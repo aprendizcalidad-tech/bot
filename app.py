@@ -19,6 +19,7 @@ import pdfplumber
 import streamlit as st
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
 from google import genai
@@ -1110,8 +1111,18 @@ def generate_final_with_gemini(
 # =========================================================
 
 
+def has_docx_style(document: Document, style_name: str) -> bool:
+    """Indica si el estilo está materializado dentro del DOCX seleccionado."""
+
+    try:
+        document.styles[style_name]
+        return True
+    except (KeyError, ValueError):
+        return False
+
+
 def configure_docx(document: Document, preserve_guide_layout: bool = False) -> None:
-    """Configura tipografía base y, si no hay guía visual, márgenes estándar."""
+    """Configura tipografía base sin asumir que la guía contiene estilos de Word."""
 
     if not preserve_guide_layout:
         for section in document.sections:
@@ -1120,17 +1131,79 @@ def configure_docx(document: Document, preserve_guide_layout: bool = False) -> N
             section.left_margin = Cm(2.5)
             section.right_margin = Cm(2.5)
 
-    normal_style = document.styles["Normal"]
-    if not normal_style.font.name:
-        normal_style.font.name = "Arial"
-    if not normal_style.font.size:
-        normal_style.font.size = Pt(11)
+    if has_docx_style(document, "Normal"):
+        normal_style = document.styles["Normal"]
+        if not normal_style.font.name:
+            normal_style.font.name = "Arial"
+        if not normal_style.font.size:
+            normal_style.font.size = Pt(11)
 
     for style_name in ("Title", "Heading 1", "Heading 2"):
-        if style_name in document.styles:
+        if has_docx_style(document, style_name):
             style = document.styles[style_name]
             if not style.font.name:
                 style.font.name = "Arial"
+
+
+def add_safe_heading(document: Document, text: str) -> None:
+    """Agrega un título de sección aunque la guía no tenga el estilo Heading 1."""
+
+    clean_text = text.strip()
+    if not clean_text:
+        return
+
+    if has_docx_style(document, "Heading 1"):
+        document.add_paragraph(clean_text, style="Heading 1")
+        return
+
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_before = Pt(12)
+    paragraph.paragraph_format.space_after = Pt(6)
+    run = paragraph.add_run(clean_text)
+    run.bold = True
+    run.font.name = "Arial"
+    run.font.size = Pt(13)
+
+
+def add_safe_bullet(document: Document, text: str) -> None:
+    """Agrega una viñeta sin depender del estilo opcional List Bullet."""
+
+    clean_text = text.strip()
+    if not clean_text:
+        return
+
+    if has_docx_style(document, "List Bullet"):
+        document.add_paragraph(clean_text, style="List Bullet")
+        return
+
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.left_indent = Cm(0.65)
+    paragraph.paragraph_format.first_line_indent = Cm(-0.35)
+    paragraph.paragraph_format.space_after = Pt(3)
+    bullet_run = paragraph.add_run("• ")
+    bullet_run.bold = True
+    paragraph.add_run(clean_text)
+
+
+def apply_safe_table_borders(table) -> None:
+    """Dibuja bordes aunque la guía no contenga el estilo Table Grid."""
+
+    table_properties = table._tbl.tblPr
+    borders = table_properties.first_child_found_in("w:tblBorders")
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        table_properties.append(borders)
+
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        tag = f"w:{edge}"
+        border = borders.find(qn(tag))
+        if border is None:
+            border = OxmlElement(tag)
+            borders.append(border)
+        border.set(qn("w:val"), "single")
+        border.set(qn("w:sz"), "4")
+        border.set(qn("w:space"), "0")
+        border.set(qn("w:color"), "B7B7B7")
 
 
 def clear_docx_body_keep_layout(document: Document) -> None:
@@ -1179,7 +1252,10 @@ def add_docx_table(document: Document, table_data: FinalTable) -> None:
         return
 
     table = document.add_table(rows=1, cols=column_count)
-    table.style = "Table Grid"
+    if has_docx_style(document, "Table Grid"):
+        table.style = "Table Grid"
+    else:
+        apply_safe_table_borders(table)
 
     headers = list(table_data.headers)
     headers.extend([""] * (column_count - len(headers)))
@@ -1233,15 +1309,14 @@ def create_docx(
         document.add_paragraph(final_document.introductory_note.strip())
 
     for section in final_document.sections:
-        document.add_heading(section.title.strip(), level=1)
+        add_safe_heading(document, section.title)
 
         for paragraph_text in section.paragraphs:
             if paragraph_text.strip():
                 document.add_paragraph(paragraph_text.strip())
 
         for bullet in section.bullets:
-            if bullet.strip():
-                document.add_paragraph(bullet.strip(), style="List Bullet")
+            add_safe_bullet(document, bullet)
 
         for table_data in section.tables:
             add_docx_table(document, table_data)
