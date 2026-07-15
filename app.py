@@ -925,14 +925,10 @@ def _discover_candidate_models(client, configured_model: str) -> list[str]:
 
     configured = _normalize_model_name(configured_model)
     preferred_defaults = [
-        configured,
-        "gemini-flash-lite-latest",
-        "gemini-flash-latest",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3-flash-preview",
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash",
-    ]
+    configured,
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+]
 
     discovered: list[str] = []
     try:
@@ -963,7 +959,7 @@ def _discover_candidate_models(client, configured_model: str) -> list[str]:
             add(candidate)
 
     # Evita esperas excesivas si el listado contiene demasiados modelos.
-    return ordered[:8]
+    return ordered[:3]
 
 
 def _is_retryable_gemini_error(error: Exception) -> bool:
