@@ -1926,18 +1926,15 @@ def download_drive_video_to_path(
 
 
 def _video_model_candidates(configured_model: str) -> list[str]:
-    """Modelos de video en orden seguro, sin duplicados.
-
-    La comprensión de video usa un modelo multimodal explícito. No reutiliza
-    indiscriminadamente todos los modelos de texto descubiertos por la API.
-    """
+    """Modelos multimodales válidos en orden estable y sin duplicados."""
 
     secret_model = read_secret("GEMINI_VIDEO_MODEL", VIDEO_MODEL_DEFAULT).strip()
     candidates = [
         secret_model,
         VIDEO_MODEL_DEFAULT,
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
         configured_model,
-        "gemini-flash-latest",
     ]
     result: list[str] = []
     for candidate in candidates:
@@ -1945,6 +1942,43 @@ def _video_model_candidates(configured_model: str) -> list[str]:
         if normalized and normalized not in result:
             result.append(normalized)
     return result
+
+
+def _interaction_video_mime(local_path: Path, reported_mime: str) -> str:
+    """Normaliza el MIME a los valores aceptados por Interactions API."""
+
+    extension = file_extension(local_path.name)
+    official = {
+        "mp4": "video/mp4",
+        "mpeg": "video/mpeg",
+        "mov": "video/mov",
+        "avi": "video/avi",
+        "flv": "video/x-flv",
+        "mpg": "video/mpg",
+        "webm": "video/webm",
+        "wmv": "video/wmv",
+        "3gp": "video/3gpp",
+        "3gpp": "video/3gpp",
+    }
+    return official.get(extension, str(reported_mime).strip().lower())
+
+
+def _gemini_video_duration_seconds(file_info) -> float | None:
+    """Obtiene la duración reportada por Files API, por ejemplo ``3600.5s``."""
+
+    metadata = getattr(file_info, "video_metadata", None)
+    raw_duration = getattr(metadata, "video_duration", None) if metadata else None
+    if raw_duration is None:
+        return None
+
+    value = str(raw_duration).strip().lower()
+    if value.endswith("s"):
+        value = value[:-1]
+    try:
+        seconds = float(value)
+        return seconds if seconds > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _interaction_output_text(interaction) -> str:
@@ -1994,6 +2028,9 @@ def _call_video_interaction(
         "type": "video",
         "uri": file_uri,
         "mime_type": mime_type,
+        # Reduce el consumo de contexto en videos largos. Para video general,
+        # Gemini recomienda resolución baja o media.
+        "resolution": "low",
     }
 
     try:
@@ -2053,25 +2090,25 @@ def _call_video_interaction(
 def _call_video_generate_content_fallback(
     client,
     model: str,
-    file_uri: str,
-    mime_type: str,
+    uploaded_file,
     prompt: str,
     schema_model: type[BaseModel],
 ) -> BaseModel:
-    """Compatibilidad con SDKs que todavía no exponen Interactions API."""
+    """Usa el patrón oficial de Files API + generateContent.
+
+    Esta ruta se ejecuta también cuando Interactions API existe pero devuelve
+    ``400 INVALID_ARGUMENT``. La versión anterior solo la usaba cuando el SDK
+    no exponía ``client.interactions``, por lo que nunca era un respaldo real.
+    """
 
     schema = _inline_and_clean_json_schema(schema_model)
     fallback_prompt = _video_schema_prompt(prompt, schema)
+
     response = client.models.generate_content(
         model=model,
-        contents=[
-            types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
-            fallback_prompt,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
+        # El SDK convierte directamente el objeto File en una referencia válida.
+        contents=[uploaded_file, fallback_prompt],
+        config=types.GenerateContentConfig(temperature=0.1),
     )
     output_text = getattr(response, "text", None)
     if not output_text:
@@ -2156,6 +2193,7 @@ def _transcribe_local_video_path_with_gemini(
 
         file_uri = getattr(uploaded_file, "uri", None)
         processed_mime = getattr(uploaded_file, "mime_type", None) or mime_type
+        interaction_mime = _interaction_video_mime(local_path, str(processed_mime))
         if not file_uri:
             raise AppError("Gemini procesó el video, pero no devolvió su URI.")
         if not str(processed_mime).lower().startswith("video/"):
@@ -2164,67 +2202,86 @@ def _transcribe_local_video_path_with_gemini(
                 f"compatible: {processed_mime}."
             )
 
+        duration_seconds = _gemini_video_duration_seconds(uploaded_file)
+        if duration_seconds is not None:
+            duration_minutes = duration_seconds / 60
+            report(f"Duración detectada por Gemini: {duration_minutes:.1f} minutos")
+            if duration_seconds > 3 * 60 * 60:
+                raise AppError(
+                    "El video dura más de 3 horas. Gemini admite hasta 3 horas "
+                    "cuando se procesa con resolución baja. Divide el video en "
+                    "partes más cortas antes de continuar."
+                )
+
         report("Transcribiendo el audio y extrayendo la información visual")
         prompt = video_transcription_prompt(display_name)
         errors: list[str] = []
 
         for candidate_model in _video_model_candidates(model):
             report(f"Analizando el video con {candidate_model}")
-            try:
-                if hasattr(client, "interactions"):
-                    result = _call_video_interaction(
-                        client=client,
-                        model=candidate_model,
-                        file_uri=str(file_uri),
-                        mime_type=str(processed_mime),
-                        prompt=prompt,
-                        schema_model=VideoTranscript,
-                    )
-                else:
-                    result = _call_video_generate_content_fallback(
-                        client=client,
-                        model=candidate_model,
-                        file_uri=str(file_uri),
-                        mime_type=str(processed_mime),
-                        prompt=prompt,
-                        schema_model=VideoTranscript,
-                    )
-                assert isinstance(result, VideoTranscript)
-                st.session_state["active_gemini_model"] = candidate_model
-                if not result.full_transcript.strip():
-                    raise AppError(
-                        "Gemini procesó el video, pero no produjo una transcripción."
-                    )
-                return result
+            interaction_error: Exception | None = None
+            result: VideoTranscript | None = None
 
-            except AppError as error:
-                errors.append(f"{candidate_model}: {str(error)[:220]}")
-                # Un JSON inválido puede variar entre modelos; se prueba el siguiente.
-                continue
-            except Exception as error:
-                message = str(error)
-                errors.append(f"{candidate_model}: {message[:220]}")
-                upper = message.upper()
-                if any(
-                    term in upper
-                    for term in (
-                        "400",
-                        "INVALID_ARGUMENT",
-                        "404",
-                        "NOT_FOUND",
-                        "429",
-                        "RESOURCE_EXHAUSTED",
-                        "503",
-                        "UNAVAILABLE",
+            # Ruta principal: Interactions API.
+            if hasattr(client, "interactions"):
+                try:
+                    candidate_result = _call_video_interaction(
+                        client=client,
+                        model=candidate_model,
+                        file_uri=str(file_uri),
+                        mime_type=interaction_mime,
+                        prompt=prompt,
+                        schema_model=VideoTranscript,
                     )
-                ):
+                    assert isinstance(candidate_result, VideoTranscript)
+                    result = candidate_result
+                except Exception as error:
+                    interaction_error = error
+
+            # Respaldo real: generateContent con el objeto File oficial. Se usa
+            # incluso cuando Interactions API está disponible pero rechazó el video.
+            if result is None:
+                try:
+                    candidate_result = _call_video_generate_content_fallback(
+                        client=client,
+                        model=candidate_model,
+                        uploaded_file=uploaded_file,
+                        prompt=prompt,
+                        schema_model=VideoTranscript,
+                    )
+                    assert isinstance(candidate_result, VideoTranscript)
+                    result = candidate_result
+                except Exception as generate_error:
+                    interaction_text = (
+                        f"Interactions: {str(interaction_error)[:150]} | "
+                        if interaction_error is not None
+                        else ""
+                    )
+                    errors.append(
+                        f"{candidate_model}: {interaction_text}"
+                        f"generateContent: {str(generate_error)[:180]}"
+                    )
                     continue
-                raise translate_gemini_error(error) from error
 
+            st.session_state["active_gemini_model"] = candidate_model
+            if not result.full_transcript.strip():
+                errors.append(
+                    f"{candidate_model}: Gemini no produjo una transcripción."
+                )
+                continue
+            return result
+
+        duration_note = ""
+        if duration_seconds is not None:
+            duration_note = f" Duración detectada: {duration_seconds / 60:.1f} minutos."
         raise AppError(
-            "Gemini no pudo analizar el video con los modelos multimodales "
-            "disponibles. Verifica que sea un video reproducible y que pese menos "
-            "de 1,95 GB. Detalles: " + " | ".join(errors[-4:])[:900]
+            "Gemini recibió y procesó el archivo, pero rechazó la inferencia de "
+            "video tanto por Interactions API como por generateContent. Esto ya "
+            "no apunta al peso del archivo; suele indicar duración fuera del "
+            "contexto, MIME/contenedor incompatible o códec no aceptado."
+            + duration_note
+            + " Detalles: "
+            + " | ".join(errors[-3:])[:1200]
         )
 
     except AppError:
