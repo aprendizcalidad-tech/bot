@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+import hashlib
 import html
 import json
 import os
@@ -47,14 +48,33 @@ from reportlab.platypus import (
 # CONFIGURACIÓN GENERAL
 # =========================================================
 
-ALLOWED_EXTENSIONS = ["docx", "pdf", "txt"]
+GUIDE_EXTENSIONS = ["docx", "pdf", "txt"]
+VIDEO_EXTENSIONS = [
+    "mp4",
+    "mpeg",
+    "mov",
+    "avi",
+    "flv",
+    "mpg",
+    "webm",
+    "wmv",
+    "3gp",
+    "3gpp",
+]
+SOURCE_EXTENSIONS = GUIDE_EXTENSIONS + VIDEO_EXTENSIONS
+ALLOWED_EXTENSIONS = GUIDE_EXTENSIONS
+
 MODEL_DEFAULT = "gemini-flash-latest"
 MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_VIDEO_SIZE_MB = 2000
+MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
+VIDEO_PROCESSING_TIMEOUT_SECONDS = 600
+VIDEO_POLL_INTERVAL_SECONDS = 5
 MAX_GUIDES = 8
 MAX_TEXT_CHARS_PER_FILE = 80_000
 MAX_TOTAL_TEXT_CHARS = 300_000
-MAX_TOTAL_UPLOAD_MB = 80
+MAX_TOTAL_UPLOAD_MB = 240
 MAX_TOTAL_UPLOAD_BYTES = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
 
 STATUS_LABELS = {
@@ -70,6 +90,16 @@ MIME_TYPES = {
         "wordprocessingml.document"
     ),
     "txt": "text/plain",
+    "mp4": "video/mp4",
+    "mpeg": "video/mpeg",
+    "mov": "video/mov",
+    "avi": "video/avi",
+    "flv": "video/x-flv",
+    "mpg": "video/mpg",
+    "webm": "video/webm",
+    "wmv": "video/wmv",
+    "3gp": "video/3gpp",
+    "3gpp": "video/3gpp",
 }
 
 
@@ -213,6 +243,55 @@ class AuditReport(BaseModel):
     )
 
 
+
+
+class VideoTranscript(BaseModel):
+    """Transcripción estructurada producida a partir de un video."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    detected_language: str = Field(
+        description="Idioma principal detectado en el video."
+    )
+    duration_estimate: str = Field(
+        description=(
+            "Duración aproximada observada, por ejemplo 08:35. "
+            "Déjala vacía si no puede determinarse con seguridad."
+        )
+    )
+    speakers: list[str] = Field(
+        description=(
+            "Etiquetas de hablantes detectados, por ejemplo Hablante 1, "
+            "Hablante 2 o nombres propios solo cuando sean explícitos."
+        )
+    )
+    full_transcript: str = Field(
+        description=(
+            "Transcripción completa y cronológica. Debe incluir marcas de "
+            "tiempo [MM:SS], hablantes y [inaudible] cuando corresponda. "
+            "No debe resumir ni omitir intervenciones relevantes."
+        )
+    )
+    visual_evidence: list[str] = Field(
+        description=(
+            "Información visual relevante con marca de tiempo: texto en "
+            "pantalla, tablas, formularios, sistemas, acciones o evidencias."
+        )
+    )
+    key_facts: list[str] = Field(
+        description=(
+            "Hechos verificables mencionados o mostrados en el video, sin "
+            "interpretaciones no sustentadas."
+        )
+    )
+    uncertainties: list[str] = Field(
+        description=(
+            "Fragmentos inaudibles, nombres dudosos, textos ilegibles o "
+            "información que requiere confirmación humana."
+        )
+    )
+
+
 class AppError(Exception):
     """Error controlado que puede mostrarse al usuario."""
 
@@ -252,12 +331,28 @@ def format_file_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-def validate_uploaded_file(filename: str, content: bytes) -> None:
-    """Valida extensión, contenido y tamaño."""
+def is_video_extension(extension: str) -> bool:
+    return extension.lower() in VIDEO_EXTENSIONS
+
+
+def uploaded_file_fingerprint(filename: str, content: bytes) -> str:
+    """Identifica un archivo sin guardar su contenido en disco permanentemente."""
+
+    digest = hashlib.sha256(content).hexdigest()
+    return f"{safe_filename(filename)}:{len(content)}:{digest}"
+
+
+def validate_uploaded_file(
+    filename: str,
+    content: bytes,
+    allowed_extensions: list[str] | None = None,
+) -> None:
+    """Valida extensión, contenido y tamaño según el tipo de archivo."""
 
     extension = file_extension(filename)
+    allowed = allowed_extensions or ALLOWED_EXTENSIONS
 
-    if extension not in ALLOWED_EXTENSIONS:
+    if extension not in allowed:
         raise AppError(
             f"{filename}: el formato .{extension or 'desconocido'} no está permitido."
         )
@@ -265,7 +360,12 @@ def validate_uploaded_file(filename: str, content: bytes) -> None:
     if not content:
         raise AppError(f"{filename}: el archivo está vacío.")
 
-    if len(content) > MAX_FILE_SIZE_BYTES:
+    if is_video_extension(extension):
+        if len(content) > MAX_VIDEO_SIZE_BYTES:
+            raise AppError(
+                f"{filename}: supera el límite de {MAX_VIDEO_SIZE_MB} MB para video."
+            )
+    elif len(content) > MAX_FILE_SIZE_BYTES:
         raise AppError(
             f"{filename}: supera el límite de {MAX_FILE_SIZE_MB} MB."
         )
@@ -376,15 +476,25 @@ def extract_text(filename: str, content: bytes) -> tuple[str, int | None]:
             # el PDF completo de forma nativa y hará el análisis principal.
             return "", None
 
+    if is_video_extension(extension):
+        # El video se transcribe mediante Gemini Files API. No intentamos
+        # extraerlo localmente para evitar depender de FFmpeg u OCR.
+        return "", None
+
     raise AppError(f"Formato no soportado: .{extension}")
 
 
-def build_file_record(uploaded_file, role: str, index: int) -> dict:
+def build_file_record(
+    uploaded_file,
+    role: str,
+    index: int,
+    allowed_extensions: list[str] | None = None,
+) -> dict:
     """Convierte UploadedFile en una estructura persistente en sesión."""
 
     name = safe_filename(uploaded_file.name)
     content = uploaded_file.getvalue()
-    validate_uploaded_file(name, content)
+    validate_uploaded_file(name, content, allowed_extensions=allowed_extensions)
     text, page_count = extract_text(name, content)
 
     warnings: list[str] = []
@@ -399,6 +509,12 @@ def build_file_record(uploaded_file, role: str, index: int) -> dict:
     if extension in {"docx", "txt"} and not text:
         warnings.append("No se encontró texto legible en el archivo.")
 
+    if is_video_extension(extension):
+        warnings.append(
+            "El archivo de origen es un video. Debe transcribirse y revisarse "
+            "antes de comparar su información con las guías."
+        )
+
     return {
         "role": role,
         "index": index,
@@ -410,6 +526,8 @@ def build_file_record(uploaded_file, role: str, index: int) -> dict:
         "text": text,
         "page_count": page_count,
         "warnings": warnings,
+        "fingerprint": uploaded_file_fingerprint(name, content),
+        "is_video": is_video_extension(extension),
     }
 
 
@@ -1417,6 +1535,217 @@ def enforce_fidelity_with_gemini(
                     f"{expected_count} pasos y contiene {actual_count}."
                 )
     return locked
+
+
+
+def video_transcription_prompt(filename: str) -> str:
+    """Instrucciones para convertir un video en un origen documental completo."""
+
+    return f"""
+Actúa como transcriptor profesional y analista audiovisual documental.
+
+ARCHIVO
+{filename}
+
+OBJETIVO
+Convertir TODO el contenido útil del video en una fuente textual verificable
+que posteriormente será comparada con guías institucionales.
+
+REGLAS DE TRANSCRIPCIÓN
+1. Transcribe de principio a fin todo el discurso audible y relevante.
+2. Mantén el orden cronológico.
+3. Incluye marcas de tiempo con formato [MM:SS] al inicio de cada intervención
+   o cuando cambie el tema.
+4. Identifica hablantes como Hablante 1, Hablante 2, etc. Usa nombres propios
+   únicamente cuando sean explícitos y verificables en el audio o en pantalla.
+5. No resumas, no fusiones intervenciones y no omitas pasos, decisiones,
+   instrucciones, cifras, fechas, nombres, sistemas, responsables ni controles.
+6. Conserva literalmente números, códigos, radicados, fechas y valores.
+7. Cuando una parte no sea comprensible, escribe [inaudible MM:SS] y registra
+   la duda en uncertainties. No inventes palabras.
+8. Incluye en visual_evidence toda información útil que aparezca en pantalla:
+   textos, tablas, diapositivas, formularios, nombres de sistemas, campos,
+   acciones realizadas, rutas de navegación y evidencias, siempre con tiempo.
+9. Si una diapositiva o pantalla contiene una lista de pasos, registra todos
+   sus elementos en el mismo orden.
+10. key_facts debe contener únicamente hechos explícitos del audio o la imagen.
+11. full_transcript debe ser suficientemente completo para sustituir al video
+   como documento de origen del generador documental.
+12. No incluyas comentarios personales, recomendaciones ni conclusiones que no
+   estén expresadas o mostradas en el video.
+
+Devuelve únicamente el objeto estructurado solicitado.
+""".strip()
+
+
+def render_video_transcript_as_source(
+    transcript: VideoTranscript,
+    video_name: str,
+) -> str:
+    """Convierte la transcripción estructurada en texto de origen editable."""
+
+    blocks = [
+        f"[DOCUMENTO DE ORIGEN GENERADO DESDE VIDEO: {video_name}]",
+        f"[IDIOMA DETECTADO] {transcript.detected_language}",
+    ]
+
+    if transcript.duration_estimate.strip():
+        blocks.append(f"[DURACIÓN APROXIMADA] {transcript.duration_estimate}")
+
+    if transcript.speakers:
+        blocks.append("[HABLANTES]\n- " + "\n- ".join(transcript.speakers))
+
+    blocks.append(
+        "[TRANSCRIPCIÓN COMPLETA]\n"
+        + (transcript.full_transcript.strip() or "[Sin transcripción]")
+    )
+
+    if transcript.visual_evidence:
+        blocks.append(
+            "[EVIDENCIA VISUAL]\n- "
+            + "\n- ".join(transcript.visual_evidence)
+        )
+
+    if transcript.key_facts:
+        blocks.append(
+            "[HECHOS CLAVE VERIFICABLES]\n- "
+            + "\n- ".join(transcript.key_facts)
+        )
+
+    if transcript.uncertainties:
+        blocks.append(
+            "[FRAGMENTOS QUE REQUIEREN CONFIRMACIÓN]\n- "
+            + "\n- ".join(transcript.uncertainties)
+        )
+
+    return "\n\n".join(blocks).strip()
+
+
+def _file_state_name(file_info) -> str:
+    state = getattr(file_info, "state", None)
+    if state is None:
+        return ""
+    name = getattr(state, "name", None)
+    return str(name or state).upper()
+
+
+def transcribe_video_with_gemini(
+    api_key: str,
+    model: str,
+    video_record: dict,
+    progress_callback=None,
+) -> VideoTranscript:
+    """Sube, procesa y transcribe un video con Gemini Files API.
+
+    El archivo remoto se elimina al finalizar, incluso cuando ocurre un error.
+    """
+
+    if not api_key:
+        raise AppError("No se encontró GEMINI_API_KEY para transcribir el video.")
+
+    if not video_record.get("is_video"):
+        raise AppError("El archivo seleccionado no es un video compatible.")
+
+    client = genai.Client(api_key=api_key)
+    uploaded_file = None
+
+    def report(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    try:
+        suffix = f".{video_record['extension']}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_path = Path(temp_dir) / f"video_origen{suffix}"
+            local_path.write_bytes(video_record["content"])
+
+            report("Subiendo el video de forma segura a Gemini Files API")
+            uploaded_file = client.files.upload(
+                file=str(local_path),
+                config=types.UploadFileConfig(
+                    display_name=video_record["name"],
+                    mime_type=video_record["mime_type"],
+                ),
+            )
+
+        if not getattr(uploaded_file, "name", None):
+            raise AppError("Gemini no devolvió un identificador para el video.")
+
+        report("Esperando que Gemini procese el audio y los fotogramas")
+        deadline = time.monotonic() + VIDEO_PROCESSING_TIMEOUT_SECONDS
+
+        while True:
+            file_info = client.files.get(name=uploaded_file.name)
+            state_name = _file_state_name(file_info)
+
+            if "ACTIVE" in state_name:
+                uploaded_file = file_info
+                break
+
+            if "FAILED" in state_name:
+                status = getattr(file_info, "error", None) or getattr(
+                    file_info, "status", None
+                )
+                raise AppError(
+                    "Gemini no pudo procesar el video. "
+                    f"Estado recibido: {status or state_name}."
+                )
+
+            if time.monotonic() >= deadline:
+                raise AppError(
+                    "El video tardó demasiado en procesarse. "
+                    "Prueba con un archivo más corto o de menor tamaño."
+                )
+
+            time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
+
+        file_uri = getattr(uploaded_file, "uri", None)
+        mime_type = getattr(uploaded_file, "mime_type", None) or video_record["mime_type"]
+
+        if not file_uri:
+            raise AppError("Gemini procesó el video, pero no devolvió su URI.")
+
+        report("Transcribiendo el audio y extrayendo la información visual")
+        parts = [
+            types.Part.from_uri(
+                file_uri=file_uri,
+                mime_type=mime_type,
+            ),
+            types.Part.from_text(
+                text=video_transcription_prompt(video_record["name"])
+            ),
+        ]
+
+        result = call_gemini_structured(
+            api_key=api_key,
+            model=model,
+            input_parts=parts,
+            schema_model=VideoTranscript,
+        )
+        assert isinstance(result, VideoTranscript)
+
+        if not result.full_transcript.strip():
+            raise AppError(
+                "Gemini procesó el video, pero no produjo una transcripción."
+            )
+
+        return result
+
+    except AppError:
+        raise
+    except Exception as error:
+        raise translate_gemini_error(error) from error
+    finally:
+        if uploaded_file is not None and getattr(uploaded_file, "name", None):
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+        try:
+            client.close()
+        except Exception:
+            pass
+
 
 def translate_gemini_error(error: Exception) -> AppError:
     """Convierte errores técnicos frecuentes en mensajes comprensibles."""
@@ -3151,6 +3480,9 @@ def initialize_state() -> None:
         "audit_summary": None,
         "upload_key": 0,
         "active_gemini_model": None,
+        "video_transcript": None,
+        "video_source_text": None,
+        "video_source_fingerprint": None,
     }
 
     for key, default in defaults.items():
@@ -3168,6 +3500,9 @@ def reset_workflow() -> None:
     st.session_state.answers = None
     st.session_state.audit_summary = None
     st.session_state.active_gemini_model = None
+    st.session_state.video_transcript = None
+    st.session_state.video_source_text = None
+    st.session_state.video_source_fingerprint = None
     st.session_state.upload_key += 1
 
 
@@ -3204,6 +3539,79 @@ def show_file_record(record: dict, title: str, key: str) -> None:
             disabled=True,
             key=f"preview_{key}",
         )
+
+
+
+
+def show_video_transcript_review(source_record: dict) -> str | None:
+    """Permite revisar y corregir el origen textual generado desde el video."""
+
+    st.divider()
+    st.subheader("🎬 Revisar transcripción del video")
+    st.markdown(
+        """<div class="friendly-note"><strong>Revisión obligatoria:</strong>
+        confirma nombres, cargos, fechas, cifras, sistemas y fragmentos marcados
+        como inaudibles. El texto aprobado será tratado como el documento de
+        origen del proceso.</div>""",
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Ver video cargado", expanded=False):
+        st.video(
+            source_record["content"],
+            format=source_record["mime_type"],
+        )
+
+    transcript = st.session_state.get("video_transcript")
+    if transcript and transcript.uncertainties:
+        with st.expander("Fragmentos que requieren confirmación", expanded=True):
+            for uncertainty in transcript.uncertainties:
+                st.warning(uncertainty)
+
+    editor_key = f"video_source_editor_{st.session_state.upload_key}"
+    edited_text = st.text_area(
+        "Transcripción y evidencia visual",
+        value=st.session_state.get("video_source_text") or source_record.get("text", ""),
+        height=520,
+        key=editor_key,
+        help=(
+            "Puedes corregir errores de transcripción. No elimines hechos ni "
+            "agregues información que no aparezca en el video."
+        ),
+    )
+
+    columns = st.columns(2)
+    approved = columns[0].button(
+        "Aprobar transcripción y analizar guías",
+        type="primary",
+        width="stretch",
+        disabled=not edited_text.strip(),
+    )
+    retranscribe = columns[1].button(
+        "Volver a transcribir el video",
+        width="stretch",
+    )
+
+    if retranscribe:
+        st.session_state.video_transcript = None
+        st.session_state.video_source_text = None
+        st.session_state.video_source_fingerprint = None
+        st.session_state.source_record = None
+        st.session_state.analysis = None
+        st.rerun()
+
+    if approved:
+        return edited_text.strip()
+
+    return None
+
+
+def _clear_outputs_after_new_analysis() -> None:
+    st.session_state.final_document = None
+    st.session_state.docx_output = None
+    st.session_state.pdf_output = None
+    st.session_state.answers = None
+    st.session_state.audit_summary = None
 
 
 def show_analysis(analysis: GuideAnalysis, guides: list[dict]) -> None:
@@ -3901,9 +4309,9 @@ def render_hero() -> None:
         <section class="app-hero">
           <h1>Generador documental inteligente</h1>
           <p>
-            Carga las guías institucionales y el documento de origen. El sistema
-            interpreta las reglas, identifica información faltante y genera un
-            Word y un PDF listos para revisión.
+            Carga las guías institucionales y un documento o video de origen. El sistema
+            interpreta las reglas, transcribe el video cuando corresponda,
+            identifica información faltante y genera un Word y un PDF listos para revisión.
           </p>
         </section>
         """,
@@ -3913,7 +4321,7 @@ def render_hero() -> None:
 
 def render_workflow_steps(current_step: int) -> None:
     steps = [
-        (1, "Cargar archivos", "Guías y documento de origen"),
+        (1, "Cargar archivos", "Guías y documento o video"),
         (2, "Analizar", "Comparación con Gemini"),
         (3, "Completar", "Solo datos críticos faltantes"),
         (4, "Generar", "Word y PDF institucionales"),
@@ -3965,11 +4373,12 @@ def main() -> None:
     with st.expander("¿Cómo funciona este proceso?", expanded=False):
         st.markdown(
             """
-            1. **Carga las guías institucionales** y el documento de origen.
-            2. El sistema **interpreta, extrae evidencia, redacta y audita**.
-            3. Solo solicita **datos críticos que realmente estén ausentes**.
-            4. Presenta un **borrador editable por secciones** antes de generar.
-            5. Crea un **Word institucional** y su PDF con paginación dinámica.
+            1. **Carga las guías institucionales** y un documento o video de origen.
+            2. Si cargas un video, el sistema **transcribe audio y evidencia visual** para que puedas revisarlos.
+            3. El sistema **interpreta, extrae evidencia, redacta y audita**.
+            4. Solo solicita **datos críticos que realmente estén ausentes**.
+            5. Presenta un **borrador editable por secciones** antes de generar.
+            6. Crea un **Word institucional** y su PDF con paginación dinámica.
             """
         )
 
@@ -4002,7 +4411,7 @@ def main() -> None:
             st.caption("Selección automática de modelo habilitada.")
 
         st.caption(
-            f"Hasta {MAX_GUIDES} guías y {MAX_FILE_SIZE_MB} MB por archivo."
+            f"Hasta {MAX_GUIDES} guías; documentos de {MAX_FILE_SIZE_MB} MB y videos de {MAX_VIDEO_SIZE_MB} MB."
         )
 
         if st.button("Reiniciar proceso", width="stretch"):
@@ -4020,7 +4429,7 @@ def main() -> None:
 
     guide_uploads = st.file_uploader(
         "Guías del proceso",
-        type=ALLOWED_EXTENSIONS,
+        type=GUIDE_EXTENSIONS,
         accept_multiple_files=True,
         key=f"guides_{st.session_state.upload_key}",
         help=(
@@ -4030,115 +4439,326 @@ def main() -> None:
     )
 
     source_upload = st.file_uploader(
-        "Documento de origen",
-        type=ALLOWED_EXTENSIONS,
+        "Documento o video de origen",
+        type=SOURCE_EXTENSIONS,
         accept_multiple_files=False,
         key=f"source_{st.session_state.upload_key}",
-        help="Archivo que contiene los datos reales del proceso o caso.",
+        help=(
+            "Puedes cargar DOCX, PDF, TXT o un video. Cuando el origen sea un "
+            "video, Gemini transcribirá el audio y extraerá la evidencia visual "
+            "antes de comparar la información con las guías."
+        ),
     )
 
-    analyze_clicked = st.button(
-        "Analizar guías y documento de origen",
-        type="primary",
-        width="stretch",
-        disabled=not api_key,
+    source_extension = (
+        file_extension(source_upload.name)
+        if source_upload is not None
+        else ""
     )
+    source_is_video = is_video_extension(source_extension)
 
-    if analyze_clicked:
-        try:
-            if not guide_uploads:
-                raise AppError("Debes cargar al menos una guía.")
+    current_video_fingerprint = None
+    if source_upload is not None and source_is_video:
+        current_video_fingerprint = uploaded_file_fingerprint(
+            source_upload.name,
+            source_upload.getvalue(),
+        )
+        stored_fingerprint = st.session_state.get("video_source_fingerprint")
+        if stored_fingerprint and stored_fingerprint != current_video_fingerprint:
+            st.session_state.video_transcript = None
+            st.session_state.video_source_text = None
+            st.session_state.video_source_fingerprint = None
+            st.session_state.source_record = None
+            st.session_state.analysis = None
+            _clear_outputs_after_new_analysis()
 
-            if len(guide_uploads) > MAX_GUIDES:
-                raise AppError(f"Solo se permiten hasta {MAX_GUIDES} guías.")
+    def validate_current_uploads() -> None:
+        if not guide_uploads:
+            raise AppError("Debes cargar al menos una guía.")
 
-            if source_upload is None:
-                raise AppError("Debes cargar el documento de origen.")
+        if len(guide_uploads) > MAX_GUIDES:
+            raise AppError(f"Solo se permiten hasta {MAX_GUIDES} guías.")
 
-            total_upload_bytes = sum(
-                len(upload.getvalue()) for upload in guide_uploads
-            ) + len(source_upload.getvalue())
-            if total_upload_bytes > MAX_TOTAL_UPLOAD_BYTES:
-                raise AppError(
-                    f"El conjunto de archivos supera {MAX_TOTAL_UPLOAD_MB} MB. "
-                    "Reduce la cantidad o el tamaño de los documentos."
-                )
+        if source_upload is None:
+            raise AppError("Debes cargar el documento o video de origen.")
 
-            names = [
-                safe_filename(upload.name).lower()
-                for upload in guide_uploads
-            ]
-            if len(names) != len(set(names)):
-                raise AppError("Hay guías con nombres duplicados.")
-
-            with st.status(
-                "Analizando el proceso documental...",
-                expanded=True,
-            ) as status:
-                st.write("1/4 · Leyendo y validando los archivos")
-                guide_records = [
-                    build_file_record(
-                        upload,
-                        role="guía normativa",
-                        index=index,
-                    )
-                    for index, upload in enumerate(guide_uploads)
-                ]
-                source_record = build_file_record(
-                    source_upload,
-                    role="documento de origen",
-                    index=0,
-                )
-
-                total_text = sum(
-                    len(record["text"]) for record in guide_records
-                )
-                total_text += len(source_record["text"])
-
-                if total_text > MAX_TOTAL_TEXT_CHARS:
-                    st.warning(
-                        "Los archivos contienen mucho texto. Se limitará el "
-                        "contenido textual por archivo; los PDF se enviarán "
-                        "completos de forma nativa."
-                    )
-
-                st.write("2/4 · Interpretando las reglas de las guías")
-                st.write("3/4 · Extrayendo evidencia del documento de origen")
-                analysis = analyze_guides_and_source(
-                    api_key=api_key,
-                    model=model or MODEL_DEFAULT,
-                    guides=guide_records,
-                    source=source_record,
-                )
-                st.write("4/4 · Identificando brechas y preguntas críticas")
-                status.update(
-                    label="Análisis completado",
-                    state="complete",
-                    expanded=False,
-                )
-
-            st.session_state.guide_records = guide_records
-            st.session_state.source_record = source_record
-            st.session_state.analysis = analysis
-            st.session_state.final_document = None
-            st.session_state.docx_output = None
-            st.session_state.pdf_output = None
-            st.session_state.answers = None
-            st.session_state.audit_summary = None
-
-            st.success("Análisis completado correctamente.")
-
-        except AppError as error:
-            show_error_panel(
-                "No fue posible completar el análisis. "
-                "Revisa el mensaje técnico y vuelve a intentarlo.",
-                error,
+        total_upload_bytes = sum(
+            len(upload.getvalue()) for upload in guide_uploads
+        ) + len(source_upload.getvalue())
+        if total_upload_bytes > MAX_TOTAL_UPLOAD_BYTES:
+            raise AppError(
+                f"El conjunto de archivos supera {MAX_TOTAL_UPLOAD_MB} MB. "
+                "Reduce la cantidad o el tamaño de los documentos."
             )
-        except Exception as error:
-            show_error_panel(
-                "Ocurrió un error inesperado durante el análisis.",
-                error,
+
+        names = [
+            safe_filename(upload.name).lower()
+            for upload in guide_uploads
+        ]
+        if len(names) != len(set(names)):
+            raise AppError("Hay guías con nombres duplicados.")
+
+    def build_current_guides() -> list[dict]:
+        return [
+            build_file_record(
+                upload,
+                role="guía normativa",
+                index=index,
+                allowed_extensions=GUIDE_EXTENSIONS,
             )
+            for index, upload in enumerate(guide_uploads or [])
+        ]
+
+    if source_is_video:
+        st.info(
+            "El video se procesará en dos fases: primero se genera una "
+            "transcripción completa y editable; después se compara el texto "
+            "aprobado con las guías."
+        )
+        st.caption(
+            f"Límite del video: {MAX_VIDEO_SIZE_MB} MB. "
+            "Para mejores resultados usa un solo video, audio claro y formato MP4."
+        )
+
+        transcript_ready = (
+            st.session_state.get("video_transcript") is not None
+            and st.session_state.get("video_source_fingerprint")
+            == current_video_fingerprint
+            and st.session_state.get("source_record") is not None
+        )
+
+        if not transcript_ready:
+            transcribe_clicked = st.button(
+                "Transcribir video y extraer evidencia visual",
+                type="primary",
+                width="stretch",
+                disabled=not api_key,
+            )
+
+            if transcribe_clicked:
+                try:
+                    validate_current_uploads()
+
+                    with st.status(
+                        "Procesando el video...",
+                        expanded=True,
+                    ) as status:
+                        st.write("1/4 · Validando el archivo y las guías")
+                        guide_records = build_current_guides()
+                        source_record = build_file_record(
+                            source_upload,
+                            role="video de origen",
+                            index=0,
+                            allowed_extensions=SOURCE_EXTENSIONS,
+                        )
+
+                        progress_slot = st.empty()
+
+                        def video_progress(message: str) -> None:
+                            progress_slot.write(f"2/4 · {message}")
+
+                        transcript = transcribe_video_with_gemini(
+                            api_key=api_key,
+                            model=model or MODEL_DEFAULT,
+                            video_record=source_record,
+                            progress_callback=video_progress,
+                        )
+
+                        st.write("3/4 · Preparando el origen textual editable")
+                        source_text = render_video_transcript_as_source(
+                            transcript,
+                            source_record["name"],
+                        )
+                        source_record["text"] = source_text
+                        source_record["warnings"] = [
+                            warning
+                            for warning in source_record["warnings"]
+                            if "Debe transcribirse" not in warning
+                        ]
+                        source_record["warnings"].append(
+                            "Origen generado desde video. Revisa la transcripción "
+                            "antes de continuar con el análisis documental."
+                        )
+                        source_record["video_transcript"] = transcript.model_dump()
+
+                        st.write("4/4 · Video listo para revisión")
+                        status.update(
+                            label="Transcripción lista para revisión",
+                            state="complete",
+                            expanded=False,
+                        )
+
+                    st.session_state.guide_records = guide_records
+                    st.session_state.source_record = source_record
+                    st.session_state.video_transcript = transcript
+                    st.session_state.video_source_text = source_text
+                    st.session_state.video_source_fingerprint = (
+                        current_video_fingerprint
+                    )
+                    st.session_state.analysis = None
+                    _clear_outputs_after_new_analysis()
+                    st.success(
+                        "El video fue transcrito. Revisa el texto antes de "
+                        "compararlo con las guías."
+                    )
+                    st.rerun()
+
+                except AppError as error:
+                    show_error_panel(
+                        "No fue posible transcribir el video.",
+                        error,
+                    )
+                except Exception as error:
+                    show_error_panel(
+                        "Ocurrió un error inesperado al procesar el video.",
+                        error,
+                    )
+
+        else:
+            source_record = st.session_state.source_record
+            approved_source_text = show_video_transcript_review(source_record)
+
+            if approved_source_text is not None:
+                try:
+                    validate_current_uploads()
+                    guide_records = build_current_guides()
+                    source_record = deepcopy(source_record)
+                    source_record["text"] = approved_source_text
+                    source_record["role"] = (
+                        "transcripción revisada del video de origen"
+                    )
+                    source_record["warnings"] = [
+                        warning
+                        for warning in source_record.get("warnings", [])
+                        if "Revisa la transcripción" not in warning
+                    ]
+                    source_record["warnings"].append(
+                        "La transcripción fue revisada y aprobada por el usuario."
+                    )
+
+                    with st.status(
+                        "Analizando las guías con la transcripción aprobada...",
+                        expanded=True,
+                    ) as status:
+                        st.write("1/4 · Validando las guías")
+                        total_text = sum(
+                            len(record["text"]) for record in guide_records
+                        ) + len(source_record["text"])
+                        if total_text > MAX_TOTAL_TEXT_CHARS:
+                            st.warning(
+                                "Los archivos contienen mucho texto. Se limitará "
+                                "el contenido textual por archivo."
+                            )
+
+                        st.write("2/4 · Seleccionando la guía aplicable")
+                        st.write("3/4 · Comparando criterios y evidencia")
+                        analysis = analyze_guides_and_source(
+                            api_key=api_key,
+                            model=model or MODEL_DEFAULT,
+                            guides=guide_records,
+                            source=source_record,
+                        )
+                        st.write("4/4 · Identificando brechas y preguntas críticas")
+                        status.update(
+                            label="Análisis completado",
+                            state="complete",
+                            expanded=False,
+                        )
+
+                    st.session_state.guide_records = guide_records
+                    st.session_state.source_record = source_record
+                    st.session_state.video_source_text = approved_source_text
+                    st.session_state.analysis = analysis
+                    _clear_outputs_after_new_analysis()
+                    st.success(
+                        "La transcripción fue aprobada y analizada correctamente."
+                    )
+                    st.rerun()
+
+                except AppError as error:
+                    show_error_panel(
+                        "No fue posible analizar la transcripción con las guías.",
+                        error,
+                    )
+                except Exception as error:
+                    show_error_panel(
+                        "Ocurrió un error inesperado durante el análisis.",
+                        error,
+                    )
+
+    else:
+        analyze_clicked = st.button(
+            "Analizar guías y documento de origen",
+            type="primary",
+            width="stretch",
+            disabled=not api_key,
+        )
+
+        if analyze_clicked:
+            try:
+                validate_current_uploads()
+
+                with st.status(
+                    "Analizando el proceso documental...",
+                    expanded=True,
+                ) as status:
+                    st.write("1/4 · Leyendo y validando los archivos")
+                    guide_records = build_current_guides()
+                    source_record = build_file_record(
+                        source_upload,
+                        role="documento de origen",
+                        index=0,
+                        allowed_extensions=SOURCE_EXTENSIONS,
+                    )
+
+                    total_text = sum(
+                        len(record["text"]) for record in guide_records
+                    )
+                    total_text += len(source_record["text"])
+
+                    if total_text > MAX_TOTAL_TEXT_CHARS:
+                        st.warning(
+                            "Los archivos contienen mucho texto. Se limitará el "
+                            "contenido textual por archivo; los PDF se enviarán "
+                            "completos de forma nativa."
+                        )
+
+                    st.write("2/4 · Interpretando las reglas de las guías")
+                    st.write("3/4 · Extrayendo evidencia del documento de origen")
+                    analysis = analyze_guides_and_source(
+                        api_key=api_key,
+                        model=model or MODEL_DEFAULT,
+                        guides=guide_records,
+                        source=source_record,
+                    )
+                    st.write("4/4 · Identificando brechas y preguntas críticas")
+                    status.update(
+                        label="Análisis completado",
+                        state="complete",
+                        expanded=False,
+                    )
+
+                st.session_state.guide_records = guide_records
+                st.session_state.source_record = source_record
+                st.session_state.analysis = analysis
+                st.session_state.video_transcript = None
+                st.session_state.video_source_text = None
+                st.session_state.video_source_fingerprint = None
+                _clear_outputs_after_new_analysis()
+
+                st.success("Análisis completado correctamente.")
+
+            except AppError as error:
+                show_error_panel(
+                    "No fue posible completar el análisis. "
+                    "Revisa el mensaje técnico y vuelve a intentarlo.",
+                    error,
+                )
+            except Exception as error:
+                show_error_panel(
+                    "Ocurrió un error inesperado durante el análisis.",
+                    error,
+                )
 
     guide_records = st.session_state.guide_records
     source_record = st.session_state.source_record
