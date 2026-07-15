@@ -582,7 +582,7 @@ PROCESO OBLIGATORIO
 REGLAS DE REDACCIÓN
 - Usa un estilo formal, preciso, coherente y eficiente.
 - Prioriza oraciones claras y directas; evita párrafos inflados.
-- La eficiencia de redacción NO permite resumir la estructura exigida: conserva
+- La eficiencia de redacción NO permite resumir ni ampliar la estructura exigida: conserva
   todos los pasos, actividades, controles, requisitos y subapartados de la guía.
 - Mantén una idea principal por oración cuando sea posible.
 - Usa voz institucional o impersonal.
@@ -603,7 +603,7 @@ FIDELIDAD ESTRUCTURAL OBLIGATORIA
 - Reproduce todos los elementos enumerados por la guía, uno a uno y en el mismo
   orden. No resumas, fusiones, agrupes, sustituyas ni omitas elementos.
 - Si la guía exige 8 pasos, numbered_items debe contener exactamente 8 pasos
-  independientes, salvo que la guía exija además subpasos claramente separados.
+  independientes: no 7, no 9. Nunca agregues pasos, subpasos o actividades que no estén autorizados por la guía principal.
 - Cada paso puede mejorarse lingüísticamente, pero debe conservar su acción,
   responsable, condición, control y resultado cuando estos estén sustentados.
 - Antes de responder, cuenta los elementos de la guía y compáralos con los del
@@ -840,61 +840,102 @@ def _guide_heading_from_line(line: str) -> tuple[str, str] | None:
 
 
 def _extract_steps_from_section(title: str, body_lines: list[str]) -> list[str]:
-    """Extrae todos los pasos de una sección y conserva su orden exacto."""
+    """Extrae únicamente los pasos que la guía define de forma explícita.
+
+    Reglas:
+    - Si existen numerales (1., 2., 3...), esos numerales son la única fuente
+      válida para determinar la cantidad de pasos.
+    - Las viñetas sin número que aparezcan dentro de un paso se consideran
+      aclaraciones o subpuntos del paso anterior; nunca crean un paso adicional.
+    - Si no hay numerales y la sección es claramente procedimental, cada viñeta
+      independiente puede representar un paso.
+    - Se eliminan duplicados causados por saltos de página o encabezados repetidos.
+    """
 
     procedural = any(term in title.lower() for term in PROCEDURAL_TITLE_TERMS)
-    items: list[dict] = []
+    numbered_items: list[dict] = []
+    bullet_items: list[str] = []
+    explicit_numbering_found = False
 
     for raw_line in body_lines:
         line = _clean_guide_line(raw_line)
         if not line or _is_page_artifact_line(line):
             continue
+        if line.upper().startswith(("[ENCABEZADO]", "[PIE DE PÁGINA]", "[PIE DE PAGINA]")):
+            continue
+        if _guide_heading_from_line(line):
+            continue
 
         numbered = NUMBERED_GUIDE_LINE_RE.match(line)
         if numbered:
-            items.append(
-                {
-                    "number": int(numbered.group("number")),
-                    "text": numbered.group("text").strip(),
-                }
+            explicit_numbering_found = True
+            step_number = int(numbered.group("number"))
+            step_text = numbered.group("text").strip()
+
+            existing = next(
+                (item for item in numbered_items if item["number"] == step_number),
+                None,
             )
+            if existing is None:
+                numbered_items.append({"number": step_number, "text": step_text})
+            elif step_text and step_text.casefold() not in existing["text"].casefold():
+                existing["text"] = f"{existing['text'].rstrip()} {step_text}".strip()
             continue
 
         bullet = GUIDE_BULLET_LINE_RE.match(line)
-        if bullet and procedural:
+        if bullet:
             bullet_text = bullet.group("text").strip()
             nested_number = NUMBERED_GUIDE_LINE_RE.match(bullet_text)
             if nested_number:
-                items.append(
-                    {
-                        "number": int(nested_number.group("number")),
-                        "text": nested_number.group("text").strip(),
-                    }
+                explicit_numbering_found = True
+                step_number = int(nested_number.group("number"))
+                step_text = nested_number.group("text").strip()
+                existing = next(
+                    (item for item in numbered_items if item["number"] == step_number),
+                    None,
                 )
-            else:
-                items.append({"number": None, "text": bullet_text})
+                if existing is None:
+                    numbered_items.append({"number": step_number, "text": step_text})
+                elif step_text and step_text.casefold() not in existing["text"].casefold():
+                    existing["text"] = f"{existing['text'].rstrip()} {step_text}".strip()
+                continue
+
+            if explicit_numbering_found and numbered_items:
+                numbered_items[-1]["text"] = (
+                    f"{numbered_items[-1]['text'].rstrip()} {bullet_text}"
+                ).strip()
+            elif procedural:
+                bullet_items.append(bullet_text)
             continue
 
-        # Las líneas partidas por PDF se anexan al último paso.
-        if items and not _guide_heading_from_line(line):
-            items[-1]["text"] = (
-                items[-1]["text"].rstrip() + " " + line
+        if explicit_numbering_found and numbered_items:
+            numbered_items[-1]["text"] = (
+                f"{numbered_items[-1]['text'].rstrip()} {line}"
             ).strip()
+        elif procedural and bullet_items:
+            bullet_items[-1] = f"{bullet_items[-1].rstrip()} {line}".strip()
 
-    if any(item["number"] is not None for item in items):
-        items.sort(
-            key=lambda item: (
-                item["number"] is None,
-                item["number"] if item["number"] is not None else 10**9,
-            )
-        )
+    if explicit_numbering_found:
+        numbered_items.sort(key=lambda item: item["number"])
+        result: list[str] = []
+        seen_numbers: set[int] = set()
+        for item in numbered_items:
+            if item["number"] in seen_numbers:
+                continue
+            seen_numbers.add(item["number"])
+            value = _strip_list_prefix(item["text"])
+            if value:
+                result.append(value)
+        return result
 
-    cleaned_items: list[str] = []
-    for item in items:
-        value = _strip_list_prefix(item["text"])
-        if value:
-            cleaned_items.append(value)
-    return cleaned_items
+    if procedural:
+        return [
+            value
+            for value in (_strip_list_prefix(item) for item in bullet_items)
+            if value
+        ]
+
+    return []
 
 
 def extract_exact_guide_structure(text: str) -> list[dict]:
@@ -1157,10 +1198,11 @@ def lock_final_document_to_selected_guide(
     analysis: GuideAnalysis,
     guides: list[dict],
 ) -> FinalDocument:
-    """Reconstruye el documento con los títulos y pasos exactos de la guía.
+    """Impone exactamente la estructura de la guía que Gemini seleccionó.
 
-    La IA solo aporta redacción. La estructura final se arma localmente, por lo
-    que no puede terminar con cuatro pasos cuando la guía exige ocho.
+    La guía principal es la única fuente de títulos, orden y cantidad de pasos.
+    Las guías complementarias pueden aportar criterios de redacción, pero nunca
+    pueden agregar secciones, títulos o pasos al documento final.
     """
 
     manifest = build_guide_structure_manifest(guides)
@@ -1179,12 +1221,16 @@ def lock_final_document_to_selected_guide(
     warnings = list(final_document.warnings)
 
     for expected in selected["sections"]:
-        generated_index = _best_section_index(expected["title"], generated_sections, used_generated)
+        generated_index = _best_section_index(
+            expected["title"], generated_sections, used_generated
+        )
         generated = generated_sections[generated_index] if generated_index is not None else None
         if generated_index is not None:
             used_generated.add(generated_index)
 
-        analysis_index = _best_section_index(expected["title"], analysis_sections, used_analysis)
+        analysis_index = _best_section_index(
+            expected["title"], analysis_sections, used_analysis
+        )
         assessed = analysis_sections[analysis_index] if analysis_index is not None else None
         if analysis_index is not None:
             used_analysis.add(analysis_index)
@@ -1200,18 +1246,28 @@ def lock_final_document_to_selected_guide(
             source_basis = list(assessed.evidence)
 
         expected_items = list(expected["numbered_items"])
+        generated_items = _collect_generated_numbered_items(generated)
+
         if expected_items:
-            generated_items = _collect_generated_numbered_items(generated)
-            # Solo se conserva la versión generada si tiene exactamente el mismo
-            # número de pasos. Ante cualquier reducción, se restablecen TODOS los
-            # pasos extraídos de la guía de forma determinista.
-            if len(generated_items) == len(expected_items):
-                numbered_items = generated_items
-            else:
-                numbered_items = expected_items
+            expected_count = len(expected_items)
+            numbered_items: list[str] = []
+            for item_index in range(expected_count):
+                if item_index < len(generated_items):
+                    candidate = generated_items[item_index]
+                    numbered_items.append(candidate or expected_items[item_index])
+                else:
+                    numbered_items.append(expected_items[item_index])
+
+            if len(generated_items) > expected_count:
                 warnings.append(
-                    f"La sección '{expected['title']}' fue restablecida con los "
-                    f"{len(expected_items)} pasos exactos de la guía."
+                    f"Se eliminaron {len(generated_items) - expected_count} paso(s) "
+                    f"adicional(es) de la sección '{expected['title']}' porque la "
+                    f"guía seleccionada exige exactamente {expected_count}."
+                )
+            elif len(generated_items) < expected_count:
+                warnings.append(
+                    f"La sección '{expected['title']}' se completó hasta los "
+                    f"{expected_count} pasos exigidos por la guía seleccionada."
                 )
 
             bullets = [
@@ -1219,16 +1275,40 @@ def lock_final_document_to_selected_guide(
                 if not NUMBERED_GUIDE_LINE_RE.match(item)
                 and not re.match(r"^\s*\d+[.)\-:]", item)
             ]
-            paragraphs = [
-                paragraph for paragraph in paragraphs
-                if not all(
-                    NUMBERED_GUIDE_LINE_RE.match(line.strip())
-                    for line in str(paragraph).splitlines()
-                    if line.strip()
-                )
-            ]
+            cleaned_paragraphs: list[str] = []
+            for paragraph in paragraphs:
+                lines = [line for line in str(paragraph).splitlines() if line.strip()]
+                non_numbered_lines = [
+                    line for line in lines
+                    if not NUMBERED_GUIDE_LINE_RE.match(line.strip())
+                    and not re.match(r"^\s*\d+[.)\-:]", line.strip())
+                ]
+                if non_numbered_lines:
+                    cleaned_paragraphs.append("\n".join(non_numbered_lines))
+            paragraphs = cleaned_paragraphs
         else:
-            numbered_items = list(generated.numbered_items) if generated else []
+            numbered_items = []
+            if generated_items:
+                warnings.append(
+                    f"Se eliminaron {len(generated_items)} paso(s) no autorizados "
+                    f"de la sección '{expected['title']}'."
+                )
+            bullets = [
+                item for item in bullets
+                if not NUMBERED_GUIDE_LINE_RE.match(item)
+                and not re.match(r"^\s*\d+[.)\-:]", item)
+            ]
+            cleaned_paragraphs: list[str] = []
+            for paragraph in paragraphs:
+                lines = [line for line in str(paragraph).splitlines() if line.strip()]
+                non_numbered_lines = [
+                    line for line in lines
+                    if not NUMBERED_GUIDE_LINE_RE.match(line.strip())
+                    and not re.match(r"^\s*\d+[.)\-:]", line.strip())
+                ]
+                if non_numbered_lines:
+                    cleaned_paragraphs.append("\n".join(non_numbered_lines))
+            paragraphs = cleaned_paragraphs
 
         locked_sections.append(
             FinalSection(
@@ -1251,9 +1331,7 @@ def lock_final_document_to_selected_guide(
             default=item.section_title,
         )
         if _title_similarity(best_title, item.section_title) >= 0.18:
-            remapped_validation.append(
-                item.model_copy(update={"section_title": best_title})
-            )
+            remapped_validation.append(item.model_copy(update={"section_title": best_title}))
 
     locked = final_document.model_copy(
         update={
@@ -1332,10 +1410,11 @@ def enforce_fidelity_with_gemini(
             )
         for expected, actual in zip(selected_manifest["sections"], locked.sections):
             expected_count = len(expected["numbered_items"])
-            if expected_count and len(actual.numbered_items) != expected_count:
+            actual_count = len(actual.numbered_items)
+            if actual_count != expected_count:
                 raise AppError(
                     f"La sección '{expected['title']}' debe contener exactamente "
-                    f"{expected_count} pasos."
+                    f"{expected_count} pasos y contiene {actual_count}."
                 )
     return locked
 
