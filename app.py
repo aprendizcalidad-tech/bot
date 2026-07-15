@@ -496,6 +496,11 @@ ETAPA 1 — INTERPRETAR LA GUÍA
   las tablas, las listas y las reglas de presentación.
 - Las guías son instrucciones de construcción; no copies sus explicaciones
   como contenido factual del documento final.
+- FIDELIDAD ESTRUCTURAL OBLIGATORIA: identifica todos los numerales, pasos,
+  actividades, controles, requisitos y subapartados de la guía. No los resumas,
+  no los agrupes y no los omitas. Cada elemento enumerado debe conservarse como
+  un elemento independiente. Si la guía contiene 8 pasos, el análisis debe
+  reconocer los 8 y el documento final debe contener los 8.
 
 ETAPA 2 — EXTRAER EVIDENCIA
 - Localiza hechos explícitos en el documento de origen.
@@ -534,6 +539,10 @@ REGLAS
 7. Para procedimientos secuenciales usa output_format “lista” o “mixto”.
 8. selected_guide_name debe coincidir exactamente con el archivo del catálogo.
 9. supporting_guide_indices solo puede contener índices válidos y distintos del principal.
+10. La concisión aplica únicamente a la redacción de cada elemento; nunca autoriza
+    reducir la cantidad de pasos, requisitos, actividades o controles exigidos.
+11. Cuando la guía enumere N elementos, conserva N elementos independientes y en
+    el mismo orden. No combines dos pasos en uno aunque sean similares.
 
 ESTADOS
 - completo: información suficiente para cumplir todos los criterios.
@@ -573,6 +582,8 @@ PROCESO OBLIGATORIO
 REGLAS DE REDACCIÓN
 - Usa un estilo formal, preciso, coherente y eficiente.
 - Prioriza oraciones claras y directas; evita párrafos inflados.
+- La eficiencia de redacción NO permite resumir la estructura exigida: conserva
+  todos los pasos, actividades, controles, requisitos y subapartados de la guía.
 - Mantén una idea principal por oración cuando sea posible.
 - Usa voz institucional o impersonal.
 - Para procedimientos, usa verbos de acción y orden lógico.
@@ -583,6 +594,16 @@ REGLAS DE REDACCIÓN
 - El alcance debe indicar inicio, límite y finalización solo cuando estén sustentados.
 - Las definiciones deben presentarse en orden alfabético cuando la guía lo solicite.
 - No incluyas una sección de datos faltantes en el documento final.
+
+FIDELIDAD ESTRUCTURAL OBLIGATORIA
+- Reproduce todos los elementos enumerados por la guía, uno a uno y en el mismo
+  orden. No resumas, fusiones, agrupes, sustituya ni omitas elementos.
+- Si la guía exige 8 pasos, numbered_items debe contener exactamente 8 pasos
+  independientes, salvo que la guía exija además subpasos claramente separados.
+- Cada paso puede mejorarse lingüísticamente, pero debe conservar su acción,
+  responsable, condición, control y resultado cuando estos estén sustentados.
+- Antes de responder, cuenta los elementos de la guía y compáralos con los del
+  documento final. Corrige cualquier diferencia antes de devolver el JSON.
 
 ESTRUCTURA DE LISTAS
 - Usa numbered_items exclusivamente para pasos, actividades secuenciales,
@@ -629,9 +650,11 @@ CRITERIOS DE AUDITORÍA
 3. No existen hechos inventados ni afirmaciones sin sustento.
 4. Nombres, cargos, fechas, cifras y sistemas son consistentes.
 5. Los pasos están ordenados y no mezclan viñetas con numeración.
-6. Las tablas son coherentes y no contienen espacios artificiales.
-7. El documento mantiene trazabilidad con el origen y las respuestas.
-8. Las limitaciones reales se registran como advertencias.
+6. La cantidad de pasos, actividades y requisitos coincide exactamente con la
+   guía; ningún elemento fue resumido, fusionado u omitido.
+7. Las tablas son coherentes y no contienen espacios artificiales.
+8. El documento mantiene trazabilidad con el origen y las respuestas.
+9. Las limitaciones reales se registran como advertencias.
 
 Devuelve validation para todos los criterios relevantes, warnings concretos
 y un editorial_summary breve. No reescribas el documento.
@@ -670,9 +693,329 @@ REGLAS
 - Conserva el número de orden de la sección.
 - Usa numbered_items para pasos secuenciales y bullets para listas no ordenadas.
 - No incluyas números dentro del texto de numbered_items.
+- Conserva todos los pasos exigidos por la guía. No reduzcas su cantidad, no
+  combines dos pasos y no omitas ninguno durante la regeneración.
 - Mantén las tablas solo si son necesarias o exigidas por la guía.
 - Devuelve únicamente la estructura FinalSection.
 """.strip()
+
+
+
+NUMBERED_GUIDE_LINE_RE = re.compile(
+    r"^\s*(?:[•●▪◦\-–—]\s*)?(?P<number>\d{1,3})\s*[.)\-:]\s*(?P<text>.+?)\s*$"
+)
+
+
+def _looks_like_guide_heading(line: str) -> bool:
+    """Detecta encabezados breves para asociar secuencias con su sección."""
+
+    cleaned = re.sub(r"\s+", " ", line).strip().strip(":")
+    if not cleaned or len(cleaned) > 120:
+        return False
+    if NUMBERED_GUIDE_LINE_RE.match(cleaned):
+        return False
+
+    letters = [character for character in cleaned if character.isalpha()]
+    if not letters:
+        return False
+
+    uppercase_ratio = sum(character.isupper() for character in letters) / len(letters)
+    heading_terms = (
+        "paso a paso",
+        "procedimiento",
+        "actividades",
+        "etapas",
+        "metodología",
+        "metodologia",
+        "desarrollo",
+        "instrucciones",
+    )
+    return uppercase_ratio >= 0.72 or cleaned.lower() in heading_terms
+
+
+def _is_page_artifact_line(line: str) -> bool:
+    """Ignora encabezados y pies repetidos que interrumpen listas entre páginas."""
+
+    normalized = re.sub(r"\s+", " ", line).strip().lower()
+    if not normalized:
+        return False
+
+    artifact_terms = (
+        "copia no controlada",
+        "antes de imprimir",
+        "piense en el medio ambiente",
+        "plantilla de ",
+    )
+    if any(term in normalized for term in artifact_terms):
+        return True
+
+    if re.match(r"^(código|codigo|versión|version|fecha|página|pagina)\s*:", normalized):
+        return True
+    if re.fullmatch(r"x{2}(?:-x{2}){1,4}", normalized):
+        return True
+    return False
+
+
+def extract_numbered_guide_sequences(text: str) -> list[dict]:
+    """Extrae secuencias numeradas completas de una guía sin usar IA.
+
+    Une líneas partidas por PDF, atraviesa saltos de página sin perder pasos y
+    conserva secuencias consecutivas de al menos dos elementos. Esto permite
+    verificar de forma determinista que una guía con ocho pasos produzca ocho
+    pasos en el documento final.
+    """
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    sequences: list[dict] = []
+    current_heading = "Sección numerada"
+    current_items: list[dict] = []
+
+    def flush() -> None:
+        nonlocal current_items
+        if len(current_items) >= 2:
+            sequences.append(
+                {
+                    "section_title": current_heading,
+                    "items": [item["text"].strip() for item in current_items],
+                    "numbers": [item["number"] for item in current_items],
+                }
+            )
+        current_items = []
+
+    for line in lines:
+        if not line:
+            continue
+        if _is_page_artifact_line(line):
+            # No finaliza la secuencia: una lista puede continuar en la página siguiente.
+            continue
+
+        numbered = NUMBERED_GUIDE_LINE_RE.match(line)
+        if numbered:
+            number = int(numbered.group("number"))
+            item_text = numbered.group("text").strip()
+
+            if current_items:
+                previous_number = current_items[-1]["number"]
+                if number != previous_number + 1:
+                    flush()
+
+            current_items.append({"number": number, "text": item_text})
+            continue
+
+        if _looks_like_guide_heading(line):
+            flush()
+            current_heading = line.strip().strip(":")
+            continue
+
+        if current_items:
+            current_items[-1]["text"] = (
+                current_items[-1]["text"].rstrip() + " " + line
+            ).strip()
+
+    flush()
+
+    # Elimina duplicados que puedan aparecer por encabezados/pies repetidos.
+    unique: list[dict] = []
+    seen: set[tuple[str, ...]] = set()
+    for sequence in sequences:
+        signature = tuple(item.lower() for item in sequence["items"])
+        if signature not in seen:
+            seen.add(signature)
+            unique.append(sequence)
+    return unique
+
+
+def build_guide_fidelity_manifest(guides: list[dict]) -> list[dict]:
+    """Construye el inventario estructural verificable de todas las guías."""
+
+    manifest: list[dict] = []
+    for guide_index, guide in enumerate(guides):
+        for sequence in extract_numbered_guide_sequences(guide.get("text", "")):
+            manifest.append(
+                {
+                    "guide_index": guide_index,
+                    "guide_name": guide.get("name", f"Guía {guide_index}"),
+                    "section_title": sequence["section_title"],
+                    "items": sequence["items"],
+                    "expected_count": len(sequence["items"]),
+                }
+            )
+    return manifest
+
+
+def render_fidelity_manifest(manifest: list[dict]) -> str:
+    """Convierte el inventario en una instrucción inequívoca para Gemini."""
+
+    if not manifest:
+        return (
+            "INVENTARIO ESTRUCTURAL AUTOMÁTICO: no se detectaron secuencias "
+            "numeradas de dos o más elementos mediante extracción local."
+        )
+
+    blocks = [
+        "INVENTARIO ESTRUCTURAL AUTOMÁTICO — CUMPLIMIENTO OBLIGATORIO",
+        "Cada elemento listado debe aparecer de forma independiente en el documento final.",
+        "No se permite resumir, fusionar ni omitir elementos.",
+    ]
+    for sequence_index, sequence in enumerate(manifest, start=1):
+        blocks.append(
+            f"\nSECUENCIA {sequence_index} | Guía {sequence['guide_index']}: "
+            f"{sequence['guide_name']} | Sección: {sequence['section_title']} | "
+            f"Cantidad obligatoria: {sequence['expected_count']}"
+        )
+        for item_index, item in enumerate(sequence["items"], start=1):
+            blocks.append(f"{item_index}. {item}")
+    return "\n".join(blocks)
+
+
+def _normalized_title_tokens(text: str) -> set[str]:
+    normalized = re.sub(r"[^a-záéíóúñ0-9]+", " ", text.lower())
+    ignored = {"de", "del", "la", "las", "el", "los", "y", "para", "a"}
+    return {token for token in normalized.split() if token and token not in ignored}
+
+
+def _best_final_section_for_sequence(
+    final_document: FinalDocument,
+    sequence: dict,
+) -> FinalSection | None:
+    """Localiza la sección final que corresponde a una secuencia de la guía."""
+
+    expected_tokens = _normalized_title_tokens(sequence.get("section_title", ""))
+    best_section: FinalSection | None = None
+    best_score = -1.0
+
+    for section in final_document.sections:
+        section_tokens = _normalized_title_tokens(section.title)
+        union = expected_tokens | section_tokens
+        overlap = len(expected_tokens & section_tokens) / len(union) if union else 0.0
+        sequence_bonus = 0.35 if section.numbered_items else 0.0
+        title_key = section.title.lower()
+        procedural_bonus = 0.25 if any(
+            term in title_key
+            for term in ("paso", "procedimiento", "actividad", "etapa", "metodolog")
+        ) else 0.0
+        score = overlap + sequence_bonus + procedural_bonus
+        if score > best_score:
+            best_score = score
+            best_section = section
+
+    return best_section
+
+
+def document_fidelity_issues(
+    final_document: FinalDocument,
+    manifest: list[dict],
+    selected_guide_index: int,
+) -> list[str]:
+    """Verifica que no se hayan reducido secuencias obligatorias de la guía."""
+
+    issues: list[str] = []
+    relevant = [
+        sequence
+        for sequence in manifest
+        if sequence["guide_index"] == selected_guide_index
+    ]
+
+    for sequence in relevant:
+        section = _best_final_section_for_sequence(final_document, sequence)
+        expected = sequence["expected_count"]
+        actual = len(section.numbered_items) if section else 0
+        if actual < expected:
+            section_name = section.title if section else "No identificada"
+            issues.append(
+                f"La sección '{sequence['section_title']}' exige {expected} elementos, "
+                f"pero '{section_name}' contiene {actual}."
+            )
+    return issues
+
+
+def fidelity_repair_prompt(
+    final_document: FinalDocument,
+    manifest: list[dict],
+    selected_guide_index: int,
+) -> str:
+    relevant = [
+        sequence
+        for sequence in manifest
+        if sequence["guide_index"] == selected_guide_index
+    ]
+    return f"""
+Actúa como revisor de fidelidad documental. Corrige el documento completo para
+que conserve TODOS los pasos, actividades y requisitos enumerados por la guía.
+
+DOCUMENTO ACTUAL
+{final_document.model_dump_json(indent=2)}
+
+INVENTARIO OBLIGATORIO
+{render_fidelity_manifest(relevant)}
+
+REGLAS INNEGOCIABLES
+1. Conserva todas las secciones existentes y su orden.
+2. En cada secuencia, crea un elemento independiente por cada elemento de la guía.
+3. No resumas, fusiones, agrupes ni omitas elementos.
+4. Si la guía contiene 8 pasos, numbered_items debe contener los 8 pasos.
+5. Mejora la redacción sin alterar la acción, el orden ni el sentido de cada paso.
+6. No inventes datos del caso; usa el origen y las respuestas del usuario.
+7. Devuelve únicamente el objeto FinalDocument completo y corregido.
+""".strip()
+
+
+def enforce_fidelity_with_gemini(
+    api_key: str,
+    model: str,
+    guides: list[dict],
+    source: dict,
+    analysis: GuideAnalysis,
+    final_document: FinalDocument,
+) -> FinalDocument:
+    """Repara automáticamente omisiones estructurales y valida el resultado."""
+
+    manifest = build_guide_fidelity_manifest(guides)
+    issues = document_fidelity_issues(
+        final_document,
+        manifest,
+        analysis.selected_guide_index,
+    )
+    if not issues:
+        return final_document
+
+    relevant_indices = [analysis.selected_guide_index]
+    relevant_indices.extend(analysis.supporting_guide_indices)
+    parts: list[types.Part] = []
+    for index in relevant_indices:
+        append_record_to_gemini_input(parts, guides[index], f"GUÍA DE FIDELIDAD {index}")
+    append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
+    parts.append(
+        types.Part.from_text(
+            text=fidelity_repair_prompt(
+                final_document,
+                manifest,
+                analysis.selected_guide_index,
+            )
+        )
+    )
+
+    repaired = call_gemini_structured(
+        api_key=api_key,
+        model=model,
+        input_parts=parts,
+        schema_model=FinalDocument,
+    )
+    assert isinstance(repaired, FinalDocument)
+    repaired = normalize_final_document_structure(repaired)
+
+    remaining = document_fidelity_issues(
+        repaired,
+        manifest,
+        analysis.selected_guide_index,
+    )
+    if remaining:
+        raise AppError(
+            "El documento no superó el control de fidelidad estructural. "
+            + " ".join(remaining)
+            + " El sistema no generará un archivo incompleto."
+        )
+    return repaired
 
 def translate_gemini_error(error: Exception) -> AppError:
     """Convierte errores técnicos frecuentes en mensajes comprensibles."""
@@ -925,10 +1268,14 @@ def _discover_candidate_models(client, configured_model: str) -> list[str]:
 
     configured = _normalize_model_name(configured_model)
     preferred_defaults = [
-    configured,
-    "gemini-3.1-flash-lite",
-    "gemini-flash-latest",
-]
+        configured,
+        "gemini-flash-lite-latest",
+        "gemini-flash-latest",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+    ]
 
     discovered: list[str] = []
     try:
@@ -959,7 +1306,7 @@ def _discover_candidate_models(client, configured_model: str) -> list[str]:
             add(candidate)
 
     # Evita esperas excesivas si el listado contiene demasiados modelos.
-    return ordered[:3]
+    return ordered[:8]
 
 
 def _is_retryable_gemini_error(error: Exception) -> bool:
@@ -1383,6 +1730,11 @@ def regenerate_section_with_gemini(
     append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
     parts.append(
         types.Part.from_text(
+            text=render_fidelity_manifest(build_guide_fidelity_manifest(guides))
+        )
+    )
+    parts.append(
+        types.Part.from_text(
             text=section_regeneration_prompt(
                 analysis,
                 answers,
@@ -1417,6 +1769,11 @@ def analyze_guides_and_source(
         append_record_to_gemini_input(parts, guide, f"GUÍA {index}")
 
     append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
+    parts.append(
+        types.Part.from_text(
+            text=render_fidelity_manifest(build_guide_fidelity_manifest(guides))
+        )
+    )
     parts.append(
         types.Part.from_text(
             text=analysis_prompt(
@@ -1487,6 +1844,11 @@ def generate_final_with_gemini(
     append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
     parts.append(
         types.Part.from_text(
+            text=render_fidelity_manifest(build_guide_fidelity_manifest(guides))
+        )
+    )
+    parts.append(
+        types.Part.from_text(
             text=generation_prompt(analysis, answers)
         )
     )
@@ -1500,6 +1862,14 @@ def generate_final_with_gemini(
 
     assert isinstance(result, FinalDocument)
     result = normalize_final_document_structure(result)
+    result = enforce_fidelity_with_gemini(
+        api_key=api_key,
+        model=model,
+        guides=guides,
+        source=source,
+        analysis=analysis,
+        final_document=result,
+    )
 
     if not result.sections:
         raise AppError("Gemini no generó las secciones del documento final.")
@@ -2453,6 +2823,22 @@ def show_analysis(analysis: GuideAnalysis, guides: list[dict]) -> None:
     )
 
     st.info(analysis.selection_reason)
+
+    fidelity_manifest = build_guide_fidelity_manifest(guides)
+    selected_sequences = [
+        sequence
+        for sequence in fidelity_manifest
+        if sequence["guide_index"] == analysis.selected_guide_index
+    ]
+    if selected_sequences:
+        with st.expander("Control de fidelidad estructural", expanded=True):
+            for sequence in selected_sequences:
+                st.success(
+                    f"{sequence['section_title']}: "
+                    f"{sequence['expected_count']} elementos obligatorios detectados."
+                )
+                for item_index, item in enumerate(sequence["items"], start=1):
+                    st.write(f"{item_index}. {item}")
 
     if analysis.supporting_guide_indices:
         supporting_names = [
@@ -3490,7 +3876,17 @@ def main() -> None:
                         edited_document
                     )
 
-                    st.write("2/4 · Auditando el contenido contra la guía")
+                    st.write("2/5 · Verificando que no falte ningún paso de la guía")
+                    edited_document = enforce_fidelity_with_gemini(
+                        api_key=api_key,
+                        model=model or MODEL_DEFAULT,
+                        guides=guide_records,
+                        source=source_record,
+                        analysis=analysis,
+                        final_document=edited_document,
+                    )
+
+                    st.write("3/5 · Auditando el contenido contra la guía")
                     try:
                         audit_report = audit_final_document_with_gemini(
                             api_key=api_key,
@@ -3524,13 +3920,13 @@ def main() -> None:
                         with st.expander("Ver detalle de la revalidación"):
                             st.code(str(audit_error)[:1600], language=None)
 
-                    st.write("3/4 · Aplicando formato institucional y paginación")
+                    st.write("4/5 · Aplicando formato institucional y paginación")
                     docx_output = create_docx(
                         edited_document,
                         style_guide=selected_guide,
                     )
 
-                    st.write("4/4 · Creando la versión PDF")
+                    st.write("5/5 · Creando la versión PDF")
                     pdf_output = convert_docx_to_pdf(docx_output)
                     if pdf_output is None:
                         pdf_output = create_pdf(edited_document)
