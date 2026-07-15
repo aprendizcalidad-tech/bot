@@ -15,6 +15,7 @@ import time
 from io import BytesIO
 from pathlib import Path
 from typing import Literal
+from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape
 
 import pdfplumber
@@ -27,6 +28,10 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
 from google import genai
 from google.genai import types
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as build_drive_api
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 from pydantic import BaseModel, ConfigDict, Field
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -67,14 +72,22 @@ ALLOWED_EXTENSIONS = GUIDE_EXTENSIONS
 MODEL_DEFAULT = "gemini-flash-latest"
 MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-MAX_VIDEO_SIZE_MB = 2000
+# Los videos grandes deben entrar por Google Drive para no llenar la memoria
+# de Streamlit. El cargador directo queda limitado a archivos pequeños.
+MAX_VIDEO_SIZE_MB = 250
 MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
-VIDEO_PROCESSING_TIMEOUT_SECONDS = 1800
+MAX_DRIVE_VIDEO_SIZE_MB = 1900
+MAX_DRIVE_VIDEO_SIZE_BYTES = MAX_DRIVE_VIDEO_SIZE_MB * 1024 * 1024
+VIDEO_PROCESSING_TIMEOUT_SECONDS = 3600
 VIDEO_POLL_INTERVAL_SECONDS = 5
+DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
+DRIVE_DOWNLOAD_CHUNK_MB = 8
+DRIVE_DOWNLOAD_CHUNK_BYTES = DRIVE_DOWNLOAD_CHUNK_MB * 1024 * 1024
+DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 MAX_GUIDES = 8
 MAX_TEXT_CHARS_PER_FILE = 80_000
 MAX_TOTAL_TEXT_CHARS = 300_000
-MAX_TOTAL_UPLOAD_MB = 2100
+MAX_TOTAL_UPLOAD_MB = 300
 MAX_TOTAL_UPLOAD_BYTES = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
 
 STATUS_LABELS = {
@@ -309,6 +322,120 @@ def read_secret(name: str, default: str = "") -> str:
         return str(value) if value is not None else default
     except Exception:
         return os.getenv(name, default)
+
+
+def read_drive_service_account_info() -> dict:
+    """Lee la cuenta de servicio de Drive desde los Secrets.
+
+    Formatos aceptados:
+    1. DRIVE_SERVICE_ACCOUNT_JSON como cadena JSON completa.
+    2. Tabla TOML [drive_service_account] con los campos del JSON.
+    """
+
+    info: dict = {}
+
+    try:
+        nested = st.secrets.get("drive_service_account")
+        if nested:
+            info = dict(nested)
+    except Exception:
+        info = {}
+
+    if not info:
+        raw = read_secret("DRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise AppError(
+                    "DRIVE_SERVICE_ACCOUNT_JSON no contiene un JSON válido. "
+                    "Pega el contenido completo del archivo de cuenta de servicio."
+                ) from error
+            if not isinstance(parsed, dict):
+                raise AppError(
+                    "DRIVE_SERVICE_ACCOUNT_JSON debe contener un objeto JSON."
+                )
+            info = parsed
+
+    if info.get("private_key"):
+        info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+
+    return info
+
+
+def drive_service_account_email() -> str:
+    """Devuelve el correo que debe recibir acceso al archivo o carpeta."""
+
+    try:
+        return str(read_drive_service_account_info().get("client_email", "")).strip()
+    except AppError:
+        return ""
+
+
+def build_drive_service():
+    """Crea un cliente de Google Drive autenticado con cuenta de servicio."""
+
+    info = read_drive_service_account_info()
+    required = {"type", "client_email", "private_key", "token_uri"}
+    missing = sorted(field for field in required if not info.get(field))
+    if missing:
+        raise AppError(
+            "Falta configurar la cuenta de servicio de Google Drive. "
+            "Campos ausentes: " + ", ".join(missing) + "."
+        )
+
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=[DRIVE_READONLY_SCOPE],
+        )
+        return build_drive_api(
+            "drive",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+    except Exception as error:
+        raise AppError(
+            "No fue posible autenticar la cuenta de servicio de Google Drive. "
+            "Revisa el JSON guardado en Secrets."
+        ) from error
+
+
+def extract_drive_file_id(reference: str) -> str:
+    """Extrae el ID desde un enlace de Drive o acepta directamente el ID."""
+
+    value = str(reference or "").strip()
+    if not value:
+        raise AppError("Debes pegar el enlace o el ID del video de Google Drive.")
+
+    if re.fullmatch(r"[A-Za-z0-9_-]{15,}", value):
+        return value
+
+    try:
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query)
+        for key in ("id", "file_id"):
+            candidate = (query.get(key) or [""])[0].strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]{15,}", candidate):
+                return candidate
+
+        patterns = (
+            r"/file/d/([A-Za-z0-9_-]{15,})",
+            r"/d/([A-Za-z0-9_-]{15,})",
+            r"/uc/([A-Za-z0-9_-]{15,})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, parsed.path)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+
+    raise AppError(
+        "No se pudo identificar el archivo de Drive. Usa un enlace de archivo "
+        "como https://drive.google.com/file/d/ID/view o pega únicamente el ID."
+    )
 
 
 def safe_filename(filename: str) -> str:
@@ -1629,22 +1756,188 @@ def _file_state_name(file_info) -> str:
     return str(name or state).upper()
 
 
-def transcribe_video_with_gemini(
+def _close_drive_service(service) -> None:
+    try:
+        http = getattr(service, "_http", None)
+        if http is not None and hasattr(http, "close"):
+            http.close()
+    except Exception:
+        pass
+
+
+def _drive_video_extension(filename: str, mime_type: str) -> str:
+    extension = file_extension(filename)
+    if extension in VIDEO_EXTENSIONS:
+        return extension
+
+    by_mime = {
+        "video/mp4": "mp4",
+        "video/mpeg": "mpeg",
+        "video/quicktime": "mov",
+        "video/x-msvideo": "avi",
+        "video/x-flv": "flv",
+        "video/webm": "webm",
+        "video/x-ms-wmv": "wmv",
+        "video/3gpp": "3gp",
+    }
+    return by_mime.get(str(mime_type).lower(), "")
+
+
+def download_drive_video_to_path(
+    drive_reference: str,
+    destination_dir: Path,
+    progress_callback=None,
+) -> tuple[dict, Path]:
+    """Descarga un video de Drive por bloques directamente al disco temporal.
+
+    No guarda el video completo en RAM. El archivo debe haberse compartido como
+    lector con el correo de la cuenta de servicio configurada en Secrets.
+    """
+
+    file_id = extract_drive_file_id(drive_reference)
+    service = build_drive_service()
+
+    def report(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    try:
+        report("Consultando el archivo en Google Drive")
+        metadata = (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields=(
+                    "id,name,size,mimeType,webViewLink,modifiedTime,"
+                    "capabilities(canDownload)"
+                ),
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+
+        filename = safe_filename(str(metadata.get("name") or f"video_{file_id}"))
+        mime_type = str(metadata.get("mimeType") or "application/octet-stream")
+        extension = _drive_video_extension(filename, mime_type)
+
+        if mime_type == "application/vnd.google-apps.vid":
+            raise AppError(
+                "El enlace corresponde a un archivo de Google Vids. Descárgalo "
+                "o expórtalo como MP4 y vuelve a subirlo a Drive."
+            )
+
+        if not extension or not mime_type.lower().startswith("video/"):
+            raise AppError(
+                f"El archivo de Drive '{filename}' no parece ser un video compatible."
+            )
+
+        can_download = metadata.get("capabilities", {}).get("canDownload")
+        if can_download is False:
+            raise AppError(
+                "El propietario de Drive bloqueó la descarga del video. "
+                "Debe permitir la descarga para la cuenta de servicio."
+            )
+
+        size_bytes = int(metadata.get("size") or 0)
+        if size_bytes <= 0:
+            raise AppError(
+                "Drive no informó el tamaño del archivo. Verifica que sea un video "
+                "normal almacenado en Drive y no un acceso directo."
+            )
+        if size_bytes > MAX_DRIVE_VIDEO_SIZE_BYTES:
+            raise AppError(
+                f"El video pesa {format_file_size(size_bytes)} y supera el límite "
+                f"seguro de {MAX_DRIVE_VIDEO_SIZE_MB} MB para Gemini."
+            )
+
+        if not filename.lower().endswith(f".{extension}"):
+            filename = f"{filename}.{extension}"
+        local_path = destination_dir / filename
+
+        request = service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+        )
+        started_at = time.monotonic()
+
+        with local_path.open("wb") as output:
+            downloader = MediaIoBaseDownload(
+                output,
+                request,
+                chunksize=DRIVE_DOWNLOAD_CHUNK_BYTES,
+            )
+            done = False
+            while not done:
+                if time.monotonic() - started_at > DRIVE_DOWNLOAD_TIMEOUT_SECONDS:
+                    raise AppError(
+                        "La descarga desde Google Drive superó el tiempo máximo "
+                        "permitido. Prueba con una conexión más estable o un video menor."
+                    )
+
+                status, done = downloader.next_chunk(num_retries=3)
+                if status is not None:
+                    downloaded = int(getattr(status, "resumable_progress", 0) or 0)
+                    progress = int(float(status.progress()) * 100)
+                    report(
+                        f"Descargando desde Drive: {progress}% "
+                        f"({format_file_size(downloaded)} de {format_file_size(size_bytes)})"
+                    )
+
+        actual_size = local_path.stat().st_size if local_path.exists() else 0
+        if actual_size <= 0:
+            raise AppError("Google Drive no entregó contenido descargable.")
+        if actual_size != size_bytes:
+            report(
+                "Drive informó un tamaño diferente al descargado; se continuará "
+                "con el archivo recibido."
+            )
+
+        metadata.update(
+            {
+                "file_id": file_id,
+                "name": filename,
+                "size_bytes": actual_size,
+                "mime_type": MIME_TYPES.get(extension, mime_type),
+                "extension": extension,
+                "drive_reference": drive_reference,
+            }
+        )
+        return metadata, local_path
+
+    except HttpError as error:
+        status_code = getattr(getattr(error, "resp", None), "status", None)
+        account_email = drive_service_account_email()
+        if status_code in {403, 404}:
+            detail = (
+                f" Comparte el archivo o la carpeta como Lector con {account_email}."
+                if account_email
+                else " Configura primero la cuenta de servicio de Drive."
+            )
+            raise AppError(
+                "La cuenta de servicio no puede acceder al video de Google Drive."
+                + detail
+            ) from error
+        raise AppError(
+            f"Google Drive rechazó la descarga. Código HTTP: {status_code or 'desconocido'}."
+        ) from error
+    finally:
+        _close_drive_service(service)
+
+
+def _transcribe_local_video_path_with_gemini(
     api_key: str,
     model: str,
-    video_record: dict,
+    local_path: Path,
+    display_name: str,
+    mime_type: str,
     progress_callback=None,
 ) -> VideoTranscript:
-    """Sube, procesa y transcribe un video con Gemini Files API.
-
-    El archivo remoto se elimina al finalizar, incluso cuando ocurre un error.
-    """
+    """Sube un archivo local temporal a Gemini y devuelve su transcripción."""
 
     if not api_key:
         raise AppError("No se encontró GEMINI_API_KEY para transcribir el video.")
-
-    if not video_record.get("is_video"):
-        raise AppError("El archivo seleccionado no es un video compatible.")
+    if not local_path.exists() or local_path.stat().st_size <= 0:
+        raise AppError("El video temporal no existe o está vacío.")
 
     client = genai.Client(api_key=api_key)
     uploaded_file = None
@@ -1654,19 +1947,14 @@ def transcribe_video_with_gemini(
             progress_callback(message)
 
     try:
-        suffix = f".{video_record['extension']}"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            local_path = Path(temp_dir) / f"video_origen{suffix}"
-            local_path.write_bytes(video_record["content"])
-
-            report("Subiendo el video de forma segura a Gemini Files API")
-            uploaded_file = client.files.upload(
-                file=str(local_path),
-                config=types.UploadFileConfig(
-                    display_name=video_record["name"],
-                    mime_type=video_record["mime_type"],
-                ),
-            )
+        report("Subiendo el video temporal a Gemini Files API")
+        uploaded_file = client.files.upload(
+            file=str(local_path),
+            config=types.UploadFileConfig(
+                display_name=display_name,
+                mime_type=mime_type,
+            ),
+        )
 
         if not getattr(uploaded_file, "name", None):
             raise AppError("Gemini no devolvió un identificador para el video.")
@@ -1700,8 +1988,7 @@ def transcribe_video_with_gemini(
             time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
 
         file_uri = getattr(uploaded_file, "uri", None)
-        mime_type = getattr(uploaded_file, "mime_type", None) or video_record["mime_type"]
-
+        processed_mime = getattr(uploaded_file, "mime_type", None) or mime_type
         if not file_uri:
             raise AppError("Gemini procesó el video, pero no devolvió su URI.")
 
@@ -1709,10 +1996,10 @@ def transcribe_video_with_gemini(
         parts = [
             types.Part.from_uri(
                 file_uri=file_uri,
-                mime_type=mime_type,
+                mime_type=processed_mime,
             ),
             types.Part.from_text(
-                text=video_transcription_prompt(video_record["name"])
+                text=video_transcription_prompt(display_name)
             ),
         ]
 
@@ -1728,7 +2015,6 @@ def transcribe_video_with_gemini(
             raise AppError(
                 "Gemini procesó el video, pero no produjo una transcripción."
             )
-
         return result
 
     except AppError:
@@ -1745,6 +2031,80 @@ def transcribe_video_with_gemini(
             client.close()
         except Exception:
             pass
+
+
+def transcribe_video_with_gemini(
+    api_key: str,
+    model: str,
+    video_record: dict,
+    progress_callback=None,
+) -> VideoTranscript:
+    """Transcribe un video cargado directamente en Streamlit."""
+
+    if not video_record.get("is_video"):
+        raise AppError("El archivo seleccionado no es un video compatible.")
+
+    suffix = f".{video_record['extension']}"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        local_path = Path(temp_dir) / f"video_origen{suffix}"
+        local_path.write_bytes(video_record["content"])
+        return _transcribe_local_video_path_with_gemini(
+            api_key=api_key,
+            model=model,
+            local_path=local_path,
+            display_name=video_record["name"],
+            mime_type=video_record["mime_type"],
+            progress_callback=progress_callback,
+        )
+
+
+def transcribe_drive_video_with_gemini(
+    api_key: str,
+    model: str,
+    drive_reference: str,
+    progress_callback=None,
+) -> tuple[VideoTranscript, dict]:
+    """Descarga un video privado de Drive por bloques y lo transcribe.
+
+    La sesión conserva únicamente metadatos y texto; el video temporal se elimina
+    automáticamente al terminar.
+    """
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        metadata, local_path = download_drive_video_to_path(
+            drive_reference=drive_reference,
+            destination_dir=Path(temp_dir),
+            progress_callback=progress_callback,
+        )
+        transcript = _transcribe_local_video_path_with_gemini(
+            api_key=api_key,
+            model=model,
+            local_path=local_path,
+            display_name=metadata["name"],
+            mime_type=metadata["mime_type"],
+            progress_callback=progress_callback,
+        )
+
+    source_record = {
+        "role": "video de origen desde Google Drive",
+        "index": 0,
+        "name": metadata["name"],
+        "extension": metadata["extension"],
+        "mime_type": metadata["mime_type"],
+        "content": b"",
+        "size_bytes": metadata["size_bytes"],
+        "text": "",
+        "page_count": None,
+        "warnings": [
+            "El video se descargó por bloques desde Google Drive y no se guardó "
+            "en la memoria de la sesión."
+        ],
+        "is_video": True,
+        "origin_kind": "google_drive",
+        "drive_file_id": metadata["file_id"],
+        "drive_url": metadata.get("webViewLink") or drive_reference,
+    }
+    return transcript, source_record
 
 
 def translate_gemini_error(error: Exception) -> AppError:
@@ -3556,11 +3916,32 @@ def show_video_transcript_review(source_record: dict) -> str | None:
         unsafe_allow_html=True,
     )
 
-    with st.expander("Ver video cargado", expanded=False):
-        st.video(
-            source_record["content"],
-            format=source_record["mime_type"],
+    with st.expander("Información del video", expanded=False):
+        st.write(f"**Archivo:** {source_record.get('name', 'Video')}")
+        st.write(
+            f"**Tamaño:** {format_file_size(int(source_record.get('size_bytes') or 0))}"
         )
+        if source_record.get("origin_kind") == "google_drive":
+            st.success(
+                "El video provino de Google Drive. Solo se conservan sus "
+                "metadatos y la transcripción; el archivo temporal ya fue eliminado."
+            )
+            drive_url = str(source_record.get("drive_url") or "").strip()
+            if drive_url:
+                st.link_button(
+                    "Abrir el video original en Google Drive",
+                    drive_url,
+                    width="stretch",
+                )
+        elif source_record.get("content"):
+            st.video(
+                source_record["content"],
+                format=source_record["mime_type"],
+            )
+        else:
+            st.caption(
+                "El video no se conserva en memoria para reducir el consumo de recursos."
+            )
 
     transcript = st.session_state.get("video_transcript")
     if transcript and transcript.uncertainties:
@@ -4373,12 +4754,12 @@ def main() -> None:
     with st.expander("¿Cómo funciona este proceso?", expanded=False):
         st.markdown(
             """
-            1. **Carga las guías institucionales** y un documento o video de origen.
-            2. Si cargas un video, el sistema **transcribe audio y evidencia visual** para que puedas revisarlos.
-            3. El sistema **interpreta, extrae evidencia, redacta y audita**.
-            4. Solo solicita **datos críticos que realmente estén ausentes**.
-            5. Presenta un **borrador editable por secciones** antes de generar.
-            6. Crea un **Word institucional** y su PDF con paginación dinámica.
+            1. **Carga las guías institucionales** y elige un documento, un video pequeño o un video de Google Drive.
+            2. Los videos de Drive se **descargan por bloques al disco temporal**, sin guardarlos completos en la memoria de Streamlit.
+            3. Gemini **transcribe el audio y analiza la evidencia visual** para que puedas revisarlos.
+            4. El sistema **selecciona la guía aplicable y respeta exactamente sus títulos, orden y cantidad de pasos**.
+            5. Solo solicita **datos críticos que realmente estén ausentes**.
+            6. Presenta un **borrador editable** y crea el Word y el PDF institucionales.
             """
         )
 
@@ -4394,6 +4775,13 @@ def main() -> None:
             st.success("Clave de Gemini detectada")
         else:
             st.error("Falta GEMINI_API_KEY")
+
+        drive_email = drive_service_account_email()
+        if drive_email:
+            st.success("Cuenta de Google Drive detectada")
+            st.caption(f"Correo de acceso: {drive_email}")
+        else:
+            st.warning("Google Drive aún no está configurado")
 
         model = st.text_input(
             "Modelo Gemini preferido",
@@ -4411,7 +4799,8 @@ def main() -> None:
             st.caption("Selección automática de modelo habilitada.")
 
         st.caption(
-            f"Hasta {MAX_GUIDES} guías; documentos de {MAX_FILE_SIZE_MB} MB y videos de {MAX_VIDEO_SIZE_MB} MB."
+            f"Hasta {MAX_GUIDES} guías. Carga directa: {MAX_VIDEO_SIZE_MB} MB. "
+            f"Google Drive: {MAX_DRIVE_VIDEO_SIZE_MB} MB recomendados."
         )
 
         if st.button("Reiniciar proceso", width="stretch"):
@@ -4438,58 +4827,110 @@ def main() -> None:
         ),
     )
 
-    source_upload = st.file_uploader(
-        "Documento o video de origen",
-        type=SOURCE_EXTENSIONS,
-        accept_multiple_files=False,
-        key=f"source_{st.session_state.upload_key}",
+    upload_mode_label = "Subir documento o video pequeño"
+    drive_mode_label = "Usar video desde Google Drive"
+    source_mode = st.radio(
+        "¿De dónde viene la información de origen?",
+        options=[upload_mode_label, drive_mode_label],
+        horizontal=True,
+        key="source_origin_mode",
         help=(
-            "Puedes cargar DOCX, PDF, TXT o un video. Cuando el origen sea un "
-            "video, Gemini transcribirá el audio y extraerá la evidencia visual "
-            "antes de comparar la información con las guías."
+            "Usa Google Drive para videos grandes. Así el navegador no envía el "
+            "archivo completo a la memoria de Streamlit."
         ),
     )
+
+    source_upload = None
+    drive_reference = ""
+    source_from_drive = source_mode == drive_mode_label
+
+    if source_from_drive:
+        drive_reference = st.text_input(
+            "Enlace o ID del video en Google Drive",
+            key="drive_video_reference",
+            placeholder="https://drive.google.com/file/d/ID/view",
+            help=(
+                "Comparte el video o la carpeta como Lector con el correo de la "
+                "cuenta de servicio mostrado debajo. No necesitas hacerlo público."
+            ),
+        ).strip()
+
+        service_email = drive_service_account_email()
+        if service_email:
+            st.success(
+                "Google Drive configurado. Comparte el archivo o la carpeta como "
+                f"Lector con: {service_email}"
+            )
+        else:
+            st.error(
+                "Falta DRIVE_SERVICE_ACCOUNT_JSON en los Secrets de Streamlit. "
+                "Sin esa credencial el bot no puede leer archivos privados de Drive."
+            )
+
+        st.caption(
+            f"Drive: máximo recomendado {MAX_DRIVE_VIDEO_SIZE_MB} MB. "
+            "El video se descarga por bloques al disco temporal y se elimina al terminar."
+        )
+    else:
+        source_upload = st.file_uploader(
+            "Documento o video de origen",
+            type=SOURCE_EXTENSIONS,
+            accept_multiple_files=False,
+            key=f"source_{st.session_state.upload_key}",
+            help=(
+                "Puedes cargar DOCX, PDF, TXT o un video pequeño. Para videos "
+                "grandes selecciona Google Drive."
+            ),
+        )
+        st.caption(
+            f"Carga directa: máximo {MAX_VIDEO_SIZE_MB} MB por video y "
+            f"{MAX_TOTAL_UPLOAD_MB} MB en total."
+        )
 
     source_extension = (
         file_extension(source_upload.name)
         if source_upload is not None
         else ""
     )
-    source_is_video = is_video_extension(source_extension)
+    source_is_video = source_from_drive or is_video_extension(source_extension)
 
     current_video_fingerprint = None
-    if source_upload is not None and source_is_video:
-        current_video_fingerprint = uploaded_file_fingerprint(
-            source_upload.name,
-            source_upload.getvalue(),
+    if source_from_drive and drive_reference:
+        try:
+            current_video_fingerprint = (
+                "drive:" + extract_drive_file_id(drive_reference)
+            )
+        except AppError:
+            current_video_fingerprint = "drive:invalid:" + drive_reference
+    elif source_upload is not None and source_is_video:
+        declared_size = int(getattr(source_upload, "size", 0) or 0)
+        current_video_fingerprint = (
+            f"upload:{safe_filename(source_upload.name)}:{declared_size}"
         )
-        stored_fingerprint = st.session_state.get("video_source_fingerprint")
-        if stored_fingerprint and stored_fingerprint != current_video_fingerprint:
-            st.session_state.video_transcript = None
-            st.session_state.video_source_text = None
-            st.session_state.video_source_fingerprint = None
-            st.session_state.source_record = None
-            st.session_state.analysis = None
-            _clear_outputs_after_new_analysis()
 
-    def validate_current_uploads() -> None:
+    stored_fingerprint = st.session_state.get("video_source_fingerprint")
+    if stored_fingerprint and stored_fingerprint != current_video_fingerprint:
+        st.session_state.video_transcript = None
+        st.session_state.video_source_text = None
+        st.session_state.video_source_fingerprint = None
+        st.session_state.source_record = None
+        st.session_state.analysis = None
+        _clear_outputs_after_new_analysis()
+
+    def upload_size(upload) -> int:
+        if upload is None:
+            return 0
+        declared = getattr(upload, "size", None)
+        if declared is not None:
+            return int(declared)
+        return len(upload.getvalue())
+
+    def validate_current_inputs() -> None:
         if not guide_uploads:
             raise AppError("Debes cargar al menos una guía.")
 
         if len(guide_uploads) > MAX_GUIDES:
             raise AppError(f"Solo se permiten hasta {MAX_GUIDES} guías.")
-
-        if source_upload is None:
-            raise AppError("Debes cargar el documento o video de origen.")
-
-        total_upload_bytes = sum(
-            len(upload.getvalue()) for upload in guide_uploads
-        ) + len(source_upload.getvalue())
-        if total_upload_bytes > MAX_TOTAL_UPLOAD_BYTES:
-            raise AppError(
-                f"El conjunto de archivos supera {MAX_TOTAL_UPLOAD_MB} MB. "
-                "Reduce la cantidad o el tamaño de los documentos."
-            )
 
         names = [
             safe_filename(upload.name).lower()
@@ -4497,6 +4938,28 @@ def main() -> None:
         ]
         if len(names) != len(set(names)):
             raise AppError("Hay guías con nombres duplicados.")
+
+        if source_from_drive:
+            extract_drive_file_id(drive_reference)
+            info = read_drive_service_account_info()
+            if not info.get("client_email") or not info.get("private_key"):
+                raise AppError(
+                    "Configura DRIVE_SERVICE_ACCOUNT_JSON en los Secrets de "
+                    "Streamlit antes de usar Google Drive."
+                )
+            total_upload_bytes = sum(upload_size(upload) for upload in guide_uploads)
+        else:
+            if source_upload is None:
+                raise AppError("Debes cargar el documento o video de origen.")
+            total_upload_bytes = sum(
+                upload_size(upload) for upload in guide_uploads
+            ) + upload_size(source_upload)
+
+        if total_upload_bytes > MAX_TOTAL_UPLOAD_BYTES:
+            raise AppError(
+                f"Los archivos enviados por el navegador superan "
+                f"{MAX_TOTAL_UPLOAD_MB} MB. Usa Google Drive para el video grande."
+            )
 
     def build_current_guides() -> list[dict]:
         return [
@@ -4515,10 +4978,16 @@ def main() -> None:
             "transcripción completa y editable; después se compara el texto "
             "aprobado con las guías."
         )
-        st.caption(
-            f"Límite del video: {MAX_VIDEO_SIZE_MB} MB. "
-            "Para mejores resultados usa un solo video, audio claro y formato MP4."
-        )
+        if source_from_drive:
+            st.caption(
+                "El video no pasa por el cargador del navegador. Se descarga por "
+                "fragmentos, se envía temporalmente a Gemini y luego se elimina."
+            )
+        else:
+            st.caption(
+                f"Límite de carga directa: {MAX_VIDEO_SIZE_MB} MB. Para archivos "
+                "mayores utiliza la opción de Google Drive."
+            )
 
         transcript_ready = (
             st.session_state.get("video_transcript") is not None
@@ -4528,41 +4997,56 @@ def main() -> None:
         )
 
         if not transcript_ready:
+            drive_ready = bool(
+                drive_reference and drive_service_account_email()
+            ) if source_from_drive else True
             transcribe_clicked = st.button(
                 "Transcribir video y extraer evidencia visual",
                 type="primary",
                 width="stretch",
-                disabled=not api_key,
+                disabled=not api_key or not drive_ready,
             )
 
             if transcribe_clicked:
                 try:
-                    validate_current_uploads()
+                    validate_current_inputs()
 
                     with st.status(
                         "Procesando el video...",
                         expanded=True,
                     ) as status:
-                        st.write("1/4 · Validando el archivo y las guías")
+                        st.write("1/4 · Validando el origen y las guías")
                         guide_records = build_current_guides()
-                        source_record = build_file_record(
-                            source_upload,
-                            role="video de origen",
-                            index=0,
-                            allowed_extensions=SOURCE_EXTENSIONS,
-                        )
-
                         progress_slot = st.empty()
 
                         def video_progress(message: str) -> None:
                             progress_slot.write(f"2/4 · {message}")
 
-                        transcript = transcribe_video_with_gemini(
-                            api_key=api_key,
-                            model=model or MODEL_DEFAULT,
-                            video_record=source_record,
-                            progress_callback=video_progress,
-                        )
+                        if source_from_drive:
+                            transcript, source_record = (
+                                transcribe_drive_video_with_gemini(
+                                    api_key=api_key,
+                                    model=model or MODEL_DEFAULT,
+                                    drive_reference=drive_reference,
+                                    progress_callback=video_progress,
+                                )
+                            )
+                        else:
+                            source_record = build_file_record(
+                                source_upload,
+                                role="video de origen",
+                                index=0,
+                                allowed_extensions=SOURCE_EXTENSIONS,
+                            )
+                            transcript = transcribe_video_with_gemini(
+                                api_key=api_key,
+                                model=model or MODEL_DEFAULT,
+                                video_record=source_record,
+                                progress_callback=video_progress,
+                            )
+                            # No conservar otra copia del video dentro del estado.
+                            source_record["content"] = b""
+                            source_record["origin_kind"] = "direct_upload"
 
                         st.write("3/4 · Preparando el origen textual editable")
                         source_text = render_video_transcript_as_source(
@@ -4572,7 +5056,7 @@ def main() -> None:
                         source_record["text"] = source_text
                         source_record["warnings"] = [
                             warning
-                            for warning in source_record["warnings"]
+                            for warning in source_record.get("warnings", [])
                             if "Debe transcribirse" not in warning
                         ]
                         source_record["warnings"].append(
@@ -4620,7 +5104,7 @@ def main() -> None:
 
             if approved_source_text is not None:
                 try:
-                    validate_current_uploads()
+                    validate_current_inputs()
                     guide_records = build_current_guides()
                     source_record = deepcopy(source_record)
                     source_record["text"] = approved_source_text
@@ -4696,7 +5180,7 @@ def main() -> None:
 
         if analyze_clicked:
             try:
-                validate_current_uploads()
+                validate_current_inputs()
 
                 with st.status(
                     "Analizando el proceso documental...",

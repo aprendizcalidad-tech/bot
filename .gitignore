@@ -1,8 +1,6 @@
-__pycache__/
-*.py[cod]
-.venv/
-.env
 .streamlit/secrets.toml
-.pytest_cache/
-.DS_Store
-Thumbs.db
+*.json
+__pycache__/
+*.pyc
+output/
+.env

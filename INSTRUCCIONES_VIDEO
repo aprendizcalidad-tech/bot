@@ -1,0 +1,17 @@
+ACTUALIZACIÓN: SOPORTE DE VIDEO COMO DOCUMENTO DE ORIGEN
+
+1. Reemplaza tu app.py por app_video_gemini_final.py y renómbralo a app.py.
+2. Copia streamlit_config.toml a .streamlit/config.toml.
+3. No cambies requirements.txt si ya contiene google-genai.
+4. Flujo:
+   - Cargar guías.
+   - Cargar documento o video.
+   - Si es video: transcribir y extraer evidencia visual.
+   - Revisar/corregir la transcripción.
+   - Aprobar y analizar contra las guías.
+   - Generar Word y PDF.
+
+Formatos de video:
+mp4, mpeg, mov, avi, flv, mpg, webm, wmv, 3gp y 3gpp.
+
+Límite configurado: 2000 MB por video.
