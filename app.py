@@ -70,6 +70,7 @@ SOURCE_EXTENSIONS = GUIDE_EXTENSIONS + VIDEO_EXTENSIONS
 ALLOWED_EXTENSIONS = GUIDE_EXTENSIONS
 
 MODEL_DEFAULT = "gemini-flash-latest"
+VIDEO_MODEL_DEFAULT = "gemini-3.5-flash"
 MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # Los videos grandes deben entrar por Google Drive para no llenar la memoria
@@ -105,10 +106,10 @@ MIME_TYPES = {
     "txt": "text/plain",
     "mp4": "video/mp4",
     "mpeg": "video/mpeg",
-    "mov": "video/mov",
-    "avi": "video/avi",
+    "mov": "video/quicktime",
+    "avi": "video/x-msvideo",
     "flv": "video/x-flv",
-    "mpg": "video/mpg",
+    "mpg": "video/mpeg",
     "webm": "video/webm",
     "wmv": "video/wmv",
     "3gp": "video/3gpp",
@@ -1924,6 +1925,166 @@ def download_drive_video_to_path(
         _close_drive_service(service)
 
 
+def _video_model_candidates(configured_model: str) -> list[str]:
+    """Modelos de video en orden seguro, sin duplicados.
+
+    La comprensión de video usa un modelo multimodal explícito. No reutiliza
+    indiscriminadamente todos los modelos de texto descubiertos por la API.
+    """
+
+    secret_model = read_secret("GEMINI_VIDEO_MODEL", VIDEO_MODEL_DEFAULT).strip()
+    candidates = [
+        secret_model,
+        VIDEO_MODEL_DEFAULT,
+        configured_model,
+        "gemini-flash-latest",
+    ]
+    result: list[str] = []
+    for candidate in candidates:
+        normalized = _normalize_model_name(candidate)
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _interaction_output_text(interaction) -> str:
+    """Obtiene el texto de una respuesta de Interactions API."""
+
+    output_text = getattr(interaction, "output_text", None)
+    if output_text:
+        return str(output_text).strip()
+
+    # Respaldo defensivo para cambios menores del SDK.
+    outputs = getattr(interaction, "outputs", None) or []
+    fragments: list[str] = []
+    for output in outputs:
+        text = getattr(output, "text", None)
+        if text:
+            fragments.append(str(text))
+        elif isinstance(output, dict) and output.get("text"):
+            fragments.append(str(output["text"]))
+    return "\n".join(fragments).strip()
+
+
+def _video_schema_prompt(prompt: str, schema: dict) -> str:
+    """Añade un esquema de respaldo cuando el endpoint rechaza response_format."""
+
+    schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    return (
+        prompt
+        + "\n\nFORMATO JSON OBLIGATORIO\n"
+        + "Devuelve solo un objeto JSON válido, sin Markdown ni comentarios, "
+          "que cumpla exactamente este esquema: "
+        + schema_text
+    )
+
+
+def _call_video_interaction(
+    client,
+    model: str,
+    file_uri: str,
+    mime_type: str,
+    prompt: str,
+    schema_model: type[BaseModel],
+) -> BaseModel:
+    """Transcribe video con Interactions API y fallback sin esquema nativo."""
+
+    schema = _inline_and_clean_json_schema(schema_model)
+    video_input = {
+        "type": "video",
+        "uri": file_uri,
+        "mime_type": mime_type,
+    }
+
+    try:
+        interaction = client.interactions.create(
+            model=model,
+            input=[
+                video_input,
+                {"type": "text", "text": prompt},
+            ],
+            response_format={
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": schema,
+            },
+        )
+        output_text = _interaction_output_text(interaction)
+        if not output_text:
+            raise AppError("Gemini no devolvió texto al analizar el video.")
+        return schema_model.model_validate_json(_clean_json_text(output_text))
+
+    except AppError:
+        raise
+    except Exception as first_error:
+        first_message = str(first_error).upper()
+        schema_or_argument_error = (
+            "400" in first_message
+            or "INVALID_ARGUMENT" in first_message
+            or "RESPONSE_FORMAT" in first_message
+            or "SCHEMA" in first_message
+        )
+        if not schema_or_argument_error:
+            raise
+
+        # Algunos modelos/endpoints aceptan el video pero rechazan el esquema
+        # nativo. Se repite la misma llamada sin response_format y se valida
+        # localmente con Pydantic.
+        fallback_prompt = _video_schema_prompt(prompt, schema)
+        interaction = client.interactions.create(
+            model=model,
+            input=[
+                video_input,
+                {"type": "text", "text": fallback_prompt},
+            ],
+        )
+        output_text = _interaction_output_text(interaction)
+        if not output_text:
+            raise AppError("Gemini no devolvió texto al analizar el video.")
+        try:
+            return schema_model.model_validate_json(_clean_json_text(output_text))
+        except Exception as validation_error:
+            raise AppError(
+                "Gemini analizó el video, pero la transcripción no llegó en un "
+                "JSON válido. Detalle: " + str(validation_error)[:500]
+            ) from validation_error
+
+
+def _call_video_generate_content_fallback(
+    client,
+    model: str,
+    file_uri: str,
+    mime_type: str,
+    prompt: str,
+    schema_model: type[BaseModel],
+) -> BaseModel:
+    """Compatibilidad con SDKs que todavía no exponen Interactions API."""
+
+    schema = _inline_and_clean_json_schema(schema_model)
+    fallback_prompt = _video_schema_prompt(prompt, schema)
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
+            fallback_prompt,
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+    output_text = getattr(response, "text", None)
+    if not output_text:
+        raise AppError("Gemini no devolvió texto al analizar el video.")
+    try:
+        return schema_model.model_validate_json(_clean_json_text(str(output_text)))
+    except Exception as validation_error:
+        raise AppError(
+            "Gemini analizó el video, pero la transcripción no llegó en un "
+            "JSON válido. Detalle: " + str(validation_error)[:500]
+        ) from validation_error
+
+
 def _transcribe_local_video_path_with_gemini(
     api_key: str,
     model: str,
@@ -1932,12 +2093,21 @@ def _transcribe_local_video_path_with_gemini(
     mime_type: str,
     progress_callback=None,
 ) -> VideoTranscript:
-    """Sube un archivo local temporal a Gemini y devuelve su transcripción."""
+    """Sube un archivo temporal y lo transcribe con una ruta multimodal segura."""
 
     if not api_key:
         raise AppError("No se encontró GEMINI_API_KEY para transcribir el video.")
     if not local_path.exists() or local_path.stat().st_size <= 0:
         raise AppError("El video temporal no existe o está vacío.")
+
+    # El límite oficial del File API se expresa en GB decimales. Mantener un
+    # margen evita aceptar 2000 MiB, que en bytes supera 2 GB.
+    max_file_api_bytes = 1_950_000_000
+    if local_path.stat().st_size > max_file_api_bytes:
+        raise AppError(
+            "El video supera el límite seguro de 1,95 GB para Gemini Files API. "
+            "Comprímelo o divídelo antes de procesarlo."
+        )
 
     client = genai.Client(api_key=api_key)
     uploaded_file = None
@@ -1948,13 +2118,10 @@ def _transcribe_local_video_path_with_gemini(
 
     try:
         report("Subiendo el video temporal a Gemini Files API")
-        uploaded_file = client.files.upload(
-            file=str(local_path),
-            config=types.UploadFileConfig(
-                display_name=display_name,
-                mime_type=mime_type,
-            ),
-        )
+        # La documentación oficial recomienda permitir que Files API detecte el
+        # MIME desde el archivo. Forzarlo puede producir INVALID_ARGUMENT cuando
+        # Drive y la extensión reportan variantes distintas.
+        uploaded_file = client.files.upload(file=str(local_path))
 
         if not getattr(uploaded_file, "name", None):
             raise AppError("Gemini no devolvió un identificador para el video.")
@@ -1991,36 +2158,84 @@ def _transcribe_local_video_path_with_gemini(
         processed_mime = getattr(uploaded_file, "mime_type", None) or mime_type
         if not file_uri:
             raise AppError("Gemini procesó el video, pero no devolvió su URI.")
+        if not str(processed_mime).lower().startswith("video/"):
+            raise AppError(
+                "Gemini recibió el archivo, pero lo identificó con un tipo no "
+                f"compatible: {processed_mime}."
+            )
 
         report("Transcribiendo el audio y extrayendo la información visual")
-        parts = [
-            types.Part.from_uri(
-                file_uri=file_uri,
-                mime_type=processed_mime,
-            ),
-            types.Part.from_text(
-                text=video_transcription_prompt(display_name)
-            ),
-        ]
+        prompt = video_transcription_prompt(display_name)
+        errors: list[str] = []
 
-        result = call_gemini_structured(
-            api_key=api_key,
-            model=model,
-            input_parts=parts,
-            schema_model=VideoTranscript,
+        for candidate_model in _video_model_candidates(model):
+            report(f"Analizando el video con {candidate_model}")
+            try:
+                if hasattr(client, "interactions"):
+                    result = _call_video_interaction(
+                        client=client,
+                        model=candidate_model,
+                        file_uri=str(file_uri),
+                        mime_type=str(processed_mime),
+                        prompt=prompt,
+                        schema_model=VideoTranscript,
+                    )
+                else:
+                    result = _call_video_generate_content_fallback(
+                        client=client,
+                        model=candidate_model,
+                        file_uri=str(file_uri),
+                        mime_type=str(processed_mime),
+                        prompt=prompt,
+                        schema_model=VideoTranscript,
+                    )
+                assert isinstance(result, VideoTranscript)
+                st.session_state["active_gemini_model"] = candidate_model
+                if not result.full_transcript.strip():
+                    raise AppError(
+                        "Gemini procesó el video, pero no produjo una transcripción."
+                    )
+                return result
+
+            except AppError as error:
+                errors.append(f"{candidate_model}: {str(error)[:220]}")
+                # Un JSON inválido puede variar entre modelos; se prueba el siguiente.
+                continue
+            except Exception as error:
+                message = str(error)
+                errors.append(f"{candidate_model}: {message[:220]}")
+                upper = message.upper()
+                if any(
+                    term in upper
+                    for term in (
+                        "400",
+                        "INVALID_ARGUMENT",
+                        "404",
+                        "NOT_FOUND",
+                        "429",
+                        "RESOURCE_EXHAUSTED",
+                        "503",
+                        "UNAVAILABLE",
+                    )
+                ):
+                    continue
+                raise translate_gemini_error(error) from error
+
+        raise AppError(
+            "Gemini no pudo analizar el video con los modelos multimodales "
+            "disponibles. Verifica que sea un video reproducible y que pese menos "
+            "de 1,95 GB. Detalles: " + " | ".join(errors[-4:])[:900]
         )
-        assert isinstance(result, VideoTranscript)
-
-        if not result.full_transcript.strip():
-            raise AppError(
-                "Gemini procesó el video, pero no produjo una transcripción."
-            )
-        return result
 
     except AppError:
         raise
     except Exception as error:
-        raise translate_gemini_error(error) from error
+        stage_detail = (
+            f"Archivo: {display_name}; tamaño: "
+            f"{format_file_size(local_path.stat().st_size)}; MIME informado: {mime_type}. "
+        )
+        translated = translate_gemini_error(error)
+        raise AppError(stage_detail + str(translated)) from error
     finally:
         if uploaded_file is not None and getattr(uploaded_file, "name", None):
             try:
@@ -2279,10 +2494,16 @@ def _is_schema_endpoint_error(error: Exception) -> bool:
     return (
         "RESPONSE_SCHEMA" in message
         or "RESPONSE_JSON_SCHEMA" in message
+        or "RESPONSE_FORMAT" in message
         or "ADDITIONAL_PROPERTIES" in message
         or "ADDITIONALPROPERTIES" in message
         or "UNKNOWN NAME" in message
         or "CANNOT FIND FIELD" in message
+        # Algunos endpoints devuelven únicamente un 400 genérico cuando el
+        # esquema estructurado no es compatible. En ese caso se intenta el
+        # modo JSON por prompt y se valida localmente con Pydantic.
+        or "INVALID_ARGUMENT" in message
+        or "400" in message
     )
 
 
@@ -2548,6 +2769,8 @@ def call_gemini_structured(
                     if (
                         "404" in fallback_upper
                         or "NOT_FOUND" in fallback_upper
+                        or "400" in fallback_upper
+                        or "INVALID_ARGUMENT" in fallback_upper
                         or _is_retryable_gemini_error(fallback_error)
                     ):
                         continue
