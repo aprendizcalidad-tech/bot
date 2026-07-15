@@ -80,8 +80,10 @@ MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
 MAX_DRIVE_VIDEO_SIZE_MB = 1900
 MAX_DRIVE_VIDEO_SIZE_BYTES = MAX_DRIVE_VIDEO_SIZE_MB * 1024 * 1024
 VIDEO_PROCESSING_TIMEOUT_SECONDS = 3600
-VIDEO_CHUNK_SECONDS = 1800  # 30 minutos por solicitud
-VIDEO_LONG_THRESHOLD_SECONDS = 3300  # 55 minutos
+VIDEO_CHUNK_SECONDS = 600  # 10 minutos por solicitud
+VIDEO_MIN_CHUNK_SECONDS = 120  # respaldo mínimo de 2 minutos
+VIDEO_LONG_THRESHOLD_SECONDS = 720  # desde 12 minutos se divide
+VIDEO_MAX_OUTPUT_TOKENS = 32768
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -1684,14 +1686,14 @@ que posteriormente será comparada con guías institucionales.
 REGLAS DE TRANSCRIPCIÓN
 1. Transcribe de principio a fin todo el discurso audible y relevante.
 2. Mantén el orden cronológico.
-3. Incluye marcas de tiempo con formato [MM:SS] al inicio de cada intervención
+3. Incluye marcas de tiempo con formato [HH:MM:SS] al inicio de cada intervención
    o cuando cambie el tema.
 4. Identifica hablantes como Hablante 1, Hablante 2, etc. Usa nombres propios
    únicamente cuando sean explícitos y verificables en el audio o en pantalla.
 5. No resumas, no fusiones intervenciones y no omitas pasos, decisiones,
    instrucciones, cifras, fechas, nombres, sistemas, responsables ni controles.
 6. Conserva literalmente números, códigos, radicados, fechas y valores.
-7. Cuando una parte no sea comprensible, escribe [inaudible MM:SS] y registra
+7. Cuando una parte no sea comprensible, escribe [inaudible HH:MM:SS] y registra
    la duda en uncertainties. No inventes palabras.
 8. Incluye en visual_evidence toda información útil que aparezca en pantalla:
    textos, tablas, diapositivas, formularios, nombres de sistemas, campos,
@@ -2221,6 +2223,130 @@ def _build_video_file_part(
     return types.Part(**kwargs)
 
 
+def _response_finish_reason(response) -> str:
+    """Devuelve la razón de finalización de la primera alternativa."""
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return ""
+        reason = getattr(candidates[0], "finish_reason", None)
+        name = getattr(reason, "name", None)
+        return str(name or reason or "").upper()
+    except Exception:
+        return ""
+
+
+def _tagged_section(text: str, name: str, next_names: list[str]) -> str:
+    """Extrae una sección de una respuesta etiquetada sin exigir JSON."""
+
+    end_pattern = "|".join(re.escape(item) for item in next_names)
+    pattern = rf"(?is)\[{re.escape(name)}\]\s*(.*?)(?=\n\[(?:{end_pattern})\]\s*|\Z)"
+    match = re.search(pattern, text)
+    return match.group(1).strip() if match else ""
+
+
+def _tagged_list(text: str, name: str, next_names: list[str]) -> list[str]:
+    block = _tagged_section(text, name, next_names)
+    if not block:
+        return []
+    values: list[str] = []
+    for line in block.splitlines():
+        cleaned = re.sub(r"^\s*(?:[-•*]|\d+[.)])\s*", "", line).strip()
+        if cleaned:
+            values.append(cleaned)
+    return values
+
+
+def _parse_tagged_video_response(
+    raw_text: str,
+    duration_estimate: str = "",
+) -> VideoTranscript:
+    """Convierte el formato etiquetado de respaldo en VideoTranscript."""
+
+    cleaned = _clean_json_text(str(raw_text or "")).strip()
+    names = [
+        "IDIOMA",
+        "HABLANTES",
+        "TRANSCRIPCION",
+        "TRANSCRIPCIÓN",
+        "EVIDENCIA_VISUAL",
+        "HECHOS_CLAVE",
+        "INCERTIDUMBRES",
+    ]
+
+    language = _tagged_section(cleaned, "IDIOMA", names[1:])
+    speakers = _tagged_list(cleaned, "HABLANTES", names[2:])
+
+    transcript = _tagged_section(
+        cleaned,
+        "TRANSCRIPCION",
+        ["EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
+    )
+    if not transcript:
+        transcript = _tagged_section(
+            cleaned,
+            "TRANSCRIPCIÓN",
+            ["EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
+        )
+
+    visual = _tagged_list(
+        cleaned,
+        "EVIDENCIA_VISUAL",
+        ["HECHOS_CLAVE", "INCERTIDUMBRES"],
+    )
+    facts = _tagged_list(
+        cleaned,
+        "HECHOS_CLAVE",
+        ["INCERTIDUMBRES"],
+    )
+    uncertainties = _tagged_list(cleaned, "INCERTIDUMBRES", [])
+
+    # Respaldo final: si el modelo no respetó etiquetas, conserva todo el texto
+    # como transcripción en vez de perder el tramo.
+    if not transcript:
+        transcript = cleaned
+
+    return VideoTranscript(
+        detected_language=language,
+        duration_estimate=duration_estimate,
+        speakers=speakers,
+        full_transcript=transcript,
+        visual_evidence=visual,
+        key_facts=facts,
+        uncertainties=uncertainties,
+    )
+
+
+def _plain_video_fallback_prompt(
+    prompt: str,
+    start_seconds: float | None,
+    end_seconds: float | None,
+) -> str:
+    interval = ""
+    if start_seconds is not None and end_seconds is not None:
+        interval = (
+            "\nAnaliza exclusivamente el intervalo "
+            f"{_video_clock(start_seconds)} a {_video_clock(end_seconds)}. "
+            "Usa horas absolutas del video original."
+        )
+
+    return (
+        prompt
+        + interval
+        + "\n\nFORMATO DE RESPALDO OBLIGATORIO\n"
+          "No uses JSON ni Markdown. Devuelve exactamente estas etiquetas:\n"
+          "[IDIOMA]\nIdioma principal\n"
+          "[HABLANTES]\n- Hablante 1\n"
+          "[TRANSCRIPCION]\nTranscripción cronológica completa del tramo\n"
+          "[EVIDENCIA_VISUAL]\n- Evidencia con hora\n"
+          "[HECHOS_CLAVE]\n- Hecho verificable\n"
+          "[INCERTIDUMBRES]\n- Duda o fragmento inaudible\n"
+          "No agregues una introducción, una descripción del formato ni texto "
+          "fuera de esas etiquetas."
+    )
+
+
 def _call_video_generate_content_fallback(
     client,
     model: str,
@@ -2230,10 +2356,11 @@ def _call_video_generate_content_fallback(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
 ) -> BaseModel:
-    """Analiza el video mediante File API + generateContent.
+    """Analiza un video con esquema nativo y respaldo etiquetado.
 
-    Para videos largos usa intervalos de tiempo. La resolución baja se envía
-    mediante GenerateContentConfig, que es el parámetro oficial.
+    El error anterior se producía porque el JSON solo se pedía por texto: el
+    modelo podía inventar campos como ``description`` o cortar el objeto. Esta
+    versión aplica ``response_json_schema`` y reduce cada tramo a diez minutos.
     """
 
     schema = _inline_and_clean_json_schema(schema_model)
@@ -2244,46 +2371,96 @@ def _call_video_generate_content_fallback(
             "\n\nINTERVALO OBLIGATORIO\n"
             f"Analiza exclusivamente el tramo {_video_clock(start_seconds)} a "
             f"{_video_clock(end_seconds)} del video completo. Usa marcas de "
-            "tiempo absolutas respecto al inicio del video original, no tiempos "
-            "reiniciados desde cero. No resumas intervenciones relevantes."
+            "tiempo absolutas respecto al inicio del video original. "
+            "No resumas ni omitas intervenciones relevantes."
         )
-
-    final_prompt = _video_schema_prompt(
-        prompt + interval_instruction,
-        schema,
-    )
 
     file_part = _build_video_file_part(
         uploaded_file=uploaded_file,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )
-    prompt_part = types.Part.from_text(text=final_prompt)
+    prompt_part = types.Part.from_text(text=prompt + interval_instruction)
 
-    response = client.models.generate_content(
+    structured_error: Exception | None = None
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=types.Content(
+                role="user",
+                parts=[file_part, prompt_part],
+            ),
+            config=types.GenerateContentConfig(
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+                response_mime_type="application/json",
+                response_json_schema=schema,
+                temperature=0.0,
+                max_output_tokens=VIDEO_MAX_OUTPUT_TOKENS,
+            ),
+        )
+
+        finish_reason = _response_finish_reason(response)
+        if "MAX_TOKENS" in finish_reason:
+            raise AppError(
+                "La respuesta estructurada quedó incompleta por límite de salida."
+            )
+
+        parsed = _validate_structured_output(schema_model, response)
+        if isinstance(parsed, VideoTranscript) and not parsed.full_transcript.strip():
+            raise AppError("Gemini devolvió una transcripción vacía.")
+        return parsed
+
+    except Exception as error:
+        structured_error = error
+
+    # Respaldo sin JSON: evita que un objeto incompleto bloquee todo el video.
+    plain_prompt = _plain_video_fallback_prompt(
+        prompt=prompt,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+    plain_response = client.models.generate_content(
         model=model,
         contents=types.Content(
             role="user",
-            parts=[file_part, prompt_part],
+            parts=[
+                file_part,
+                types.Part.from_text(text=plain_prompt),
+            ],
         ),
         config=types.GenerateContentConfig(
             media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+            temperature=0.0,
+            max_output_tokens=VIDEO_MAX_OUTPUT_TOKENS,
         ),
     )
 
-    output_text = getattr(response, "text", None)
-    if not output_text:
-        raise AppError("Gemini no devolvió texto al analizar el video.")
-
-    try:
-        return schema_model.model_validate_json(
-            _clean_json_text(str(output_text))
-        )
-    except Exception as validation_error:
+    plain_text = str(getattr(plain_response, "text", None) or "").strip()
+    if not plain_text:
         raise AppError(
-            "Gemini procesó el tramo, pero no devolvió el JSON requerido. "
-            f"Detalle: {str(validation_error)[:500]}"
-        ) from validation_error
+            "Gemini no devolvió texto para el tramo. Error estructurado previo: "
+            f"{str(structured_error)[:350]}"
+        )
+
+    finish_reason = _response_finish_reason(plain_response)
+    if "MAX_TOKENS" in finish_reason:
+        raise AppError(
+            "La transcripción del tramo quedó incompleta por límite de salida."
+        )
+
+    duration = ""
+    if start_seconds is not None and end_seconds is not None:
+        duration = _video_clock(max(0, end_seconds - start_seconds))
+
+    parsed_fallback = _parse_tagged_video_response(
+        plain_text,
+        duration_estimate=duration,
+    )
+    if not parsed_fallback.full_transcript.strip():
+        raise AppError(
+            "Gemini devolvió una respuesta sin transcripción utilizable."
+        )
+    return parsed_fallback
 
 
 def _transcribe_video_by_intervals(
@@ -2294,43 +2471,60 @@ def _transcribe_video_by_intervals(
     duration_seconds: float,
     progress_callback=None,
 ) -> VideoTranscript:
-    """Transcribe el video en tramos para evitar exceder el contexto."""
+    """Transcribe por tramos cortos y divide de nuevo si una salida se corta."""
 
     chunks: list[tuple[float, float, VideoTranscript]] = []
+    planned: list[tuple[float, float]] = []
     start_seconds = 0.0
-    total_chunks = max(
-        1,
-        int((duration_seconds + VIDEO_CHUNK_SECONDS - 1) // VIDEO_CHUNK_SECONDS),
-    )
-    chunk_number = 1
 
     while start_seconds < duration_seconds:
-        end_seconds = min(
-            duration_seconds,
-            start_seconds + VIDEO_CHUNK_SECONDS,
-        )
+        end_seconds = min(duration_seconds, start_seconds + VIDEO_CHUNK_SECONDS)
+        planned.append((start_seconds, end_seconds))
+        start_seconds = end_seconds
 
+    completed = 0
+
+    def transcribe_range(start_at: float, end_at: float, depth: int = 0) -> None:
+        nonlocal completed
         if progress_callback is not None:
             progress_callback(
-                f"Transcribiendo tramo {chunk_number}/{total_chunks}: "
-                f"{_video_clock(start_seconds)}–{_video_clock(end_seconds)}"
+                f"Transcribiendo tramo {_video_clock(start_at)}–"
+                f"{_video_clock(end_at)}"
             )
 
-        chunk_result = _call_video_generate_content_fallback(
-            client=client,
-            model=model,
-            uploaded_file=uploaded_file,
-            prompt=prompt,
-            schema_model=VideoTranscript,
-            start_seconds=start_seconds,
-            end_seconds=end_seconds,
-        )
-        assert isinstance(chunk_result, VideoTranscript)
-        chunks.append((start_seconds, end_seconds, chunk_result))
+        try:
+            result = _call_video_generate_content_fallback(
+                client=client,
+                model=model,
+                uploaded_file=uploaded_file,
+                prompt=prompt,
+                schema_model=VideoTranscript,
+                start_seconds=start_at,
+                end_seconds=end_at,
+            )
+            assert isinstance(result, VideoTranscript)
+            chunks.append((start_at, end_at, result))
+            completed += 1
+            return
+        except Exception:
+            duration = end_at - start_at
+            if duration <= VIDEO_MIN_CHUNK_SECONDS or depth >= 4:
+                raise
 
-        start_seconds = end_seconds
-        chunk_number += 1
+            midpoint = start_at + duration / 2
+            if progress_callback is not None:
+                progress_callback(
+                    "La salida fue demasiado extensa; dividiendo el tramo en "
+                    f"{_video_clock(start_at)}–{_video_clock(midpoint)} y "
+                    f"{_video_clock(midpoint)}–{_video_clock(end_at)}"
+                )
+            transcribe_range(start_at, midpoint, depth + 1)
+            transcribe_range(midpoint, end_at, depth + 1)
 
+    for start_at, end_at in planned:
+        transcribe_range(start_at, end_at)
+
+    chunks.sort(key=lambda item: item[0])
     return _merge_video_transcript_chunks(chunks, duration_seconds)
 
 
@@ -2342,7 +2536,7 @@ def _transcribe_local_video_path_with_gemini(
     mime_type: str,
     progress_callback=None,
 ) -> VideoTranscript:
-    """Sube el video y lo procesa completo o en intervalos de 30 minutos."""
+    """Sube el video y lo procesa completo o en intervalos de 10 minutos."""
 
     if not api_key:
         raise AppError("No se encontró GEMINI_API_KEY para transcribir el video.")
@@ -2527,7 +2721,7 @@ def _transcribe_local_video_path_with_gemini(
         raise AppError(
             "Gemini procesó el archivo, pero las solicitudes de inferencia "
             "fallaron. El bot ya probó la solicitud completa y el procesamiento "
-            "por tramos de 30 minutos."
+            "por tramos cortos con división automática."
             + duration_note
             + " Detalles: "
             + " | ".join(errors[-4:])[:1800]
