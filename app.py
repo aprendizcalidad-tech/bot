@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import html
 import json
 import os
@@ -18,6 +19,7 @@ from xml.sax.saxutils import escape
 import pdfplumber
 import streamlit as st
 from docx import Document
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -30,6 +32,7 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
+from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.platypus import (
     KeepTogether,
     Paragraph,
@@ -78,6 +81,13 @@ MIME_TYPES = {
 class MissingQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    category: str = Field(
+        default="Información del proceso",
+        description=(
+            "Categoría breve para agrupar la pregunta, por ejemplo: "
+            "Datos operativos, Responsables, Fechas y periodos o Control documental."
+        ),
+    )
     question: str = Field(
         description=(
             "Pregunta específica que debe responder el usuario. "
@@ -159,6 +169,13 @@ class FinalSection(BaseModel):
     title: str
     paragraphs: list[str]
     bullets: list[str]
+    numbered_items: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Pasos o actividades que deben presentarse como lista numerada. "
+            "No deben incluir viñetas ni el número dentro del texto."
+        ),
+    )
     tables: list[FinalTable]
     source_basis: list[str]
 
@@ -181,6 +198,19 @@ class FinalDocument(BaseModel):
     sections: list[FinalSection]
     validation: list[ValidationItem]
     warnings: list[str]
+
+
+class AuditReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    validation: list[ValidationItem]
+    warnings: list[str]
+    editorial_summary: str = Field(
+        description=(
+            "Resumen breve de la calidad de redacción, coherencia, trazabilidad "
+            "y cumplimiento del documento revisado."
+        )
+    )
 
 
 class AppError(Exception):
@@ -447,12 +477,12 @@ def analysis_prompt(guide_names: list[str], source_name: str) -> str:
     )
 
     return f"""
-Actúa como analista documental, profesional de calidad y redactor técnico.
+Actúa como analista documental, profesional de calidad y redactor técnico institucional.
 
-OBJETIVO DEL ANÁLISIS
-Comparar las GUÍAS NORMATIVAS cargadas por el usuario con el DOCUMENTO DE
-ORIGEN, identificar la guía principal aplicable y convertir sus instrucciones
-en una estructura de documento que pueda completarse sin inventar datos.
+OBJETIVO
+Comparar las GUÍAS cargadas por el usuario con el DOCUMENTO DE ORIGEN,
+seleccionar la guía principal aplicable, interpretar sus instrucciones y
+determinar qué contenido puede redactarse con evidencia verificable.
 
 CATÁLOGO DE GUÍAS
 {catalog}
@@ -460,45 +490,55 @@ CATÁLOGO DE GUÍAS
 DOCUMENTO DE ORIGEN
 {source_name}
 
-INTERPRETACIÓN OBLIGATORIA DE LAS GUÍAS
-Las guías NO son plantillas con marcadores y NO contienen necesariamente los
-datos del caso. Son instrucciones sobre lo que debe tener cada sección.
+MÉTODO OBLIGATORIO EN CUATRO ETAPAS
+ETAPA 1 — INTERPRETAR LA GUÍA
+- Identifica el tipo de documento, las secciones, el orden, los criterios,
+  las tablas, las listas y las reglas de presentación.
+- Las guías son instrucciones de construcción; no copies sus explicaciones
+  como contenido factual del documento final.
 
-Ejemplo:
-Si una guía dice: "OBJETIVO: describir la intención del documento en términos
-del qué y el para qué, de forma clara", debes interpretar que la sección
-Objetivo debe explicar QUÉ se realizará y PARA QUÉ se realizará. No debes copiar
-esa instrucción como si fuera el objetivo final.
+ETAPA 2 — EXTRAER EVIDENCIA
+- Localiza hechos explícitos en el documento de origen.
+- Distingue entre información explícita, información derivable sin agregar
+  hechos nuevos e información ausente.
+- Conserva literalmente nombres, cargos, radicados, fechas, cifras,
+  plataformas y denominaciones oficiales.
 
-REGLAS DE ANÁLISIS
-1. Selecciona una guía principal utilizando su índice real del catálogo.
-2. Puedes indicar guías complementarias si agregan reglas compatibles.
-3. Extrae las secciones, el orden, las instrucciones y los criterios exigidos.
-4. Compara cada criterio con el documento de origen.
-5. Distingue entre:
-   - Información explícita: aparece directamente en el origen.
-   - Información derivable: puede redactarse razonablemente usando hechos del
-     origen, sin agregar hechos nuevos.
-   - Información ausente: no puede inferirse con seguridad.
-6. Nunca inventes nombres, cargos, fechas, cifras, sedes, periodos, resultados,
-   responsables, conclusiones ni decisiones.
-7. Para información ausente, formula preguntas específicas. Ejemplo correcto:
-   "¿Cuál fue el periodo evaluado?". Ejemplo incorrecto: "Complete el alcance".
-8. Reduce preguntas duplicadas: una respuesta puede servir para varias secciones.
-9. draft_content debe ser una propuesta redactada, no una copia de la instrucción.
-10. Si una sección requiere tabla, lista o combinación de formatos, indícalo en
-    output_format.
-11. evidence debe contener referencias breves al documento de origen, no a la guía.
-12. Conserva literalmente identificaciones, radicados, fechas y valores encontrados.
-13. Ordena sections según la guía seleccionada.
-14. selected_guide_name debe coincidir exactamente con el archivo del catálogo.
-15. supporting_guide_indices solo puede contener índices válidos y distintos del
-    índice principal.
+ETAPA 3 — PROPONER REDACCIÓN
+- Redacta draft_content con lenguaje institucional claro, directo y preciso.
+- No inventes datos, responsables, decisiones, resultados, periodos ni
+  controles.
+- Evita repeticiones, muletillas, frases ambiguas y contenido genérico.
+
+ETAPA 4 — IDENTIFICAR BRECHAS
+- Formula únicamente preguntas críticas que no puedan resolverse con el
+  origen.
+- Cada pregunta debe ser específica, breve y responder a un solo dato.
+- Agrupa cada pregunta en una categoría útil: Datos operativos,
+  Responsables, Fechas y periodos, Control documental u otra equivalente.
+- No preguntes por datos de encabezado que la guía ya deja como XX o
+  pendiente de asignación, salvo que sean indispensables para el contenido.
+
+INTERPRETACIÓN
+Ejemplo: si la guía dice “OBJETIVO: describir la intención del documento en
+términos del qué y el para qué”, debes redactar un objetivo que explique QUÉ
+se hará y PARA QUÉ se hará. No copies esa instrucción.
+
+REGLAS
+1. Selecciona una guía principal usando su índice real.
+2. Incluye guías complementarias solo si aportan reglas compatibles.
+3. Ordena las secciones según la guía principal.
+4. evidence debe referirse al documento de origen, no a la guía.
+5. draft_content debe ser contenido final propuesto.
+6. Evita preguntas duplicadas; una respuesta puede servir a varias secciones.
+7. Para procedimientos secuenciales usa output_format “lista” o “mixto”.
+8. selected_guide_name debe coincidir exactamente con el archivo del catálogo.
+9. supporting_guide_indices solo puede contener índices válidos y distintos del principal.
 
 ESTADOS
-- completo: existe información suficiente para redactar y cumplir los criterios.
-- parcial: existe un borrador sustentado, pero faltan uno o más datos críticos.
-- faltante: no hay información suficiente para redactar sin inventar.
+- completo: información suficiente para cumplir todos los criterios.
+- parcial: existe un borrador sustentado, pero falta información crítica.
+- faltante: no es posible redactar sin inventar.
 
 Devuelve únicamente el objeto estructurado solicitado.
 """.strip()
@@ -509,13 +549,13 @@ def generation_prompt(
     answers: list[UserAnswer],
 ) -> str:
     return f"""
-Actúa como redactor técnico y auditor de cumplimiento documental.
+Actúa como redactor técnico institucional y auditor de cumplimiento documental.
 
-Debes generar el DOCUMENTO FINAL utilizando:
-1. Las guías normativas adjuntas.
-2. El documento de origen adjunto.
+Debes producir un DOCUMENTO FINAL profesional utilizando:
+1. Las guías aplicables adjuntas.
+2. El documento de origen.
 3. El análisis estructurado previo.
-4. Las respuestas suministradas por el usuario.
+4. Las respuestas verificables del usuario.
 
 ANÁLISIS PREVIO
 {analysis.model_dump_json(indent=2)}
@@ -523,27 +563,116 @@ ANÁLISIS PREVIO
 RESPUESTAS DEL USUARIO
 {json.dumps([answer.model_dump() for answer in answers], ensure_ascii=False, indent=2)}
 
-REGLAS OBLIGATORIAS
-1. La guía contiene instrucciones, no contenido factual. No copies las
-   instrucciones como texto final.
-2. Redacta cada sección siguiendo exactamente su finalidad y criterios.
-3. Usa únicamente hechos del documento de origen y respuestas del usuario.
-4. Puedes mejorar redacción, cohesión y orden, pero no inventar hechos.
-5. Conserva literalmente nombres, documentos, radicados, fechas, cifras y valores.
-6. Cuando una instrucción pida un objetivo en términos del qué y el para qué,
-   sintetiza ambos elementos en una redacción clara y profesional.
-7. Respeta el orden de las secciones establecido en el análisis.
-8. Usa párrafos, viñetas o tablas según lo exigido por la guía.
-9. No agregues una sección de "datos faltantes" al documento final.
-10. Si todavía existe una limitación no resoluble, regístrala en warnings sin
-    fabricar contenido.
-11. En source_basis indica de forma breve qué información sustenta cada sección.
-12. validation debe revisar cada criterio de la guía y marcar cumple, parcial o
-    no_aplica con una justificación breve.
-13. No incluyas el informe de validación dentro del contenido normal del documento.
-14. Devuelve únicamente el objeto estructurado solicitado.
+PROCESO OBLIGATORIO
+1. INTERPRETAR: confirma la finalidad y criterios de cada sección.
+2. REDACTAR: construye el contenido con trazabilidad y lenguaje institucional.
+3. NORMALIZAR: corrige ortografía, concordancia, puntuación, repeticiones,
+   mayúsculas, fechas y denominaciones.
+4. AUDITAR: evalúa cada criterio y registra el resultado en validation.
+
+REGLAS DE REDACCIÓN
+- Usa un estilo formal, preciso, coherente y eficiente.
+- Prioriza oraciones claras y directas; evita párrafos inflados.
+- Mantén una idea principal por oración cuando sea posible.
+- Usa voz institucional o impersonal.
+- Para procedimientos, usa verbos de acción y orden lógico.
+- No inventes hechos, responsables, fechas, resultados, decisiones ni controles.
+- Conserva literalmente datos sensibles y denominaciones oficiales.
+- No copies las instrucciones de la guía como contenido factual.
+- El objetivo debe integrar claramente el QUÉ y el PARA QUÉ cuando la guía lo exija.
+- El alcance debe indicar inicio, límite y finalización solo cuando estén sustentados.
+- Las definiciones deben presentarse en orden alfabético cuando la guía lo solicite.
+- No incluyas una sección de datos faltantes en el documento final.
+
+ESTRUCTURA DE LISTAS
+- Usa numbered_items exclusivamente para pasos, actividades secuenciales,
+  procedimientos, etapas o instrucciones ordenadas.
+- Cada elemento de numbered_items debe ir sin “1.”, “2.” ni viñeta inicial.
+- Usa bullets para responsabilidades, definiciones, condiciones, referencias
+  y listados sin secuencia.
+- No mezcles una viñeta con un número, por ejemplo “• 1.”.
+
+TABLAS
+- Usa tablas solo cuando la guía las solicite o mejoren claramente la lectura.
+- En control de cambios conserva las columnas de la guía.
+- Evita textos con espacios repetidos o saltos manuales innecesarios.
+
+VALIDACIÓN
+- validation debe revisar cada criterio de la guía.
+- Marca cumple, parcial o no_aplica y explica brevemente.
+- source_basis debe indicar el sustento de cada sección.
+- Registra en warnings cualquier limitación que no pueda resolverse sin inventar.
+
+Devuelve únicamente el objeto estructurado solicitado.
 """.strip()
 
+
+def audit_prompt(
+    analysis: GuideAnalysis,
+    final_document: FinalDocument,
+) -> str:
+    return f"""
+Actúa como auditor documental independiente.
+
+Compara el borrador final contra las instrucciones y criterios identificados
+en la guía. Evalúa contenido, redacción y trazabilidad.
+
+ANÁLISIS DE LA GUÍA
+{analysis.model_dump_json(indent=2)}
+
+BORRADOR A REVISAR
+{final_document.model_dump_json(indent=2)}
+
+CRITERIOS DE AUDITORÍA
+1. Cada sección cumple su finalidad y criterios.
+2. La redacción es formal, clara, precisa y sin repeticiones.
+3. No existen hechos inventados ni afirmaciones sin sustento.
+4. Nombres, cargos, fechas, cifras y sistemas son consistentes.
+5. Los pasos están ordenados y no mezclan viñetas con numeración.
+6. Las tablas son coherentes y no contienen espacios artificiales.
+7. El documento mantiene trazabilidad con el origen y las respuestas.
+8. Las limitaciones reales se registran como advertencias.
+
+Devuelve validation para todos los criterios relevantes, warnings concretos
+y un editorial_summary breve. No reescribas el documento.
+""".strip()
+
+
+def section_regeneration_prompt(
+    analysis: GuideAnalysis,
+    answers: list[UserAnswer],
+    final_document: FinalDocument,
+    section: FinalSection,
+) -> str:
+    return f"""
+Actúa como redactor técnico institucional.
+
+Regenera ÚNICAMENTE la sección indicada, manteniendo el orden y la finalidad
+definidos por la guía. Usa exclusivamente hechos sustentados en los archivos,
+el análisis y las respuestas del usuario.
+
+ANÁLISIS
+{analysis.model_dump_json(indent=2)}
+
+RESPUESTAS
+{json.dumps([answer.model_dump() for answer in answers], ensure_ascii=False, indent=2)}
+
+CONTEXTO DEL DOCUMENTO
+Título: {final_document.title}
+Subtítulo: {final_document.subtitle}
+
+SECCIÓN A REGENERAR
+{section.model_dump_json(indent=2)}
+
+REGLAS
+- Mejora claridad, precisión, cohesión y eficiencia.
+- No inventes información.
+- Conserva el número de orden de la sección.
+- Usa numbered_items para pasos secuenciales y bullets para listas no ordenadas.
+- No incluyas números dentro del texto de numbered_items.
+- Mantén las tablas solo si son necesarias o exigidas por la guía.
+- Devuelve únicamente la estructura FinalSection.
+""".strip()
 
 def translate_gemini_error(error: Exception) -> AppError:
     """Convierte errores técnicos frecuentes en mensajes comprensibles."""
@@ -1007,13 +1136,284 @@ def call_gemini_structured(
             pass
 
 
+def _normalized_question_key(question: str) -> str:
+    """Normaliza una pregunta para detectar duplicados semánticos simples."""
+
+    cleaned = re.sub(r"[¿?¡!.,;:()]+", " ", question.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    stopwords = {
+        "el", "la", "los", "las", "un", "una", "de", "del", "en",
+        "para", "por", "que", "cuál", "cual", "qué", "como", "cómo",
+    }
+    tokens = [token for token in cleaned.split() if token not in stopwords]
+    return " ".join(tokens)
+
+
+def _deduplicate_missing_questions(analysis: GuideAnalysis) -> GuideAnalysis:
+    """Elimina preguntas repetidas sin perder la primera sección que las requiere."""
+
+    seen: set[str] = set()
+
+    for section in analysis.sections:
+        unique_questions: list[MissingQuestion] = []
+
+        for question in section.missing_questions:
+            key = _normalized_question_key(question.question)
+            if not key or key in seen:
+                continue
+
+            seen.add(key)
+            question.category = (
+                question.category.strip() or "Información del proceso"
+            )
+            unique_questions.append(question)
+
+        section.missing_questions = unique_questions
+
+    return analysis
+
+
+def _strip_list_prefix(text: str) -> str:
+    """Elimina viñetas y numeración ya incorporadas en el texto."""
+
+    cleaned = re.sub(r"^\s*[•●▪◦\-–—]\s*", "", text.strip())
+    cleaned = re.sub(r"^\s*\(?\d+\)?[.)\-:]\s*", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def normalize_final_document_structure(
+    final_document: FinalDocument,
+) -> FinalDocument:
+    """Normaliza listas, espacios, tablas y orden antes de generar."""
+
+    normalized_sections: list[FinalSection] = []
+
+    def explicit_number(value: str) -> int | None:
+        match = re.match(
+            r"^\s*[•●▪◦\-–—]?\s*\(?(\d+)\)?[.)\-:]\s+",
+            value,
+        )
+        return int(match.group(1)) if match else None
+
+    for section in sorted(final_document.sections, key=lambda item: item.order):
+        title = re.sub(r"\s+", " ", section.title).strip()
+
+        paragraphs = [
+            re.sub(r"[ \t]+", " ", paragraph).strip()
+            for paragraph in section.paragraphs
+            if paragraph.strip()
+        ]
+
+        title_key = title.lower()
+        sequential_section = any(
+            token in title_key
+            for token in (
+                "paso a paso",
+                "procedimiento",
+                "actividades",
+                "metodología",
+                "metodologia",
+                "etapas",
+            )
+        )
+
+        numbered_candidates: list[tuple[int | None, int, int, str]] = []
+        remaining_bullets: list[str] = []
+
+        for item_index, original in enumerate(section.numbered_items):
+            cleaned = _strip_list_prefix(original)
+            if cleaned:
+                numbered_candidates.append(
+                    (
+                        explicit_number(original),
+                        0,
+                        item_index,
+                        cleaned,
+                    )
+                )
+
+        for item_index, original in enumerate(section.bullets):
+            cleaned = _strip_list_prefix(original)
+            if not cleaned:
+                continue
+
+            detected_number = explicit_number(original)
+            if detected_number is not None or sequential_section:
+                numbered_candidates.append(
+                    (
+                        detected_number,
+                        1,
+                        item_index,
+                        cleaned,
+                    )
+                )
+            else:
+                remaining_bullets.append(cleaned)
+
+        if any(item[0] is not None for item in numbered_candidates):
+            numbered_candidates.sort(
+                key=lambda item: (
+                    item[0] is None,
+                    item[0] if item[0] is not None else 10**9,
+                    item[1],
+                    item[2],
+                )
+            )
+        else:
+            numbered_candidates.sort(key=lambda item: (item[1], item[2]))
+
+        numbered_items = list(
+            dict.fromkeys(item[3] for item in numbered_candidates)
+        )
+        bullets = list(dict.fromkeys(remaining_bullets))
+
+        tables: list[FinalTable] = []
+        for table in section.tables:
+            headers = [
+                re.sub(r"\s+", " ", str(header)).strip()
+                for header in table.headers
+            ]
+            rows = [
+                [
+                    re.sub(r"\s+", " ", str(value)).strip()
+                    for value in row
+                ]
+                for row in table.rows
+            ]
+            tables.append(
+                table.model_copy(
+                    update={
+                        "title": re.sub(r"\s+", " ", table.title).strip(),
+                        "headers": headers,
+                        "rows": rows,
+                    }
+                )
+            )
+
+        normalized_sections.append(
+            section.model_copy(
+                update={
+                    "title": title,
+                    "paragraphs": paragraphs,
+                    "bullets": bullets,
+                    "numbered_items": numbered_items,
+                    "tables": tables,
+                }
+            )
+        )
+
+    return final_document.model_copy(
+        update={
+            "title": re.sub(r"\s+", " ", final_document.title).strip(),
+            "subtitle": re.sub(r"\s+", " ", final_document.subtitle).strip(),
+            "sections": normalized_sections,
+        }
+    )
+
+
+def audit_final_document_with_gemini(
+    api_key: str,
+    model: str,
+    guides: list[dict],
+    source: dict,
+    analysis: GuideAnalysis,
+    final_document: FinalDocument,
+) -> AuditReport:
+    """Audita el documento editado contra las guías y el origen."""
+
+    relevant_indices = [analysis.selected_guide_index]
+    relevant_indices.extend(analysis.supporting_guide_indices)
+
+    parts: list[types.Part] = []
+    for index in relevant_indices:
+        append_record_to_gemini_input(
+            parts,
+            guides[index],
+            f"GUÍA PARA AUDITORÍA {index}",
+        )
+
+    append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
+    parts.append(
+        types.Part.from_text(
+            text=audit_prompt(analysis, final_document)
+        )
+    )
+
+    result = call_gemini_structured(
+        api_key=api_key,
+        model=model,
+        input_parts=parts,
+        schema_model=AuditReport,
+    )
+
+    assert isinstance(result, AuditReport)
+    return result
+
+
+def regenerate_section_with_gemini(
+    api_key: str,
+    model: str,
+    guides: list[dict],
+    source: dict,
+    analysis: GuideAnalysis,
+    answers: list[UserAnswer],
+    final_document: FinalDocument,
+    section_order: int,
+) -> FinalSection:
+    """Regenera una sección específica sin rehacer el documento completo."""
+
+    section = next(
+        (
+            item
+            for item in final_document.sections
+            if item.order == section_order
+        ),
+        None,
+    )
+    if section is None:
+        raise AppError("No se encontró la sección seleccionada para regenerar.")
+
+    relevant_indices = [analysis.selected_guide_index]
+    relevant_indices.extend(analysis.supporting_guide_indices)
+
+    parts: list[types.Part] = []
+    for index in relevant_indices:
+        append_record_to_gemini_input(
+            parts,
+            guides[index],
+            f"GUÍA PARA REGENERACIÓN {index}",
+        )
+
+    append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
+    parts.append(
+        types.Part.from_text(
+            text=section_regeneration_prompt(
+                analysis,
+                answers,
+                final_document,
+                section,
+            )
+        )
+    )
+
+    result = call_gemini_structured(
+        api_key=api_key,
+        model=model,
+        input_parts=parts,
+        schema_model=FinalSection,
+    )
+
+    assert isinstance(result, FinalSection)
+    result.order = section_order
+    return result
+
 def analyze_guides_and_source(
     api_key: str,
     model: str,
     guides: list[dict],
     source: dict,
 ) -> GuideAnalysis:
-    """Selecciona la guía y evalúa el documento de origen."""
+    """Selecciona la guía, evalúa el origen y depura preguntas repetidas."""
 
     parts: list[types.Part] = []
 
@@ -1055,6 +1455,7 @@ def analyze_guides_and_source(
     result.supporting_guide_indices = valid_supporting
 
     result.sections = sorted(result.sections, key=lambda section: section.order)
+    result = _deduplicate_missing_questions(result)
 
     if not result.sections:
         raise AppError(
@@ -1073,7 +1474,7 @@ def generate_final_with_gemini(
     analysis: GuideAnalysis,
     answers: list[UserAnswer],
 ) -> FinalDocument:
-    """Redacta y valida el documento final."""
+    """Redacta el borrador y normaliza su estructura documental."""
 
     relevant_indices = [analysis.selected_guide_index]
     relevant_indices.extend(analysis.supporting_guide_indices)
@@ -1081,7 +1482,11 @@ def generate_final_with_gemini(
     parts: list[types.Part] = []
 
     for index in relevant_indices:
-        append_record_to_gemini_input(parts, guides[index], f"GUÍA APLICABLE {index}")
+        append_record_to_gemini_input(
+            parts,
+            guides[index],
+            f"GUÍA APLICABLE {index}",
+        )
 
     append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
     parts.append(
@@ -1098,7 +1503,7 @@ def generate_final_with_gemini(
     )
 
     assert isinstance(result, FinalDocument)
-    result.sections = sorted(result.sections, key=lambda section: section.order)
+    result = normalize_final_document_structure(result)
 
     if not result.sections:
         raise AppError("Gemini no generó las secciones del documento final.")
@@ -1111,6 +1516,197 @@ def generate_final_with_gemini(
 # =========================================================
 
 
+PAGE_TOTAL_PATTERN = re.compile(
+    r"(?i)\b(p[áa]gina)(\s*:?\s*)\d+\s*(?:de|/)\s*\d+\b"
+)
+PAGE_SINGLE_PATTERN = re.compile(
+    r"(?i)\b(p[áa]gina)(\s*:?\s*)\d+\b"
+)
+
+
+def _set_update_fields_on_open(document: Document) -> None:
+    """Solicita a Word/LibreOffice actualizar PAGE y NUMPAGES."""
+
+    settings = document.settings._element
+    update_fields = settings.find(qn("w:updateFields"))
+    if update_fields is None:
+        update_fields = OxmlElement("w:updateFields")
+        settings.append(update_fields)
+    update_fields.set(qn("w:val"), "true")
+
+
+def _copy_run_format(run, source_rpr) -> None:
+    if source_rpr is not None:
+        run._r.insert(0, deepcopy(source_rpr))
+
+
+def _append_word_field(paragraph, field_code: str, source_rpr=None) -> None:
+    """Inserta un campo de Word, por ejemplo PAGE o NUMPAGES."""
+
+    run = paragraph.add_run()
+    _copy_run_format(run, source_rpr)
+
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = f" {field_code} "
+
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+
+    display = OxmlElement("w:t")
+    display.text = "1"
+
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+
+    run._r.extend([begin, instruction, separate, display, end])
+
+
+def _clear_paragraph_content(paragraph) -> None:
+    """Limpia runs conservando las propiedades del párrafo."""
+
+    for child in list(paragraph._p):
+        if child.tag != qn("w:pPr"):
+            paragraph._p.remove(child)
+
+
+def _replace_page_markers_in_paragraph(paragraph) -> bool:
+    """Reemplaza paginación estática por campos PAGE/NUMPAGES."""
+
+    original_text = paragraph.text
+    if not original_text.strip():
+        return False
+
+    tokenized = PAGE_TOTAL_PATTERN.sub(
+        lambda match: (
+            f"{match.group(1)}{match.group(2)}"
+            "[[PAGE_CURRENT]] de [[PAGE_TOTAL]]"
+        ),
+        original_text,
+    )
+
+    if "[[PAGE_CURRENT]]" not in tokenized:
+        tokenized = PAGE_SINGLE_PATTERN.sub(
+            lambda match: (
+                f"{match.group(1)}{match.group(2)}[[PAGE_CURRENT]]"
+            ),
+            tokenized,
+        )
+
+    if "[[PAGE_CURRENT]]" not in tokenized:
+        return False
+
+    source_rpr = None
+    if paragraph.runs and paragraph.runs[0]._r.rPr is not None:
+        source_rpr = deepcopy(paragraph.runs[0]._r.rPr)
+
+    _clear_paragraph_content(paragraph)
+
+    tokens = re.split(
+        r"(\[\[PAGE_CURRENT\]\]|\[\[PAGE_TOTAL\]\])",
+        tokenized,
+    )
+    for token in tokens:
+        if not token:
+            continue
+        if token == "[[PAGE_CURRENT]]":
+            _append_word_field(paragraph, "PAGE", source_rpr)
+        elif token == "[[PAGE_TOTAL]]":
+            _append_word_field(paragraph, "NUMPAGES", source_rpr)
+        else:
+            run = paragraph.add_run(token)
+            _copy_run_format(run, source_rpr)
+
+    return True
+
+
+def _iter_container_paragraphs(container):
+    for paragraph in container.paragraphs:
+        yield paragraph
+
+    for table in container.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                yield from _iter_container_paragraphs(cell)
+
+
+def apply_dynamic_page_numbering(document: Document) -> int:
+    """
+    Convierte textos como “PÁGINA: 1 de 2” y “Página 1” en campos
+    dinámicos que se actualizan al abrir o convertir el archivo.
+    """
+
+    updated = 0
+    visited_parts: set[int] = set()
+
+    for section in document.sections:
+        containers = (
+            section.header,
+            section.first_page_header,
+            section.even_page_header,
+            section.footer,
+            section.first_page_footer,
+            section.even_page_footer,
+        )
+
+        for container in containers:
+            part_id = id(container.part)
+            if part_id in visited_parts:
+                continue
+            visited_parts.add(part_id)
+
+            for paragraph in _iter_container_paragraphs(container):
+                if _replace_page_markers_in_paragraph(paragraph):
+                    updated += 1
+
+    _set_update_fields_on_open(document)
+    return updated
+
+
+def _set_row_repeat_header(row) -> None:
+    """Repite la primera fila de una tabla al pasar de página."""
+
+    tr_pr = row._tr.get_or_add_trPr()
+    element = tr_pr.find(qn("w:tblHeader"))
+    if element is None:
+        element = OxmlElement("w:tblHeader")
+        tr_pr.append(element)
+    element.set(qn("w:val"), "true")
+
+
+def _set_row_cant_split(row) -> None:
+    """Evita que una fila se parta entre dos páginas."""
+
+    tr_pr = row._tr.get_or_add_trPr()
+    element = tr_pr.find(qn("w:cantSplit"))
+    if element is None:
+        element = OxmlElement("w:cantSplit")
+        tr_pr.append(element)
+
+
+def _normalize_document_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def _format_body_paragraph(paragraph, justify: bool = True) -> None:
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(6)
+    paragraph.paragraph_format.line_spacing = 1.15
+    paragraph.paragraph_format.widow_control = True
+    if justify:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+
+def _format_heading_paragraph(paragraph) -> None:
+    paragraph.paragraph_format.space_before = Pt(12)
+    paragraph.paragraph_format.space_after = Pt(6)
+    paragraph.paragraph_format.keep_with_next = True
+    paragraph.paragraph_format.keep_together = True
+    paragraph.paragraph_format.widow_control = True
+
 def has_docx_style(document: Document, style_name: str) -> bool:
     """Indica si el estilo está materializado dentro del DOCX seleccionado."""
 
@@ -1122,7 +1718,7 @@ def has_docx_style(document: Document, style_name: str) -> bool:
 
 
 def configure_docx(document: Document, preserve_guide_layout: bool = False) -> None:
-    """Configura tipografía base sin asumir que la guía contiene estilos de Word."""
+    """Configura tipografía y espaciado base sin romper la guía institucional."""
 
     if not preserve_guide_layout:
         for section in document.sections:
@@ -1136,54 +1732,78 @@ def configure_docx(document: Document, preserve_guide_layout: bool = False) -> N
         if not normal_style.font.name:
             normal_style.font.name = "Arial"
         if not normal_style.font.size:
-            normal_style.font.size = Pt(11)
+            normal_style.font.size = Pt(10.5)
+        normal_style.paragraph_format.space_after = Pt(6)
+        normal_style.paragraph_format.line_spacing = 1.15
+        normal_style.paragraph_format.widow_control = True
 
     for style_name in ("Title", "Heading 1", "Heading 2"):
         if has_docx_style(document, style_name):
             style = document.styles[style_name]
             if not style.font.name:
                 style.font.name = "Arial"
+            style.paragraph_format.keep_with_next = True
+            style.paragraph_format.widow_control = True
 
 
-def add_safe_heading(document: Document, text: str) -> None:
-    """Agrega un título de sección aunque la guía no tenga el estilo Heading 1."""
+def add_safe_heading(document: Document, text: str):
+    """Agrega un título unido al primer elemento de su sección."""
 
-    clean_text = text.strip()
+    clean_text = _normalize_document_text(text)
     if not clean_text:
-        return
+        return None
 
     if has_docx_style(document, "Heading 1"):
-        document.add_paragraph(clean_text, style="Heading 1")
-        return
+        paragraph = document.add_paragraph(clean_text, style="Heading 1")
+        _format_heading_paragraph(paragraph)
+        return paragraph
 
     paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_before = Pt(12)
-    paragraph.paragraph_format.space_after = Pt(6)
+    _format_heading_paragraph(paragraph)
     run = paragraph.add_run(clean_text)
     run.bold = True
     run.font.name = "Arial"
-    run.font.size = Pt(13)
+    run.font.size = Pt(12)
+    return paragraph
 
 
-def add_safe_bullet(document: Document, text: str) -> None:
-    """Agrega una viñeta sin depender del estilo opcional List Bullet."""
+def add_safe_bullet(document: Document, text: str):
+    """Agrega una viñeta limpia sin depender de estilos opcionales."""
 
-    clean_text = text.strip()
+    clean_text = _strip_list_prefix(text)
     if not clean_text:
-        return
+        return None
 
     if has_docx_style(document, "List Bullet"):
-        document.add_paragraph(clean_text, style="List Bullet")
-        return
+        paragraph = document.add_paragraph(clean_text, style="List Bullet")
+    else:
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.left_indent = Cm(0.65)
+        paragraph.paragraph_format.first_line_indent = Cm(-0.35)
+        bullet_run = paragraph.add_run("• ")
+        bullet_run.bold = True
+        paragraph.add_run(clean_text)
+
+    _format_body_paragraph(paragraph, justify=False)
+    paragraph.paragraph_format.keep_together = True
+    return paragraph
+
+
+def add_safe_numbered(document: Document, text: str, number: int):
+    """Agrega numeración limpia, sin producir combinaciones como “• 1.”."""
+
+    clean_text = _strip_list_prefix(text)
+    if not clean_text:
+        return None
 
     paragraph = document.add_paragraph()
-    paragraph.paragraph_format.left_indent = Cm(0.65)
-    paragraph.paragraph_format.first_line_indent = Cm(-0.35)
-    paragraph.paragraph_format.space_after = Pt(3)
-    bullet_run = paragraph.add_run("• ")
-    bullet_run.bold = True
+    paragraph.paragraph_format.left_indent = Cm(0.72)
+    paragraph.paragraph_format.first_line_indent = Cm(-0.52)
+    paragraph.add_run(f"{number}. ").bold = True
     paragraph.add_run(clean_text)
-
+    _format_body_paragraph(paragraph, justify=False)
+    paragraph.paragraph_format.keep_together = True
+    return paragraph
 
 def apply_safe_table_borders(table) -> None:
     """Dibuja bordes aunque la guía no contenga el estilo Table Grid."""
@@ -1238,9 +1858,14 @@ def load_visual_guide_document(style_guide: dict | None) -> tuple[Document, bool
 
 
 def add_docx_table(document: Document, table_data: FinalTable) -> None:
+    """Agrega una tabla con alineación, filas repetibles y altura automática."""
+
     if table_data.title.strip():
         title_paragraph = document.add_paragraph()
-        title_run = title_paragraph.add_run(table_data.title.strip())
+        _format_heading_paragraph(title_paragraph)
+        title_run = title_paragraph.add_run(
+            _normalize_document_text(table_data.title)
+        )
         title_run.bold = True
 
     column_count = max(
@@ -1252,28 +1877,76 @@ def add_docx_table(document: Document, table_data: FinalTable) -> None:
         return
 
     table = document.add_table(rows=1, cols=column_count)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+
     if has_docx_style(document, "Table Grid"):
         table.style = "Table Grid"
     else:
         apply_safe_table_borders(table)
 
-    headers = list(table_data.headers)
+    headers = [
+        _normalize_document_text(header)
+        for header in table_data.headers
+    ]
     headers.extend([""] * (column_count - len(headers)))
 
+    header_row = table.rows[0]
+    _set_row_repeat_header(header_row)
+    _set_row_cant_split(header_row)
+
     for index, header in enumerate(headers):
-        cell = table.rows[0].cells[index]
-        cell.text = header
-        for run in cell.paragraphs[0].runs:
-            run.bold = True
+        cell = header_row.cells[index]
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.paragraph_format.keep_together = True
+        run = paragraph.add_run(header) if not paragraph.text else None
+        if run is None:
+            paragraph.text = header
+        for existing_run in paragraph.runs:
+            existing_run.bold = True
+            existing_run.font.name = "Arial"
+            existing_run.font.size = Pt(9)
+
+    normalized_headers = [
+        re.sub(r"[^a-záéíóúñ]", "", header.lower())
+        for header in headers
+    ]
 
     for source_row in table_data.rows:
-        row_values = list(source_row)
+        row_values = [
+            _normalize_document_text(value)
+            for value in source_row
+        ]
         row_values.extend([""] * (column_count - len(row_values)))
-        cells = table.add_row().cells
-        for index, value in enumerate(row_values):
-            cells[index].text = value
 
-    document.add_paragraph("")
+        row = table.add_row()
+        _set_row_cant_split(row)
+
+        for index, value in enumerate(row_values):
+            cell = row.cells[index]
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            paragraph = cell.paragraphs[0]
+            paragraph.text = value
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1.0
+            paragraph.paragraph_format.keep_together = True
+
+            header_key = normalized_headers[index] if index < len(normalized_headers) else ""
+            if header_key in {"fecha", "versión", "version"}:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+            for run in paragraph.runs:
+                run.font.name = "Arial"
+                run.font.size = Pt(9)
+
+    spacer = document.add_paragraph("")
+    spacer.paragraph_format.space_after = Pt(4)
 
 
 def create_docx(
@@ -1281,45 +1954,66 @@ def create_docx(
     style_guide: dict | None = None,
 ) -> bytes:
     """
-    Crea el Word final. Si la guía seleccionada es DOCX, reutiliza ese archivo
-    como base visual para conservar encabezados, pies, logos, márgenes y estilos.
+    Crea el Word final y conserva el diseño institucional de la guía DOCX.
+    También convierte la paginación estática del encabezado y pie en campos
+    PAGE/NUMPAGES dinámicos.
     """
 
+    final_document = normalize_final_document_structure(final_document)
     document, inherited_layout = load_visual_guide_document(style_guide)
     configure_docx(document, preserve_guide_layout=inherited_layout)
+    apply_dynamic_page_numbering(document)
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = Pt(6)
+    title.paragraph_format.keep_with_next = True
     title_run = title.add_run(final_document.title.strip())
     title_run.bold = True
     title_run.font.name = "Arial"
-    title_run.font.size = Pt(16)
+    title_run.font.size = Pt(15)
 
     if final_document.subtitle.strip():
         subtitle = document.add_paragraph()
         subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        subtitle.paragraph_format.space_after = Pt(10)
         subtitle_run = subtitle.add_run(final_document.subtitle.strip())
         subtitle_run.italic = True
         subtitle_run.font.name = "Arial"
-        subtitle_run.font.size = Pt(11)
-
-    document.add_paragraph("")
+        subtitle_run.font.size = Pt(10.5)
 
     if final_document.introductory_note.strip():
-        document.add_paragraph(final_document.introductory_note.strip())
+        introductory = document.add_paragraph(
+            final_document.introductory_note.strip()
+        )
+        _format_body_paragraph(introductory)
 
     for section in final_document.sections:
         add_safe_heading(document, section.title)
 
+        first_content_paragraph = None
+
         for paragraph_text in section.paragraphs:
             if paragraph_text.strip():
-                document.add_paragraph(paragraph_text.strip())
+                paragraph = document.add_paragraph(paragraph_text.strip())
+                _format_body_paragraph(paragraph)
+                if first_content_paragraph is None:
+                    first_content_paragraph = paragraph
+
+        for number, item in enumerate(section.numbered_items, start=1):
+            paragraph = add_safe_numbered(document, item, number)
+            if first_content_paragraph is None and paragraph is not None:
+                first_content_paragraph = paragraph
 
         for bullet in section.bullets:
-            add_safe_bullet(document, bullet)
+            paragraph = add_safe_bullet(document, bullet)
+            if first_content_paragraph is None and paragraph is not None:
+                first_content_paragraph = paragraph
 
         for table_data in section.tables:
             add_docx_table(document, table_data)
+
+    _set_update_fields_on_open(document)
 
     output = BytesIO()
     document.save(output)
@@ -1371,9 +2065,34 @@ def pdf_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
     return Paragraph(safe_text, style)
 
 
-def create_pdf(final_document: FinalDocument) -> bytes:
-    """Crea una versión PDF estructurada del documento final."""
+class NumberedCanvas(pdf_canvas.Canvas):
+    """Canvas de respaldo con numeración dinámica Página X de Y."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states: list[dict] = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        page_count = len(self._saved_page_states)
+        for page_number, state in enumerate(self._saved_page_states, start=1):
+            self.__dict__.update(state)
+            self.setFont("Helvetica", 8)
+            self.drawCentredString(
+                A4[0] / 2,
+                1.25 * cm,
+                f"Página {page_number} de {page_count}",
+            )
+            super().showPage()
+        super().save()
+
+def create_pdf(final_document: FinalDocument) -> bytes:
+    """Crea una versión PDF estructurada con numeración dinámica."""
+
+    final_document = normalize_final_document_structure(final_document)
     output = BytesIO()
     styles = getSampleStyleSheet()
 
@@ -1381,36 +2100,40 @@ def create_pdf(final_document: FinalDocument) -> bytes:
         "DocumentTitle",
         parent=styles["Title"],
         fontName="Helvetica-Bold",
-        fontSize=16,
-        leading=20,
+        fontSize=15,
+        leading=18,
         alignment=TA_CENTER,
-        spaceAfter=10,
+        spaceAfter=8,
     )
     subtitle_style = ParagraphStyle(
         "DocumentSubtitle",
         parent=styles["Normal"],
         fontName="Helvetica-Oblique",
         fontSize=10,
-        leading=14,
+        leading=13,
         alignment=TA_CENTER,
-        spaceAfter=16,
+        spaceAfter=12,
     )
     heading_style = ParagraphStyle(
         "SectionHeading",
         parent=styles["Heading1"],
         fontName="Helvetica-Bold",
-        fontSize=13,
-        leading=16,
-        spaceBefore=12,
-        spaceAfter=7,
+        fontSize=11.5,
+        leading=14,
+        spaceBefore=10,
+        spaceAfter=5,
+        keepWithNext=True,
     )
     body_style = ParagraphStyle(
         "BodyTextCustom",
         parent=styles["BodyText"],
         fontName="Helvetica",
-        fontSize=10,
-        leading=14,
-        spaceAfter=7,
+        fontSize=9.5,
+        leading=13,
+        spaceAfter=5,
+        alignment=0,
+        allowWidows=0,
+        allowOrphans=0,
     )
     bullet_style = ParagraphStyle(
         "BulletCustom",
@@ -1419,17 +2142,30 @@ def create_pdf(final_document: FinalDocument) -> bytes:
         firstLineIndent=-8,
         bulletIndent=4,
     )
+    numbered_style = ParagraphStyle(
+        "NumberedCustom",
+        parent=body_style,
+        leftIndent=18,
+        firstLineIndent=-14,
+    )
     table_cell_style = ParagraphStyle(
         "TableCell",
         parent=styles["BodyText"],
         fontName="Helvetica",
         fontSize=8,
         leading=10,
+        alignment=0,
+    )
+    table_center_style = ParagraphStyle(
+        "TableCellCenter",
+        parent=table_cell_style,
+        alignment=TA_CENTER,
     )
     table_header_style = ParagraphStyle(
         "TableHeader",
         parent=table_cell_style,
         fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
     )
 
     story: list = [
@@ -1437,13 +2173,15 @@ def create_pdf(final_document: FinalDocument) -> bytes:
     ]
 
     if final_document.subtitle.strip():
-        story.append(pdf_paragraph(final_document.subtitle.strip(), subtitle_style))
+        story.append(
+            pdf_paragraph(final_document.subtitle.strip(), subtitle_style)
+        )
 
     if final_document.introductory_note.strip():
         story.append(
             pdf_paragraph(final_document.introductory_note.strip(), body_style)
         )
-        story.append(Spacer(1, 6))
+        story.append(Spacer(1, 4))
 
     available_width = A4[0] - 5 * cm
 
@@ -1454,19 +2192,33 @@ def create_pdf(final_document: FinalDocument) -> bytes:
 
         for paragraph_text in section.paragraphs:
             if paragraph_text.strip():
-                section_story.append(pdf_paragraph(paragraph_text.strip(), body_style))
+                section_story.append(
+                    pdf_paragraph(paragraph_text.strip(), body_style)
+                )
+
+        for index, item in enumerate(section.numbered_items, start=1):
+            if item.strip():
+                section_story.append(
+                    Paragraph(
+                        f"<b>{index}.</b> {escape(_strip_list_prefix(item))}",
+                        numbered_style,
+                    )
+                )
 
         for bullet in section.bullets:
             if bullet.strip():
                 section_story.append(
                     Paragraph(
-                        f"• {escape(bullet.strip())}",
+                        f"• {escape(_strip_list_prefix(bullet))}",
                         bullet_style,
                     )
                 )
 
-        story.append(KeepTogether(section_story[:2]))
-        story.extend(section_story[2:])
+        if len(section_story) >= 2:
+            story.append(KeepTogether(section_story[:2]))
+            story.extend(section_story[2:])
+        else:
+            story.extend(section_story)
 
         for table_data in section.tables:
             if table_data.title.strip():
@@ -1481,22 +2233,47 @@ def create_pdf(final_document: FinalDocument) -> bytes:
             if column_count == 0:
                 continue
 
-            headers = list(table_data.headers)
+            headers = [
+                _normalize_document_text(header)
+                for header in table_data.headers
+            ]
             headers.extend([""] * (column_count - len(headers)))
+
+            normalized_headers = [
+                re.sub(r"[^a-záéíóúñ]", "", header.lower())
+                for header in headers
+            ]
+
             rows = [
                 headers,
                 *[
-                    list(row) + [""] * (column_count - len(row))
+                    [
+                        _normalize_document_text(value)
+                        for value in list(row)
+                    ]
+                    + [""] * (column_count - len(row))
                     for row in table_data.rows
                 ],
             ]
 
             formatted_rows: list[list[Paragraph]] = []
             for row_index, row in enumerate(rows):
-                cell_style = table_header_style if row_index == 0 else table_cell_style
-                formatted_rows.append(
-                    [pdf_paragraph(str(value), cell_style) for value in row]
-                )
+                formatted_cells: list[Paragraph] = []
+                for column_index, value in enumerate(row):
+                    if row_index == 0:
+                        cell_style = table_header_style
+                    elif normalized_headers[column_index] in {
+                        "fecha",
+                        "versión",
+                        "version",
+                    }:
+                        cell_style = table_center_style
+                    else:
+                        cell_style = table_cell_style
+                    formatted_cells.append(
+                        pdf_paragraph(str(value), cell_style)
+                    )
+                formatted_rows.append(formatted_cells)
 
             col_widths = [available_width / column_count] * column_count
             table = Table(
@@ -1504,13 +2281,14 @@ def create_pdf(final_document: FinalDocument) -> bytes:
                 colWidths=col_widths,
                 repeatRows=1,
                 hAlign="LEFT",
+                splitByRow=1,
             )
             table.setStyle(
                 TableStyle(
                     [
                         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                         ("LEFTPADDING", (0, 0), (-1, -1), 5),
                         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
                         ("TOPPADDING", (0, 0), (-1, -1), 4),
@@ -1519,7 +2297,7 @@ def create_pdf(final_document: FinalDocument) -> bytes:
                 )
             )
             story.append(table)
-            story.append(Spacer(1, 10))
+            story.append(Spacer(1, 8))
 
     pdf = SimpleDocTemplate(
         output,
@@ -1527,11 +2305,11 @@ def create_pdf(final_document: FinalDocument) -> bytes:
         rightMargin=2.5 * cm,
         leftMargin=2.5 * cm,
         topMargin=2.5 * cm,
-        bottomMargin=2.5 * cm,
+        bottomMargin=2.1 * cm,
         title=final_document.title,
         author="Generador inteligente de documentos",
     )
-    pdf.build(story)
+    pdf.build(story, canvasmaker=NumberedCanvas)
     return output.getvalue()
 
 
@@ -1589,6 +2367,7 @@ def initialize_state() -> None:
         "docx_output": None,
         "pdf_output": None,
         "answers": None,
+        "audit_summary": None,
         "upload_key": 0,
         "active_gemini_model": None,
     }
@@ -1606,6 +2385,7 @@ def reset_workflow() -> None:
     st.session_state.docx_output = None
     st.session_state.pdf_output = None
     st.session_state.answers = None
+    st.session_state.audit_summary = None
     st.session_state.active_gemini_model = None
     st.session_state.upload_key += 1
 
@@ -1652,7 +2432,29 @@ def show_analysis(analysis: GuideAnalysis, guides: list[dict]) -> None:
     columns[0].metric("Proceso", analysis.detected_process)
     columns[1].metric("Guía principal", analysis.selected_guide_name)
     columns[2].metric("Secciones", len(analysis.sections))
-    columns[3].metric("Preguntas obligatorias", count_required_questions(analysis))
+    columns[3].metric(
+        "Preguntas obligatorias",
+        count_required_questions(analysis),
+    )
+
+    status_counts = {
+        status: sum(
+            1 for section in analysis.sections if section.status == status
+        )
+        for status in STATUS_LABELS
+    }
+    completed_ratio = (
+        status_counts["completo"] / len(analysis.sections)
+        if analysis.sections
+        else 0
+    )
+    st.progress(
+        completed_ratio,
+        text=(
+            f"{status_counts['completo']} de {len(analysis.sections)} "
+            "secciones tienen información completa"
+        ),
+    )
 
     st.info(analysis.selection_reason)
 
@@ -1671,9 +2473,32 @@ def show_analysis(analysis: GuideAnalysis, guides: list[dict]) -> None:
     for warning in analysis.warnings:
         st.warning(warning)
 
-    st.markdown("### Evaluación por sección")
+    comparison_rows = []
+    for section in analysis.sections:
+        comparison_rows.append(
+            {
+                "Sección": section.title,
+                "Estado": STATUS_LABELS[section.status],
+                "Criterios": len(section.criteria),
+                "Evidencias": len(section.evidence),
+                "Preguntas": len(section.missing_questions),
+            }
+        )
 
-    for section_index, section in enumerate(analysis.sections):
+    st.markdown("### Comparación guía vs. información encontrada")
+    st.dataframe(
+        comparison_rows,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Sección": st.column_config.TextColumn(width="large"),
+            "Estado": st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    st.markdown("### Evaluación detallada por sección")
+
+    for section in analysis.sections:
         icon = {
             "completo": "✅",
             "parcial": "🟠",
@@ -1704,14 +2529,17 @@ def show_analysis(analysis: GuideAnalysis, guides: list[dict]) -> None:
                 st.write("**Información que debe completarse**")
                 for question in section.missing_questions:
                     required = "Obligatoria" if question.required else "Opcional"
-                    st.write(f"- **{question.question}** ({required})")
+                    st.write(
+                        f"- **{question.question}** "
+                        f"({question.category} · {required})"
+                    )
                     st.caption(question.why_needed)
 
             st.caption(f"Formato previsto: {section.output_format}")
 
 
 def collect_answers_form(analysis: GuideAnalysis) -> list[UserAnswer] | None:
-    """Muestra preguntas dinámicas y devuelve respuestas al enviar el formulario."""
+    """Agrupa preguntas críticas por categoría y valida las obligatorias."""
 
     all_questions = [
         (section, question_index, question)
@@ -1722,33 +2550,45 @@ def collect_answers_form(analysis: GuideAnalysis) -> list[UserAnswer] | None:
     if not all_questions:
         st.success(
             "La información disponible es suficiente. "
-            "Puedes generar directamente el documento final."
+            "Puedes generar el borrador directamente."
         )
+
+    grouped_questions: dict[str, list[tuple]] = {}
+    for item in all_questions:
+        category = item[2].category.strip() or "Información del proceso"
+        grouped_questions.setdefault(category, []).append(item)
 
     answers_by_key: dict[str, str] = {}
 
     with st.form("missing_information_form", clear_on_submit=False):
-        if all_questions:
-            st.markdown("### Completar información faltante")
-            st.caption(
-                "Responde únicamente con información verificable. "
-                "Los campos marcados con * son obligatorios."
-            )
+        st.markdown("### Completar información faltante")
+        st.caption(
+            "Responde únicamente con información verificable. "
+            "Los campos marcados con * son obligatorios."
+        )
 
-        for item_index, (section, question_index, question) in enumerate(all_questions):
-            label = question.question + (" *" if question.required else "")
-            help_text = f"Sección: {section.title}. {question.why_needed}"
-            key = f"answer_{section.order}_{question_index}_{item_index}"
+        item_index = 0
+        for category, category_items in grouped_questions.items():
+            st.markdown(f"#### {category}")
 
-            answers_by_key[key] = st.text_area(
-                label,
-                height=90,
-                help=help_text,
-                key=key,
-            )
+            for section, question_index, question in category_items:
+                label = question.question + (" *" if question.required else "")
+                help_text = f"Sección: {section.title}. {question.why_needed}"
+                key = (
+                    f"answer_{section.order}_{question_index}_{item_index}"
+                )
+
+                answers_by_key[key] = st.text_area(
+                    label,
+                    height=90,
+                    help=help_text,
+                    key=key,
+                    placeholder="Escribe una respuesta concreta y verificable.",
+                )
+                item_index += 1
 
         submitted = st.form_submit_button(
-            "Generar y validar documento final",
+            "Crear borrador para revisión",
             type="primary",
             width="stretch",
         )
@@ -1758,22 +2598,25 @@ def collect_answers_form(analysis: GuideAnalysis) -> list[UserAnswer] | None:
 
     missing_required: list[str] = []
     answers: list[UserAnswer] = []
+    item_index = 0
 
-    for item_index, (section, question_index, question) in enumerate(all_questions):
-        key = f"answer_{section.order}_{question_index}_{item_index}"
-        answer_text = answers_by_key.get(key, "").strip()
+    for category_items in grouped_questions.values():
+        for section, question_index, question in category_items:
+            key = f"answer_{section.order}_{question_index}_{item_index}"
+            answer_text = answers_by_key.get(key, "").strip()
 
-        if question.required and not answer_text:
-            missing_required.append(question.question)
+            if question.required and not answer_text:
+                missing_required.append(question.question)
 
-        if answer_text:
-            answers.append(
-                UserAnswer(
-                    section_title=section.title,
-                    question=question.question,
-                    answer=answer_text,
+            if answer_text:
+                answers.append(
+                    UserAnswer(
+                        section_title=section.title,
+                        question=question.question,
+                        answer=answer_text,
+                    )
                 )
-            )
+            item_index += 1
 
     if missing_required:
         st.error(
@@ -1785,8 +2628,235 @@ def collect_answers_form(analysis: GuideAnalysis) -> list[UserAnswer] | None:
     return answers
 
 
+def _split_paragraph_editor(value: str) -> list[str]:
+    """Convierte bloques separados por línea en blanco en párrafos."""
+
+    return [
+        re.sub(r"[ \t]+", " ", item).strip()
+        for item in re.split(r"\n\s*\n", value.strip())
+        if item.strip()
+    ]
+
+
+def _split_list_editor(value: str) -> list[str]:
+    """Convierte una línea por elemento en una lista limpia."""
+
+    return [
+        _strip_list_prefix(item)
+        for item in value.splitlines()
+        if _strip_list_prefix(item)
+    ]
+
+
+def _records_from_data_editor(edited_data) -> list[dict]:
+    if hasattr(edited_data, "to_dict"):
+        return edited_data.to_dict(orient="records")
+    if isinstance(edited_data, list):
+        return [dict(item) for item in edited_data]
+    return []
+
+
+def replace_section_in_document(
+    final_document: FinalDocument,
+    regenerated_section: FinalSection,
+) -> FinalDocument:
+    sections = [
+        regenerated_section
+        if section.order == regenerated_section.order
+        else section
+        for section in final_document.sections
+    ]
+    return normalize_final_document_structure(
+        final_document.model_copy(update={"sections": sections})
+    )
+
+
+def edit_final_document_form(
+    final_document: FinalDocument,
+) -> FinalDocument | None:
+    """Permite editar títulos, texto, listas y celdas antes de generar."""
+
+    final_document = normalize_final_document_structure(final_document)
+    section_values: list[dict] = []
+
+    with st.form("final_document_editor", clear_on_submit=False):
+        st.markdown("### Vista previa editable")
+        st.caption(
+            "Revisa el contenido antes de crear los archivos. "
+            "Los cambios guardados reemplazarán el borrador de la IA."
+        )
+
+        edited_title = st.text_input(
+            "Título del documento",
+            value=final_document.title,
+        )
+        edited_subtitle = st.text_input(
+            "Subtítulo",
+            value=final_document.subtitle,
+        )
+        edited_intro = st.text_area(
+            "Nota introductoria",
+            value=final_document.introductory_note,
+            height=100,
+        )
+
+        for section_index, section in enumerate(final_document.sections):
+            with st.expander(
+                f"{section.order}. {section.title}",
+                expanded=section_index == 0,
+            ):
+                title_value = st.text_input(
+                    "Título de la sección",
+                    value=section.title,
+                    key=f"edit_title_{section.order}",
+                )
+                paragraphs_value = st.text_area(
+                    "Párrafos",
+                    value="\n\n".join(section.paragraphs),
+                    height=max(120, min(320, 80 + 35 * len(section.paragraphs))),
+                    key=f"edit_paragraphs_{section.order}",
+                    help="Separa los párrafos con una línea en blanco.",
+                )
+                numbered_value = st.text_area(
+                    "Pasos numerados",
+                    value="\n".join(section.numbered_items),
+                    height=max(90, min(250, 70 + 25 * len(section.numbered_items))),
+                    key=f"edit_numbered_{section.order}",
+                    help=(
+                        "Escribe un paso por línea. No agregues 1., 2. ni viñetas; "
+                        "el bot aplicará la numeración."
+                    ),
+                )
+                bullets_value = st.text_area(
+                    "Viñetas",
+                    value="\n".join(section.bullets),
+                    height=max(90, min(250, 70 + 25 * len(section.bullets))),
+                    key=f"edit_bullets_{section.order}",
+                    help="Escribe un elemento por línea, sin el símbolo de viñeta.",
+                )
+
+                edited_tables: list[tuple[str, list[str], object]] = []
+                for table_index, table_data in enumerate(section.tables):
+                    st.markdown(f"**Tabla {table_index + 1}**")
+                    table_title = st.text_input(
+                        "Título de la tabla",
+                        value=table_data.title,
+                        key=f"table_title_{section.order}_{table_index}",
+                    )
+
+                    headers = list(table_data.headers)
+                    if headers:
+                        records = []
+                        for row in table_data.rows:
+                            padded = list(row) + [""] * (len(headers) - len(row))
+                            records.append(
+                                {
+                                    header: padded[column_index]
+                                    for column_index, header in enumerate(headers)
+                                }
+                            )
+
+                        editor_source = (
+                            records
+                            if records
+                            else {header: [] for header in headers}
+                        )
+                        edited_data = st.data_editor(
+                            editor_source,
+                            num_rows="dynamic",
+                            width="stretch",
+                            hide_index=True,
+                            key=f"table_editor_{section.order}_{table_index}",
+                        )
+                        edited_tables.append(
+                            (table_title, headers, edited_data)
+                        )
+                    else:
+                        st.caption("La tabla no tiene encabezados editables.")
+
+                section_values.append(
+                    {
+                        "section": section,
+                        "title": title_value,
+                        "paragraphs": paragraphs_value,
+                        "numbered": numbered_value,
+                        "bullets": bullets_value,
+                        "tables": edited_tables,
+                    }
+                )
+
+        submitted = st.form_submit_button(
+            "Guardar cambios, auditar y generar archivos",
+            type="primary",
+            width="stretch",
+        )
+
+    if not submitted:
+        return None
+
+    rebuilt_sections: list[FinalSection] = []
+
+    for values in section_values:
+        original_section: FinalSection = values["section"]
+        rebuilt_tables: list[FinalTable] = []
+
+        for table_title, headers, edited_data in values["tables"]:
+            records = _records_from_data_editor(edited_data)
+            rows = [
+                [
+                    _normalize_document_text(record.get(header, ""))
+                    for header in headers
+                ]
+                for record in records
+            ]
+            rebuilt_tables.append(
+                FinalTable(
+                    title=table_title.strip(),
+                    headers=headers,
+                    rows=rows,
+                )
+            )
+
+        if not values["tables"]:
+            rebuilt_tables = original_section.tables
+
+        rebuilt_sections.append(
+            original_section.model_copy(
+                update={
+                    "title": values["title"].strip(),
+                    "paragraphs": _split_paragraph_editor(values["paragraphs"]),
+                    "numbered_items": _split_list_editor(values["numbered"]),
+                    "bullets": _split_list_editor(values["bullets"]),
+                    "tables": rebuilt_tables,
+                }
+            )
+        )
+
+    edited_document = final_document.model_copy(
+        update={
+            "title": edited_title.strip() or final_document.title,
+            "subtitle": edited_subtitle.strip(),
+            "introductory_note": edited_intro.strip(),
+            "sections": rebuilt_sections,
+        }
+    )
+
+    return normalize_final_document_structure(edited_document)
+
+
+def show_error_panel(
+    user_message: str,
+    error: Exception,
+    technical_label: str = "Ver detalle técnico",
+) -> None:
+    """Muestra un mensaje comprensible y oculta el detalle técnico."""
+
+    st.error(user_message)
+    with st.expander(technical_label):
+        st.code(str(error)[:2000], language=None)
+
 def show_final_document(final_document: FinalDocument) -> None:
-    st.subheader("Documento final generado")
+    st.subheader("Documento final")
     st.markdown(f"## {final_document.title}")
 
     if final_document.subtitle.strip():
@@ -1799,6 +2869,9 @@ def show_final_document(final_document: FinalDocument) -> None:
         with st.expander(f"{section.order}. {section.title}", expanded=False):
             for paragraph_text in section.paragraphs:
                 st.write(paragraph_text)
+
+            for index, item in enumerate(section.numbered_items, start=1):
+                st.write(f"{index}. {item}")
 
             for bullet in section.bullets:
                 st.write(f"- {bullet}")
@@ -1813,7 +2886,9 @@ def show_final_document(final_document: FinalDocument) -> None:
                         padded = list(row) + [""] * (
                             len(table_data.headers) - len(row)
                         )
-                        normalized_rows.append(padded[: len(table_data.headers)])
+                        normalized_rows.append(
+                            padded[: len(table_data.headers)]
+                        )
 
                     st.dataframe(
                         {
@@ -1833,6 +2908,20 @@ def show_final_document(final_document: FinalDocument) -> None:
     for item in final_document.validation:
         compliance_counts[item.status] += 1
 
+    total_checks = sum(compliance_counts.values())
+    compliance_ratio = (
+        compliance_counts["cumple"] / total_checks
+        if total_checks
+        else 0
+    )
+    st.progress(
+        compliance_ratio,
+        text=(
+            f"{compliance_counts['cumple']} de {total_checks} "
+            "criterios cumplen completamente"
+        ),
+    )
+
     columns = st.columns(3)
     columns[0].metric("Cumple", compliance_counts["cumple"])
     columns[1].metric("Parcial", compliance_counts["parcial"])
@@ -1846,8 +2935,13 @@ def show_final_document(final_document: FinalDocument) -> None:
                 "no_aplica": "⚪",
             }[item.status]
             st.write(
-                f"{icon} **{item.section_title}** — {item.criterion}: {item.note}"
+                f"{icon} **{item.section_title}** — "
+                f"{item.criterion}: {item.note}"
             )
+
+    audit_summary = st.session_state.get("audit_summary")
+    if audit_summary:
+        st.info(f"**Resumen editorial:** {audit_summary}")
 
     for warning in final_document.warnings:
         st.warning(warning)
@@ -2025,8 +3119,10 @@ def render_workflow_steps(current_step: int) -> None:
 
 
 def current_workflow_step() -> int:
-    if st.session_state.get("final_document") is not None:
+    if st.session_state.get("docx_output") is not None:
         return 4
+    if st.session_state.get("final_document") is not None:
+        return 3
     if st.session_state.get("analysis") is not None:
         return 3
     if st.session_state.get("guide_records"):
@@ -2059,10 +3155,11 @@ def main() -> None:
     with st.expander("¿Cómo funciona este proceso?", expanded=False):
         st.markdown(
             """
-            1. **Carga las guías institucionales** y el documento con la información real.
-            2. **Gemini interpreta las reglas** de cada sección y selecciona la guía aplicable.
-            3. El bot **pregunta únicamente lo indispensable** cuando falta información.
-            4. Genera un **Word con el encabezado y pie de la guía DOCX seleccionada** y su PDF.
+            1. **Carga las guías institucionales** y el documento de origen.
+            2. El sistema **interpreta, extrae evidencia, redacta y audita**.
+            3. Solo solicita **datos críticos que realmente estén ausentes**.
+            4. Presenta un **borrador editable por secciones** antes de generar.
+            5. Crea un **Word institucional** y su PDF con paginación dinámica.
             """
         )
 
@@ -2105,9 +3202,9 @@ def main() -> None:
     st.subheader("📁 1. Cargar guías e información de origen")
 
     st.markdown(
-        """<div class="friendly-note"><strong>Consejo:</strong> para conservar exactamente
-        el encabezado, pie de página, logos y márgenes, carga al menos una guía en formato
-        <strong>DOCX</strong>.</div>""",
+        """<div class="friendly-note"><strong>Consejo:</strong> para conservar
+        exactamente el encabezado, pie de página, logos y márgenes, carga al
+        menos una guía en formato <strong>DOCX</strong>.</div>""",
         unsafe_allow_html=True,
     )
 
@@ -2157,13 +3254,24 @@ def main() -> None:
                     "Reduce la cantidad o el tamaño de los documentos."
                 )
 
-            names = [safe_filename(upload.name).lower() for upload in guide_uploads]
+            names = [
+                safe_filename(upload.name).lower()
+                for upload in guide_uploads
+            ]
             if len(names) != len(set(names)):
                 raise AppError("Hay guías con nombres duplicados.")
 
-            with st.spinner("Leyendo archivos..."):
+            with st.status(
+                "Analizando el proceso documental...",
+                expanded=True,
+            ) as status:
+                st.write("1/4 · Leyendo y validando los archivos")
                 guide_records = [
-                    build_file_record(upload, role="guía normativa", index=index)
+                    build_file_record(
+                        upload,
+                        role="guía normativa",
+                        index=index,
+                    )
                     for index, upload in enumerate(guide_uploads)
                 ]
                 source_record = build_file_record(
@@ -2172,24 +3280,31 @@ def main() -> None:
                     index=0,
                 )
 
-                total_text = sum(len(record["text"]) for record in guide_records)
+                total_text = sum(
+                    len(record["text"]) for record in guide_records
+                )
                 total_text += len(source_record["text"])
 
                 if total_text > MAX_TOTAL_TEXT_CHARS:
                     st.warning(
-                        "Los archivos contienen mucho texto. La aplicación limitará "
-                        "el contenido textual enviado por archivo, pero los PDF se "
-                        "seguirán enviando completos de forma nativa."
+                        "Los archivos contienen mucho texto. Se limitará el "
+                        "contenido textual por archivo; los PDF se enviarán "
+                        "completos de forma nativa."
                     )
 
-            with st.spinner(
-                "Gemini está interpretando las guías y comparando la información..."
-            ):
+                st.write("2/4 · Interpretando las reglas de las guías")
+                st.write("3/4 · Extrayendo evidencia del documento de origen")
                 analysis = analyze_guides_and_source(
                     api_key=api_key,
                     model=model or MODEL_DEFAULT,
                     guides=guide_records,
                     source=source_record,
+                )
+                st.write("4/4 · Identificando brechas y preguntas críticas")
+                status.update(
+                    label="Análisis completado",
+                    state="complete",
+                    expanded=False,
                 )
 
             st.session_state.guide_records = guide_records
@@ -2199,17 +3314,26 @@ def main() -> None:
             st.session_state.docx_output = None
             st.session_state.pdf_output = None
             st.session_state.answers = None
+            st.session_state.audit_summary = None
 
             st.success("Análisis completado correctamente.")
 
         except AppError as error:
-            st.error(str(error))
+            show_error_panel(
+                "No fue posible completar el análisis. "
+                "Revisa el mensaje técnico y vuelve a intentarlo.",
+                error,
+            )
         except Exception as error:
-            st.error(f"Ocurrió un error inesperado: {error}")
+            show_error_panel(
+                "Ocurrió un error inesperado durante el análisis.",
+                error,
+            )
 
     guide_records = st.session_state.guide_records
     source_record = st.session_state.source_record
     analysis = st.session_state.analysis
+    final_document = st.session_state.final_document
 
     if guide_records and source_record:
         st.divider()
@@ -2232,65 +3356,233 @@ def main() -> None:
         st.divider()
         show_analysis(analysis, guide_records)
 
-        st.divider()
-        answers = collect_answers_form(analysis)
+        if final_document is None:
+            st.divider()
+            answers = collect_answers_form(analysis)
 
-        if answers is not None:
+            if answers is not None:
+                try:
+                    with st.status(
+                        "Construyendo el borrador profesional...",
+                        expanded=True,
+                    ) as status:
+                        st.write("1/3 · Redactando las secciones")
+                        draft_document = generate_final_with_gemini(
+                            api_key=api_key,
+                            model=model or MODEL_DEFAULT,
+                            guides=guide_records,
+                            source=source_record,
+                            analysis=analysis,
+                            answers=answers,
+                        )
+                        st.write("2/3 · Normalizando listas, tablas y redacción")
+                        draft_document = normalize_final_document_structure(
+                            draft_document
+                        )
+                        st.write("3/3 · Preparando la vista previa editable")
+                        status.update(
+                            label="Borrador listo para revisión",
+                            state="complete",
+                            expanded=False,
+                        )
+
+                    st.session_state.answers = answers
+                    st.session_state.final_document = draft_document
+                    st.session_state.docx_output = None
+                    st.session_state.pdf_output = None
+                    st.session_state.audit_summary = None
+                    st.success(
+                        "Borrador creado. Revísalo y edítalo antes de generar "
+                        "los archivos."
+                    )
+                    st.rerun()
+
+                except AppError as error:
+                    show_error_panel(
+                        "Gemini no pudo construir el borrador en este intento.",
+                        error,
+                    )
+                except Exception as error:
+                    show_error_panel(
+                        "Ocurrió un error inesperado al construir el borrador.",
+                        error,
+                    )
+
+    final_document = st.session_state.final_document
+
+    if (
+        final_document
+        and analysis
+        and guide_records
+        and source_record
+    ):
+        st.divider()
+        st.subheader("✍️ 3. Revisar y editar el borrador")
+
+        st.markdown(
+            """<div class="friendly-note"><strong>Control del usuario:</strong>
+            puedes editar directamente cada sección o regenerar únicamente una
+            sección sin rehacer todo el documento.</div>""",
+            unsafe_allow_html=True,
+        )
+
+        section_options = {
+            f"{section.order}. {section.title}": section.order
+            for section in final_document.sections
+        }
+        selected_section_label = st.selectbox(
+            "Sección para regenerar",
+            options=list(section_options),
+            help=(
+                "La IA regenerará solo la sección seleccionada usando las "
+                "mismas guías, el origen y tus respuestas."
+            ),
+        )
+
+        if st.button(
+            "Regenerar únicamente esta sección",
+            width="stretch",
+        ):
             try:
-                with st.spinner(
-                    "Gemini está redactando y validando el documento final..."
-                ):
-                    final_document = generate_final_with_gemini(
+                with st.spinner("Regenerando la sección seleccionada..."):
+                    regenerated = regenerate_section_with_gemini(
                         api_key=api_key,
                         model=model or MODEL_DEFAULT,
                         guides=guide_records,
                         source=source_record,
                         analysis=analysis,
-                        answers=answers,
+                        answers=st.session_state.answers or [],
+                        final_document=final_document,
+                        section_order=section_options[selected_section_label],
                     )
 
-                    selected_guide = guide_records[analysis.selected_guide_index]
+                st.session_state.final_document = replace_section_in_document(
+                    final_document,
+                    regenerated,
+                )
+                st.session_state.docx_output = None
+                st.session_state.pdf_output = None
+                st.session_state.audit_summary = None
+                st.success("Sección regenerada correctamente.")
+                st.rerun()
+
+            except AppError as error:
+                show_error_panel(
+                    "No fue posible regenerar la sección.",
+                    error,
+                )
+            except Exception as error:
+                show_error_panel(
+                    "Ocurrió un error inesperado al regenerar la sección.",
+                    error,
+                )
+
+        edited_document = edit_final_document_form(
+            st.session_state.final_document
+        )
+
+        if edited_document is not None:
+            selected_guide = guide_records[analysis.selected_guide_index]
+
+            try:
+                with st.status(
+                    "Auditando y generando los archivos...",
+                    expanded=True,
+                ) as status:
+                    st.write("1/4 · Guardando tus modificaciones")
+                    edited_document = normalize_final_document_structure(
+                        edited_document
+                    )
+
+                    st.write("2/4 · Auditando el contenido contra la guía")
+                    try:
+                        audit_report = audit_final_document_with_gemini(
+                            api_key=api_key,
+                            model=model or MODEL_DEFAULT,
+                            guides=guide_records,
+                            source=source_record,
+                            analysis=analysis,
+                            final_document=edited_document,
+                        )
+                        combined_warnings = list(
+                            dict.fromkeys(
+                                edited_document.warnings
+                                + audit_report.warnings
+                            )
+                        )
+                        edited_document = edited_document.model_copy(
+                            update={
+                                "validation": audit_report.validation,
+                                "warnings": combined_warnings,
+                            }
+                        )
+                        st.session_state.audit_summary = (
+                            audit_report.editorial_summary
+                        )
+                    except Exception as audit_error:
+                        st.warning(
+                            "No fue posible completar la revalidación con "
+                            "Gemini. El documento se generará con la validación "
+                            "del borrador."
+                        )
+                        with st.expander("Ver detalle de la revalidación"):
+                            st.code(str(audit_error)[:1600], language=None)
+
+                    st.write("3/4 · Aplicando formato institucional y paginación")
                     docx_output = create_docx(
-                        final_document,
+                        edited_document,
                         style_guide=selected_guide,
                     )
+
+                    st.write("4/4 · Creando la versión PDF")
                     pdf_output = convert_docx_to_pdf(docx_output)
                     if pdf_output is None:
-                        pdf_output = create_pdf(final_document)
+                        pdf_output = create_pdf(edited_document)
 
-                st.session_state.answers = answers
-                st.session_state.final_document = final_document
+                    status.update(
+                        label="Documento auditado y generado",
+                        state="complete",
+                        expanded=False,
+                    )
+
+                st.session_state.final_document = edited_document
                 st.session_state.docx_output = docx_output
                 st.session_state.pdf_output = pdf_output
 
                 if selected_guide.get("extension") == "docx":
                     st.success(
-                        "Documento generado con el encabezado, pie de página, márgenes "
-                        "y elementos visuales de la guía DOCX seleccionada."
+                        "Documento generado con encabezado, pie, márgenes, "
+                        "paginación dinámica y formato de la guía seleccionada."
                     )
                 else:
                     st.success("Documento final generado y validado.")
                     st.info(
-                        "La guía seleccionada no es DOCX. El contenido fue respetado, pero "
-                        "para copiar exactamente encabezado y pie debes cargar la versión Word."
+                        "La guía principal no es DOCX. Para reproducir exactamente "
+                        "encabezado y pie, carga su versión Word."
                     )
+                st.rerun()
 
             except AppError as error:
-                st.error(str(error))
+                show_error_panel(
+                    "No fue posible generar el documento final.",
+                    error,
+                )
             except Exception as error:
-                st.error(f"No fue posible generar el documento: {error}")
+                show_error_panel(
+                    "Ocurrió un error inesperado durante la generación.",
+                    error,
+                )
 
     final_document = st.session_state.final_document
+    docx_output = st.session_state.get("docx_output")
+    pdf_output = st.session_state.get("pdf_output")
 
-    if final_document:
+    if final_document and docx_output and pdf_output:
         st.divider()
+        st.subheader("✅ 4. Documento listo")
         show_final_document(final_document)
 
         st.markdown("### Descargar archivos")
-
-        docx_output = st.session_state.get("docx_output")
-        pdf_output = st.session_state.get("pdf_output")
-
         files_are_valid = True
 
         if not isinstance(docx_output, (bytes, bytearray)) or not docx_output:
@@ -2308,25 +3600,18 @@ def main() -> None:
             files_are_valid = False
 
         if files_are_valid:
-            # Convertimos explícitamente a bytes para evitar problemas con
-            # bytearray/BytesIO y mantenemos claves estables para los widgets.
             docx_bytes = bytes(docx_output)
             pdf_bytes = bytes(pdf_output)
 
-            # Validación mínima de firmas para detectar archivos corruptos antes
-            # de ofrecerlos al navegador. DOCX es un contenedor ZIP (PK) y PDF
-            # debe iniciar con %PDF.
             if not docx_bytes.startswith(b"PK"):
                 st.error(
-                    "El Word generado no tiene una estructura DOCX válida. "
-                    "Vuelve a generar el documento."
+                    "El Word generado no tiene una estructura DOCX válida."
                 )
                 files_are_valid = False
 
             if not pdf_bytes.startswith(b"%PDF"):
                 st.error(
-                    "El PDF generado no tiene una estructura PDF válida. "
-                    "Vuelve a generar el documento."
+                    "El PDF generado no tiene una estructura PDF válida."
                 )
                 files_are_valid = False
 
@@ -2334,17 +3619,10 @@ def main() -> None:
             docx_name = output_filename(final_document.title, "docx")
             pdf_name = output_filename(final_document.title, "pdf")
 
-            # Copia local de respaldo. En Codespaces también puede descargarse
-            # con clic derecho sobre el archivo en la carpeta output.
             docx_path = save_generated_file(docx_name, docx_bytes)
             pdf_path = save_generated_file(pdf_name, pdf_bytes)
 
             st.markdown("#### Descarga directa")
-            st.caption(
-                "Estos enlaces llevan el archivo embebido en la página y evitan "
-                "el endpoint temporal que puede fallar en puertos privados de Codespaces."
-            )
-
             direct_columns = st.columns(2)
             direct_columns[0].markdown(
                 direct_download_link(
@@ -2392,16 +3670,13 @@ def main() -> None:
             )
             st.info(
                 "También se guardaron copias en "
-                f"`{docx_path.as_posix()}` y `{pdf_path.as_posix()}`. "
-                "En Codespaces puedes abrir la carpeta `output`, hacer clic derecho "
-                "sobre cada archivo y seleccionar Download."
+                f"`{docx_path.as_posix()}` y `{pdf_path.as_posix()}`."
             )
 
     st.divider()
     st.caption(
-        "La aplicación utiliza las guías como reglas de construcción. No copia sus "
-        "instrucciones como contenido factual y no debe inventar información que no "
-        "esté sustentada en el documento de origen o en las respuestas del usuario."
+        "La aplicación utiliza las guías como reglas de construcción, conserva "
+        "la trazabilidad del origen y evita inventar información."
     )
 
 
