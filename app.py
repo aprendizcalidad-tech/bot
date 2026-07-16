@@ -82,8 +82,9 @@ MAX_DRIVE_VIDEO_SIZE_BYTES = MAX_DRIVE_VIDEO_SIZE_MB * 1024 * 1024
 VIDEO_PROCESSING_TIMEOUT_SECONDS = 3600
 VIDEO_CHUNK_SECONDS = 600  # 10 minutos por solicitud
 VIDEO_MIN_CHUNK_SECONDS = 120  # respaldo mínimo de 2 minutos
-VIDEO_LONG_THRESHOLD_SECONDS = 720  # desde 12 minutos se divide
+VIDEO_LONG_THRESHOLD_SECONDS = 1  # todo video con duración conocida usa tramos auditados
 VIDEO_MAX_OUTPUT_TOKENS = 32768
+VIDEO_ACTION_AUDIT_ENABLED = True
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -91,7 +92,9 @@ DRIVE_DOWNLOAD_CHUNK_BYTES = DRIVE_DOWNLOAD_CHUNK_MB * 1024 * 1024
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 MAX_GUIDES = 8
 MAX_TEXT_CHARS_PER_FILE = 80_000
-MAX_TOTAL_TEXT_CHARS = 300_000
+MAX_VIDEO_SOURCE_CHARS = 1_200_000
+MAX_TOTAL_TEXT_CHARS = 1_400_000
+MIN_ACTION_TEXT_CHARS = 12
 MAX_TOTAL_UPLOAD_MB = 300
 MAX_TOTAL_UPLOAD_BYTES = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
 
@@ -263,52 +266,137 @@ class AuditReport(BaseModel):
 
 
 
+class VideoAction(BaseModel):
+    """Acción operativa atómica identificada en el documento o video."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action_id: str = Field(
+        default="",
+        description="Identificador secuencial. Se normaliza localmente como ACC-0001.",
+    )
+    timestamp_start: str = Field(
+        default="",
+        description="Hora de inicio absoluta en formato HH:MM:SS.",
+    )
+    timestamp_end: str = Field(
+        default="",
+        description="Hora de finalización absoluta cuando pueda determinarse.",
+    )
+    actor: str = Field(
+        default="",
+        description="Cargo, rol o hablante que ejecuta la acción.",
+    )
+    system: str = Field(
+        default="",
+        description="Aplicación, sistema o plataforma utilizada.",
+    )
+    location_path: str = Field(
+        default="",
+        description="Módulo, menú, pestaña, pantalla o ruta de navegación.",
+    )
+    action: str = Field(
+        description=(
+            "Una sola acción operativa, concreta y verificable. No debe contener "
+            "una secuencia completa ni fusionar acciones diferentes."
+        )
+    )
+    interface_element: str = Field(
+        default="",
+        description="Botón, enlace, campo, filtro, lista, casilla o archivo utilizado.",
+    )
+    data_handled: str = Field(
+        default="",
+        description="Dato consultado, registrado, modificado, cargado o descargado.",
+    )
+    validation: str = Field(
+        default="",
+        description="Validación, condición o comprobación realizada antes de continuar.",
+    )
+    result: str = Field(
+        default="",
+        description="Mensaje, estado, registro o resultado que confirma la acción.",
+    )
+    evidence: str = Field(
+        default="",
+        description="Evidencia visual o auditiva que sustenta la acción.",
+    )
+    uncertainty: str = Field(
+        default="",
+        description="Dato dudoso o no legible que requiere confirmación.",
+    )
+
+
+class VideoActionBatch(BaseModel):
+    """Inventario de acciones de un tramo de video."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    actions: list[VideoAction] = Field(
+        default_factory=list,
+        description=(
+            "Todas las acciones operativas atómicas del tramo, en orden "
+            "cronológico y sin fusionar acciones diferentes."
+        ),
+    )
+
+
 class VideoTranscript(BaseModel):
     """Transcripción estructurada producida a partir de un video."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     detected_language: str = Field(
-        description="Idioma principal detectado en el video."
+        default="",
+        description="Idioma principal detectado en el video.",
     )
     duration_estimate: str = Field(
+        default="",
         description=(
             "Duración aproximada observada, por ejemplo 08:35. "
             "Déjala vacía si no puede determinarse con seguridad."
-        )
+        ),
     )
     speakers: list[str] = Field(
+        default_factory=list,
         description=(
             "Etiquetas de hablantes detectados, por ejemplo Hablante 1, "
             "Hablante 2 o nombres propios solo cuando sean explícitos."
-        )
+        ),
     )
     full_transcript: str = Field(
+        default="",
         description=(
             "Transcripción completa y cronológica. Debe incluir marcas de "
-            "tiempo [MM:SS], hablantes y [inaudible] cuando corresponda. "
-            "No debe resumir ni omitir intervenciones relevantes."
-        )
+            "tiempo y no resumir intervenciones relevantes."
+        ),
+    )
+    actions: list[VideoAction] = Field(
+        default_factory=list,
+        description=(
+            "Inventario exhaustivo de acciones operativas atómicas. Cada clic, "
+            "selección, navegación, diligenciamiento, carga, validación o resultado "
+            "diferenciable debe aparecer como un elemento independiente."
+        ),
     )
     visual_evidence: list[str] = Field(
+        default_factory=list,
         description=(
-            "Información visual relevante con marca de tiempo: texto en "
-            "pantalla, tablas, formularios, sistemas, acciones o evidencias."
-        )
+            "Información visual relevante con marca de tiempo: textos, tablas, "
+            "formularios, sistemas, acciones, rutas y evidencias."
+        ),
     )
     key_facts: list[str] = Field(
-        description=(
-            "Hechos verificables mencionados o mostrados en el video, sin "
-            "interpretaciones no sustentadas."
-        )
+        default_factory=list,
+        description="Hechos verificables mencionados o mostrados en el video.",
     )
     uncertainties: list[str] = Field(
+        default_factory=list,
         description=(
             "Fragmentos inaudibles, nombres dudosos, textos ilegibles o "
             "información que requiere confirmación humana."
-        )
+        ),
     )
-
 
 class AppError(Exception):
     """Error controlado que puede mostrarse al usuario."""
@@ -689,7 +777,12 @@ def append_record_to_gemini_input(
     record: dict,
     label: str,
 ) -> None:
-    """Agrega un archivo al input multimodal como objetos Part válidos."""
+    """Agrega un archivo al input multimodal como objetos Part válidos.
+
+    Las transcripciones de video no se recortan al límite general de 80.000
+    caracteres. El inventario de acciones y la transcripción aprobada deben llegar
+    completos a las fases de selección de guía, redacción y auditoría.
+    """
 
     parts.append(
         types.Part.from_text(
@@ -703,7 +796,25 @@ def append_record_to_gemini_input(
     if record["extension"] == "pdf":
         parts.append(pdf_document_part(record))
     else:
-        extracted_text = clipped_text(record["text"]).strip()
+        raw_text = str(record.get("text") or "").strip()
+        is_video_source = bool(
+            record.get("is_video")
+            or record.get("video_actions")
+            or str(record.get("origin_kind") or "").lower()
+            in {"google_drive", "direct_upload"}
+        )
+
+        if is_video_source:
+            extracted_text = raw_text[:MAX_VIDEO_SOURCE_CHARS]
+            if len(raw_text) > MAX_VIDEO_SOURCE_CHARS:
+                extracted_text += (
+                    "\n\n[ADVERTENCIA: EL ORIGEN DE VIDEO SUPERÓ EL LÍMITE DE "
+                    "SEGURIDAD. EL INVENTARIO DE ACCIONES DEBE USARSE COMO FUENTE "
+                    "PRINCIPAL Y NO PUEDE RESUMIRSE.]"
+                )
+        else:
+            extracted_text = clipped_text(raw_text).strip()
+
         if not extracted_text:
             extracted_text = "[ARCHIVO SIN TEXTO EXTRAÍBLE]"
         parts.append(types.Part.from_text(text=extracted_text))
@@ -713,7 +824,6 @@ def append_record_to_gemini_input(
             text=f"\n===== FIN {label}: {record['name']} =====\n"
         )
     )
-
 
 # =========================================================
 # PROMPTS Y LLAMADAS A GEMINI
@@ -754,6 +864,8 @@ ETAPA 1 — INTERPRETAR LA GUÍA
 
 ETAPA 2 — EXTRAER EVIDENCIA
 - Localiza hechos explícitos en el documento de origen.
+- Si el origen proviene de un video, utiliza el bloque INVENTARIO DE ACCIONES OPERATIVAS como fuente prioritaria y conserva todas las acciones ACC-XXXX.
+- Una sección PASO A PASO o PROCEDIMIENTO sin una cantidad fija en la guía debe desarrollarse con una actividad independiente por cada acción operativa.
 - Distingue entre información explícita, información derivable sin agregar
   hechos nuevos e información ausente.
 - Conserva literalmente nombres, cargos, radicados, fechas, cifras,
@@ -793,6 +905,8 @@ REGLAS
     reducir la cantidad de pasos, requisitos, actividades o controles exigidos.
 11. Cuando la guía enumere N elementos, conserva N elementos independientes y en
     el mismo orden. No combines dos pasos en uno aunque sean similares.
+12. Cuando la guía ordene DETALLAR un paso a paso sin fijar una cantidad, no interpretes la instrucción como un único paso. Debes reconocer todas las acciones operativas del origen y mantener una acción diferenciable por paso.
+13. Está prohibido convertir un inventario de múltiples acciones ACC-XXXX en uno o pocos pasos generales.
 
 ESTADOS
 - completo: información suficiente para cumplir todos los criterios.
@@ -837,6 +951,8 @@ REGLAS DE REDACCIÓN
 - Mantén una idea principal por oración cuando sea posible.
 - Usa voz institucional o impersonal.
 - Para procedimientos, usa verbos de acción y orden lógico.
+- Si el origen contiene un INVENTARIO DE ACCIONES OPERATIVAS, cada ACC-XXXX debe convertirse en un paso o fila independiente, en el mismo orden cronológico.
+- No redactes un resumen del procedimiento. Debes explicar qué se hace, dónde, con qué elemento, qué dato se gestiona y cómo se verifica, usando la evidencia disponible para cada acción.
 - No inventes hechos, responsables, fechas, resultados, decisiones ni controles.
 - Conserva literalmente datos sensibles y denominaciones oficiales.
 - No copies las instrucciones de la guía como contenido factual.
@@ -852,8 +968,8 @@ FIDELIDAD ESTRUCTURAL OBLIGATORIA
 - Conserva exactamente el orden de aparición de los títulos en la guía principal.
 - Reproduce todos los elementos enumerados por la guía, uno a uno y en el mismo
   orden. No resumas, fusiones, agrupes, sustituyas ni omitas elementos.
-- Si la guía exige 8 pasos, numbered_items debe contener exactamente 8 pasos
-  independientes: no 7, no 9. Nunca agregues pasos, subpasos o actividades que no estén autorizados por la guía principal.
+- Si la guía exige 8 pasos fijos, numbered_items debe contener exactamente 8 pasos independientes: no 7, no 9.
+- Si la guía no fija una cantidad y ordena detallar el PASO A PASO o el PROCEDIMIENTO, la cantidad se obtiene del inventario de acciones del origen. En ese caso no existe un máximo artificial y no deben eliminarse pasos.
 - Cada paso puede mejorarse lingüísticamente, pero debe conservar su acción,
   responsable, condición, control y resultado cuando estos estén sustentados.
 - Antes de responder, cuenta los elementos de la guía y compáralos con los del
@@ -904,8 +1020,7 @@ CRITERIOS DE AUDITORÍA
 3. No existen hechos inventados ni afirmaciones sin sustento.
 4. Nombres, cargos, fechas, cifras y sistemas son consistentes.
 5. Los pasos están ordenados y no mezclan viñetas con numeración.
-6. La cantidad de pasos, actividades y requisitos coincide exactamente con la
-   guía; ningún elemento fue resumido, fusionado u omitido.
+6. Para listas fijas, la cantidad coincide exactamente con la guía. Para procedimientos dinámicos, la cantidad coincide con el inventario de acciones del origen y ninguna ACC-XXXX fue resumida, fusionada u omitida.
 7. Las tablas son coherentes y no contienen espacios artificiales.
 8. El documento mantiene trazabilidad con el origen y las respuestas.
 9. Las limitaciones reales se registran como advertencias.
@@ -947,8 +1062,7 @@ REGLAS
 - Conserva el número de orden de la sección.
 - Usa numbered_items para pasos secuenciales y bullets para listas no ordenadas.
 - No incluyas números dentro del texto de numbered_items.
-- Conserva todos los pasos exigidos por la guía. No reduzcas su cantidad, no
-  combines dos pasos y no omitas ninguno durante la regeneración.
+- Conserva todos los pasos exigidos por la guía. Si la sección es dinámica, conserva una acción del inventario por paso o fila; no reduzcas, combines ni omitas acciones durante la regeneración.
 - Mantén las tablas solo si son necesarias o exigidas por la guía.
 - Devuelve únicamente la estructura FinalSection.
 """.strip()
@@ -1188,11 +1302,66 @@ def _extract_steps_from_section(title: str, body_lines: list[str]) -> list[str]:
     return []
 
 
-def extract_exact_guide_structure(text: str) -> list[dict]:
-    """Extrae los títulos exactos y sus pasos directamente de la guía.
+def _has_explicit_numbered_steps(body_lines: list[str]) -> bool:
+    return any(
+        NUMBERED_GUIDE_LINE_RE.match(_clean_guide_line(line))
+        for line in body_lines
+        if _clean_guide_line(line)
+    )
 
-    Esta estructura es determinista: Gemini puede redactar el contenido, pero no
-    puede cambiar, fusionar, reordenar ni omitir los títulos y pasos detectados.
+
+def _looks_like_dynamic_procedure(title: str, instruction: str) -> bool:
+    """Detecta instrucciones que piden construir el procedimiento desde el origen."""
+
+    combined = f"{title} {instruction}".lower()
+    procedural_title = any(term in title.lower() for term in PROCEDURAL_TITLE_TERMS)
+    dynamic_phrases = (
+        "detallar el paso a paso",
+        "todas las acciones",
+        "cantidad de pasos no es fija",
+        "documento o video",
+        "video de origen",
+        "sin omitir actividades",
+        "describir detalladamente",
+        "actividad mencionada",
+        "flujo de actividades",
+    )
+    return procedural_title and any(phrase in combined for phrase in dynamic_phrases)
+
+
+def _procedure_step_mode(
+    title: str,
+    instruction: str,
+    numbered_items: list[str],
+    explicit_numbering: bool,
+) -> str:
+    """Clasifica la sección como lista fija, procedimiento dinámico o no procedimental."""
+
+    title_key = title.lower()
+    instruction_key = instruction.lower()
+    procedural = any(term in title_key for term in PROCEDURAL_TITLE_TERMS)
+
+    if explicit_numbering and numbered_items:
+        return "fixed"
+
+    if _looks_like_dynamic_procedure(title, instruction) or procedural:
+        table_terms = all(
+            term in instruction_key
+            for term in ("actividad", "descripción", "responsable", "evidencia")
+        )
+        if "procedimiento" in title_key and table_terms:
+            return "dynamic_table"
+        return "dynamic_list"
+
+    return "none"
+
+
+def extract_exact_guide_structure(text: str) -> list[dict]:
+    """Extrae títulos, instrucciones y tipo de secuencia de la guía.
+
+    Una guía puede contener pasos fijos explícitamente numerados o una instrucción
+    dinámica que ordena construir el paso a paso a partir del documento/video. Las
+    viñetas explicativas de una instrucción dinámica son criterios, no pasos fijos.
     """
 
     raw_lines = str(text or "").splitlines()
@@ -1205,18 +1374,36 @@ def extract_exact_guide_structure(text: str) -> list[dict]:
         if not current_title:
             current_body = []
             return
+
         body_lines = [
             _clean_guide_line(line)
             for line in current_body
-            if _clean_guide_line(line) and not _is_page_artifact_line(_clean_guide_line(line))
+            if _clean_guide_line(line)
+            and not _is_page_artifact_line(_clean_guide_line(line))
         ]
         instruction = re.sub(r"\s+", " ", " ".join(body_lines)).strip()
+        explicit_numbering = _has_explicit_numbered_steps(body_lines)
+        numbered_items = _extract_steps_from_section(current_title, body_lines)
+
+        # Las viñetas de una instrucción dinámica describen qué debe contener cada
+        # paso; no representan una cantidad fija de pasos.
+        if _looks_like_dynamic_procedure(current_title, instruction) and not explicit_numbering:
+            numbered_items = []
+
+        step_mode = _procedure_step_mode(
+            current_title,
+            instruction,
+            numbered_items,
+            explicit_numbering,
+        )
+
         sections.append(
             {
                 "order": len(sections) + 1,
                 "title": current_title.strip(),
                 "instruction": instruction,
-                "numbered_items": _extract_steps_from_section(current_title, body_lines),
+                "numbered_items": numbered_items,
+                "step_mode": step_mode,
             }
         )
         current_title = None
@@ -1250,7 +1437,6 @@ def extract_exact_guide_structure(text: str) -> list[dict]:
         section["order"] = len(unique) + 1
         unique.append(section)
     return unique
-
 
 def build_guide_structure_manifest(guides: list[dict]) -> list[dict]:
     manifest: list[dict] = []
@@ -1318,12 +1504,22 @@ def render_exact_guide_structure(guides: list[dict], selected_guide_index: int) 
     ]
     for section in selected["sections"]:
         lines.append(f"\n{section['order']}. TÍTULO EXACTO: {section['title']}")
-        if section["numbered_items"]:
-            lines.append(f"   PASOS OBLIGATORIOS: {len(section['numbered_items'])}")
+        mode = section.get("step_mode", "none")
+        if mode == "fixed":
+            lines.append(f"   PASOS FIJOS OBLIGATORIOS: {len(section['numbered_items'])}")
             for index, item in enumerate(section["numbered_items"], start=1):
                 lines.append(f"   {index}. {item}")
+        elif mode == "dynamic_list":
+            lines.append(
+                "   PROCEDIMIENTO DINÁMICO: crear un paso independiente por cada "
+                "acción ACC-XXXX del origen; no resumir ni limitar la cantidad."
+            )
+        elif mode == "dynamic_table":
+            lines.append(
+                "   PROCEDIMIENTO DINÁMICO EN TABLA: crear una fila independiente "
+                "por cada acción ACC-XXXX del origen."
+            )
     return "\n".join(lines)
-
 
 def _normalized_title_tokens(text: str) -> set[str]:
     normalized = re.sub(r"[^a-záéíóúñ0-9]+", " ", str(text).lower())
@@ -1385,13 +1581,30 @@ def lock_analysis_to_selected_guide(
         title_rule = f"Conservar exactamente el título '{expected['title']}'."
         if title_rule not in criteria:
             criteria.insert(0, title_rule)
-        if expected["numbered_items"]:
+
+        mode = expected.get("step_mode", "none")
+        if mode == "fixed":
             count_rule = (
-                f"Incluir exactamente {len(expected['numbered_items'])} pasos independientes "
-                "en el mismo orden de la guía."
+                f"Incluir exactamente {len(expected['numbered_items'])} pasos "
+                "independientes en el mismo orden de la guía."
             )
             if count_rule not in criteria:
                 criteria.append(count_rule)
+        elif mode in {"dynamic_list", "dynamic_table"}:
+            dynamic_rule = (
+                "Construir el procedimiento completo con una actividad independiente "
+                "por cada acción operativa verificable del origen; no resumir, fusionar "
+                "ni limitar artificialmente la cantidad."
+            )
+            if dynamic_rule not in criteria:
+                criteria.append(dynamic_rule)
+
+        if mode == "dynamic_table":
+            output_format = "tabla"
+        elif mode in {"fixed", "dynamic_list"}:
+            output_format = "lista"
+        else:
+            output_format = matched.output_format if matched else "parrafo"
 
         locked_sections.append(
             SectionAssessment(
@@ -1406,16 +1619,12 @@ def lock_analysis_to_selected_guide(
                 status=matched.status if matched else "faltante",
                 evidence=list(matched.evidence) if matched else [],
                 draft_content=matched.draft_content if matched else "",
-                output_format=(
-                    "lista" if expected["numbered_items"]
-                    else (matched.output_format if matched else "parrafo")
-                ),
+                output_format=output_format,
                 missing_questions=list(matched.missing_questions) if matched else [],
             )
         )
 
     return analysis.model_copy(update={"sections": locked_sections})
-
 
 def _collect_generated_numbered_items(section: FinalSection | None) -> list[str]:
     if section is None:
@@ -1443,16 +1652,30 @@ def _collect_generated_numbered_items(section: FinalSection | None) -> list[str]
     return list(dict.fromkeys(candidates))
 
 
+def _remove_embedded_numbered_lines(paragraphs: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for paragraph in paragraphs:
+        lines = [line for line in str(paragraph).splitlines() if line.strip()]
+        remaining = [
+            line for line in lines
+            if not NUMBERED_GUIDE_LINE_RE.match(line.strip())
+            and not re.match(r"^\s*\d+[.)\-:]", line.strip())
+        ]
+        if remaining:
+            cleaned.append("\n".join(remaining))
+    return cleaned
+
+
 def lock_final_document_to_selected_guide(
     final_document: FinalDocument,
     analysis: GuideAnalysis,
     guides: list[dict],
 ) -> FinalDocument:
-    """Impone exactamente la estructura de la guía que Gemini seleccionó.
+    """Impone títulos y orden sin borrar procedimientos dinámicos.
 
-    La guía principal es la única fuente de títulos, orden y cantidad de pasos.
-    Las guías complementarias pueden aportar criterios de redacción, pero nunca
-    pueden agregar secciones, títulos o pasos al documento final.
+    Los pasos fijos se limitan a la cantidad explícita de la guía. Las secciones
+    dinámicas PASO A PASO/PROCEDIMIENTO conservan su contenido y posteriormente
+    se reconstruyen de forma determinista desde el inventario de acciones.
     """
 
     manifest = build_guide_structure_manifest(guides)
@@ -1497,68 +1720,60 @@ def lock_final_document_to_selected_guide(
 
         expected_items = list(expected["numbered_items"])
         generated_items = _collect_generated_numbered_items(generated)
+        mode = expected.get("step_mode", "none")
 
-        if expected_items:
+        if mode == "fixed":
             expected_count = len(expected_items)
-            numbered_items: list[str] = []
-            for item_index in range(expected_count):
-                if item_index < len(generated_items):
-                    candidate = generated_items[item_index]
-                    numbered_items.append(candidate or expected_items[item_index])
-                else:
-                    numbered_items.append(expected_items[item_index])
-
+            numbered_items = [
+                generated_items[index] if index < len(generated_items) and generated_items[index]
+                else expected_items[index]
+                for index in range(expected_count)
+            ]
             if len(generated_items) > expected_count:
                 warnings.append(
                     f"Se eliminaron {len(generated_items) - expected_count} paso(s) "
-                    f"adicional(es) de la sección '{expected['title']}' porque la "
-                    f"guía seleccionada exige exactamente {expected_count}."
+                    f"adicional(es) de '{expected['title']}' porque la guía fija "
+                    f"exactamente {expected_count}."
                 )
             elif len(generated_items) < expected_count:
                 warnings.append(
                     f"La sección '{expected['title']}' se completó hasta los "
-                    f"{expected_count} pasos exigidos por la guía seleccionada."
+                    f"{expected_count} pasos fijos exigidos por la guía."
                 )
-
             bullets = [
                 item for item in bullets
                 if not NUMBERED_GUIDE_LINE_RE.match(item)
                 and not re.match(r"^\s*\d+[.)\-:]", item)
             ]
-            cleaned_paragraphs: list[str] = []
-            for paragraph in paragraphs:
-                lines = [line for line in str(paragraph).splitlines() if line.strip()]
-                non_numbered_lines = [
-                    line for line in lines
-                    if not NUMBERED_GUIDE_LINE_RE.match(line.strip())
-                    and not re.match(r"^\s*\d+[.)\-:]", line.strip())
-                ]
-                if non_numbered_lines:
-                    cleaned_paragraphs.append("\n".join(non_numbered_lines))
-            paragraphs = cleaned_paragraphs
+            paragraphs = _remove_embedded_numbered_lines(paragraphs)
+
+        elif mode == "dynamic_list":
+            # Nunca eliminar los pasos de una sección dinámica. La cobertura final
+            # se aplicará usando source["video_actions"].
+            numbered_items = generated_items
+            bullets = [
+                item for item in bullets
+                if not NUMBERED_GUIDE_LINE_RE.match(item)
+                and not re.match(r"^\s*\d+[.)\-:]", item)
+            ]
+            paragraphs = _remove_embedded_numbered_lines(paragraphs)
+
+        elif mode == "dynamic_table":
+            numbered_items = []
+
         else:
             numbered_items = []
             if generated_items:
                 warnings.append(
                     f"Se eliminaron {len(generated_items)} paso(s) no autorizados "
-                    f"de la sección '{expected['title']}'."
+                    f"de la sección no procedimental '{expected['title']}'."
                 )
             bullets = [
                 item for item in bullets
                 if not NUMBERED_GUIDE_LINE_RE.match(item)
                 and not re.match(r"^\s*\d+[.)\-:]", item)
             ]
-            cleaned_paragraphs: list[str] = []
-            for paragraph in paragraphs:
-                lines = [line for line in str(paragraph).splitlines() if line.strip()]
-                non_numbered_lines = [
-                    line for line in lines
-                    if not NUMBERED_GUIDE_LINE_RE.match(line.strip())
-                    and not re.match(r"^\s*\d+[.)\-:]", line.strip())
-                ]
-                if non_numbered_lines:
-                    cleaned_paragraphs.append("\n".join(non_numbered_lines))
-            paragraphs = cleaned_paragraphs
+            paragraphs = _remove_embedded_numbered_lines(paragraphs)
 
         locked_sections.append(
             FinalSection(
@@ -1591,7 +1806,6 @@ def lock_final_document_to_selected_guide(
         }
     )
     return normalize_final_document_structure(locked)
-
 
 def document_fidelity_issues(
     final_document: FinalDocument,
@@ -1627,6 +1841,212 @@ def document_fidelity_issues(
     return issues
 
 
+def _clean_action_value(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _video_action_from_mapping(payload: dict) -> VideoAction | None:
+    try:
+        action_text = _clean_action_value(payload.get("action"))
+        if len(action_text) < MIN_ACTION_TEXT_CHARS:
+            return None
+        return VideoAction(
+            action_id=_clean_action_value(payload.get("action_id")),
+            timestamp_start=_clean_action_value(payload.get("timestamp_start")),
+            timestamp_end=_clean_action_value(payload.get("timestamp_end")),
+            actor=_clean_action_value(payload.get("actor")),
+            system=_clean_action_value(payload.get("system")),
+            location_path=_clean_action_value(payload.get("location_path")),
+            action=action_text,
+            interface_element=_clean_action_value(payload.get("interface_element")),
+            data_handled=_clean_action_value(payload.get("data_handled")),
+            validation=_clean_action_value(payload.get("validation")),
+            result=_clean_action_value(payload.get("result")),
+            evidence=_clean_action_value(payload.get("evidence")),
+            uncertainty=_clean_action_value(payload.get("uncertainty")),
+        )
+    except Exception:
+        return None
+
+
+def _source_video_actions(source: dict) -> list[VideoAction]:
+    raw_actions = source.get("video_actions") or []
+    if not raw_actions:
+        transcript_payload = source.get("video_transcript") or {}
+        if isinstance(transcript_payload, dict):
+            raw_actions = transcript_payload.get("actions") or []
+
+    actions: list[VideoAction] = []
+    for payload in raw_actions:
+        if isinstance(payload, VideoAction):
+            action = payload
+        elif isinstance(payload, dict):
+            action = _video_action_from_mapping(payload)
+        else:
+            action = None
+        if action is not None:
+            actions.append(action)
+
+    if not actions:
+        actions = _parse_action_inventory_from_source_text(str(source.get("text") or ""))
+
+    normalized: list[VideoAction] = []
+    seen: set[str] = set()
+    for index, action in enumerate(actions, start=1):
+        key = re.sub(
+            r"[^a-záéíóúñ0-9]+",
+            " ",
+            f"{action.timestamp_start} {action.action} {action.interface_element}".lower(),
+        ).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            action.model_copy(update={"action_id": f"ACC-{len(normalized)+1:04d}"})
+        )
+    return normalized
+
+
+def _sentence(value: str) -> str:
+    cleaned = _clean_action_value(value)
+    if not cleaned:
+        return ""
+    return cleaned if cleaned.endswith((".", "!", "?")) else cleaned + "."
+
+
+def _action_to_detailed_step(action: VideoAction) -> str:
+    """Convierte una acción atómica en un paso detallado sin inventar datos."""
+
+    parts: list[str] = []
+    actor = action.actor.strip()
+    base_action = action.action.strip()
+
+    if actor and actor.casefold() not in base_action.casefold():
+        parts.append(_sentence(f"El rol {actor} debe {base_action[0].lower() + base_action[1:] if base_action else base_action}"))
+    else:
+        parts.append(_sentence(base_action))
+
+    location_parts = [value for value in (action.system, action.location_path) if value.strip()]
+    if location_parts:
+        parts.append(_sentence("La acción se realiza en " + " — ".join(location_parts)))
+    if action.interface_element.strip():
+        parts.append(_sentence("Utilice o seleccione el elemento " + action.interface_element.strip()))
+    if action.data_handled.strip():
+        parts.append(_sentence("Gestione la siguiente información: " + action.data_handled.strip()))
+    if action.validation.strip():
+        parts.append(_sentence("Antes de continuar, verifique que " + action.validation.strip()))
+    if action.result.strip():
+        parts.append(_sentence("Confirme la ejecución mediante " + action.result.strip()))
+    elif action.evidence.strip():
+        parts.append(_sentence("La evidencia de la acción corresponde a " + action.evidence.strip()))
+    if action.uncertainty.strip():
+        parts.append(_sentence("Dato pendiente de confirmación: " + action.uncertainty.strip()))
+
+    return " ".join(part for part in parts if part).strip()
+
+
+def _action_to_procedure_row(action: VideoAction) -> list[str]:
+    activity = action.action.strip()
+    description = _action_to_detailed_step(action)
+    responsible = action.actor.strip() or "Por confirmar"
+    evidence_parts = [
+        value.strip()
+        for value in (action.validation, action.result, action.evidence)
+        if value.strip()
+    ]
+    evidence = "; ".join(dict.fromkeys(evidence_parts)) or "Por confirmar"
+    return [activity, description, responsible, evidence]
+
+
+def _apply_video_action_coverage(
+    final_document: FinalDocument,
+    selected_manifest: dict,
+    source: dict,
+) -> FinalDocument:
+    actions = _source_video_actions(source)
+    if not actions:
+        dynamic_sections = [
+            section for section in selected_manifest.get("sections", [])
+            if section.get("step_mode") in {"dynamic_list", "dynamic_table"}
+        ]
+        if dynamic_sections and source.get("is_video"):
+            raise AppError(
+                "La transcripción del video no contiene un inventario de acciones "
+                "operativas. Vuelve a transcribir el video con esta versión antes "
+                "de generar el documento."
+            )
+        return final_document
+
+    sections_by_title = {
+        re.sub(r"\s+", " ", section.title).strip().casefold(): section
+        for section in final_document.sections
+    }
+    rebuilt_sections: list[FinalSection] = []
+    warnings = list(final_document.warnings)
+
+    for expected in selected_manifest.get("sections", []):
+        key = re.sub(r"\s+", " ", expected["title"]).strip().casefold()
+        section = sections_by_title.get(key)
+        if section is None:
+            continue
+
+        mode = expected.get("step_mode", "none")
+        if mode == "dynamic_list":
+            steps = [_action_to_detailed_step(action) for action in actions]
+            steps = [step for step in steps if step.strip()]
+            section = section.model_copy(
+                update={
+                    "numbered_items": steps,
+                    "bullets": [],
+                    "source_basis": [
+                        f"Inventario audiovisual {actions[0].action_id}–{actions[-1].action_id}; "
+                        f"{len(actions)} acciones verificables."
+                    ],
+                }
+            )
+            warnings.append(
+                f"La sección '{section.title}' se construyó con {len(steps)} "
+                "pasos, uno por cada acción operativa identificada en el video."
+            )
+
+        elif mode == "dynamic_table":
+            procedure_table = FinalTable(
+                title="",
+                headers=["Actividad", "Descripción", "Responsables", "Evidencia"],
+                rows=[_action_to_procedure_row(action) for action in actions],
+            )
+            section = section.model_copy(
+                update={
+                    "numbered_items": [],
+                    "tables": [procedure_table],
+                    "source_basis": [
+                        f"Inventario audiovisual {actions[0].action_id}–{actions[-1].action_id}; "
+                        f"{len(actions)} acciones verificables."
+                    ],
+                }
+            )
+            warnings.append(
+                f"La sección '{section.title}' se construyó con {len(actions)} "
+                "filas, una por cada acción operativa identificada en el video."
+            )
+
+        rebuilt_sections.append(section)
+
+    rebuilt_by_order = {section.order: section for section in rebuilt_sections}
+    all_sections = [
+        rebuilt_by_order.get(section.order, section)
+        for section in final_document.sections
+    ]
+    return normalize_final_document_structure(
+        final_document.model_copy(
+            update={
+                "sections": all_sections,
+                "warnings": list(dict.fromkeys(warnings)),
+            }
+        )
+    )
+
+
 def enforce_fidelity_with_gemini(
     api_key: str,
     model: str,
@@ -1635,9 +2055,9 @@ def enforce_fidelity_with_gemini(
     analysis: GuideAnalysis,
     final_document: FinalDocument,
 ) -> FinalDocument:
-    """Aplica el bloqueo estructural local; no depende de otra respuesta de IA."""
+    """Aplica títulos exactos y cobertura determinista de acciones."""
 
-    del api_key, model, source  # La estructura se garantiza localmente.
+    del api_key, model
     locked = lock_final_document_to_selected_guide(
         final_document=final_document,
         analysis=analysis,
@@ -1651,70 +2071,171 @@ def enforce_fidelity_with_gemini(
         ),
         None,
     )
-    if selected_manifest:
-        expected_titles = [section["title"] for section in selected_manifest["sections"]]
-        actual_titles = [section.title for section in locked.sections]
-        if actual_titles != expected_titles:
-            raise AppError(
-                "El documento no conserva exactamente los títulos y el orden de la guía."
-            )
-        for expected, actual in zip(selected_manifest["sections"], locked.sections):
+    if not selected_manifest:
+        return locked
+
+    locked = _apply_video_action_coverage(locked, selected_manifest, source)
+
+    expected_titles = [section["title"] for section in selected_manifest["sections"]]
+    actual_titles = [section.title for section in locked.sections]
+    if actual_titles != expected_titles:
+        raise AppError(
+            "El documento no conserva exactamente los títulos y el orden de la guía."
+        )
+
+    actions = _source_video_actions(source)
+    for expected, actual in zip(selected_manifest["sections"], locked.sections):
+        mode = expected.get("step_mode", "none")
+        if mode == "fixed":
             expected_count = len(expected["numbered_items"])
             actual_count = len(actual.numbered_items)
             if actual_count != expected_count:
                 raise AppError(
                     f"La sección '{expected['title']}' debe contener exactamente "
-                    f"{expected_count} pasos y contiene {actual_count}."
+                    f"{expected_count} pasos fijos y contiene {actual_count}."
                 )
+        elif mode == "dynamic_list" and actions:
+            if len(actual.numbered_items) != len(actions):
+                raise AppError(
+                    f"Cobertura incompleta en '{expected['title']}': se detectaron "
+                    f"{len(actions)} acciones y se generaron {len(actual.numbered_items)} pasos."
+                )
+            if any(not item.strip() for item in actual.numbered_items):
+                raise AppError(
+                    f"La sección '{expected['title']}' contiene pasos vacíos."
+                )
+        elif mode == "dynamic_table" and actions:
+            row_count = sum(len(table.rows) for table in actual.tables)
+            if row_count != len(actions):
+                raise AppError(
+                    f"Cobertura incompleta en '{expected['title']}': se detectaron "
+                    f"{len(actions)} acciones y se generaron {row_count} filas."
+                )
+            for table in actual.tables:
+                for row in table.rows:
+                    if len(row) < 4 or not row[0].strip() or not row[1].strip():
+                        raise AppError(
+                            f"La tabla de '{expected['title']}' contiene una fila incompleta."
+                        )
+
     return locked
 
-
-
 def video_transcription_prompt(filename: str) -> str:
-    """Instrucciones para convertir un video en un origen documental completo."""
+    """Instrucciones para transcripción completa e inventario atómico de acciones."""
 
     return f"""
-Actúa como transcriptor profesional y analista audiovisual documental.
+Actúa como transcriptor profesional, observador de pantalla y analista de procesos.
 
 ARCHIVO
 {filename}
 
 OBJETIVO
-Convertir TODO el contenido útil del video en una fuente textual verificable
-que posteriormente será comparada con guías institucionales.
+Convertir TODO el video en una fuente textual verificable y, adicionalmente,
+construir un inventario exhaustivo de acciones operativas que permita redactar
+un procedimiento sin resumir ni perder actividades.
 
 REGLAS DE TRANSCRIPCIÓN
 1. Transcribe de principio a fin todo el discurso audible y relevante.
-2. Mantén el orden cronológico.
-3. Incluye marcas de tiempo con formato [HH:MM:SS] al inicio de cada intervención
-   o cuando cambie el tema.
-4. Identifica hablantes como Hablante 1, Hablante 2, etc. Usa nombres propios
-   únicamente cuando sean explícitos y verificables en el audio o en pantalla.
-5. No resumas, no fusiones intervenciones y no omitas pasos, decisiones,
-   instrucciones, cifras, fechas, nombres, sistemas, responsables ni controles.
-6. Conserva literalmente números, códigos, radicados, fechas y valores.
-7. Cuando una parte no sea comprensible, escribe [inaudible HH:MM:SS] y registra
-   la duda en uncertainties. No inventes palabras.
-8. Incluye en visual_evidence toda información útil que aparezca en pantalla:
-   textos, tablas, diapositivas, formularios, nombres de sistemas, campos,
-   acciones realizadas, rutas de navegación y evidencias, siempre con tiempo.
-9. Si una diapositiva o pantalla contiene una lista de pasos, registra todos
-   sus elementos en el mismo orden.
-10. key_facts debe contener únicamente hechos explícitos del audio o la imagen.
-11. full_transcript debe ser suficientemente completo para sustituir al video
-   como documento de origen del generador documental.
-12. No incluyas comentarios personales, recomendaciones ni conclusiones que no
-   estén expresadas o mostradas en el video.
+2. Mantén el orden cronológico y usa marcas absolutas [HH:MM:SS].
+3. Identifica hablantes sin inventar nombres.
+4. No resumas, no fusiones intervenciones y no omitas instrucciones, decisiones,
+   cifras, fechas, nombres, sistemas, responsables ni controles.
+5. Registra como evidencia visual los textos, formularios, tablas, pantallas,
+   módulos, rutas, botones, campos, archivos, mensajes y cambios de estado.
+6. Cuando algo no sea comprensible, usa [inaudible HH:MM:SS] y regístralo en
+   uncertainties. Nunca inventes.
+
+INVENTARIO DE ACCIONES OBLIGATORIO
+7. El campo actions es independiente de full_transcript y debe registrar TODAS
+   las acciones operativas observadas o explicadas en el tramo.
+8. Cada acción diferenciable debe ser un elemento independiente. Un clic, abrir
+   un menú, seleccionar una pestaña, buscar un registro, aplicar un filtro,
+   diligenciar un campo, adjuntar un archivo, guardar, enviar, validar, aprobar,
+   descargar, confirmar un mensaje o revisar un resultado son acciones distintas.
+9. Está prohibido escribir una sola acción como “ingresa al sistema y realiza el
+   proceso”. Debes descomponerla en todas las acciones que realmente ocurren.
+10. No omitas acciones por ser repetitivas, sencillas, obvias o de corta duración.
+11. No combines acciones usando “y luego”, “posteriormente” o expresiones
+    equivalentes. Si hay dos verbos operativos diferentes, normalmente deben ser
+    dos elementos de actions.
+12. Para cada acción completa, cuando la evidencia lo permita: timestamp_start,
+    timestamp_end, actor, system, location_path, action, interface_element,
+    data_handled, validation, result, evidence y uncertainty.
+13. action debe contener UNA sola acción concreta y verificable, redactada con
+    suficiente detalle para reconstruir el procedimiento.
+14. Si durante un intervalo no ocurre ninguna actividad operativa y solo existe
+    conversación sin instrucciones o ejecución, actions puede quedar vacío para
+    ese intervalo. No inventes pasos para aumentar la cantidad.
+15. Antes de responder, revisa nuevamente el tramo y confirma que cada acción
+    visible o mencionada tenga un registro independiente en actions.
 
 Devuelve únicamente el objeto estructurado solicitado.
 """.strip()
+
+def _render_action_inventory(actions: list[VideoAction]) -> str:
+    blocks: list[str] = []
+    for index, action in enumerate(actions, start=1):
+        action_id = action.action_id.strip() or f"ACC-{index:04d}"
+        blocks.extend(
+            [
+                f"[ACCION {action_id}]",
+                f"TIEMPO_INICIO: {action.timestamp_start}",
+                f"TIEMPO_FIN: {action.timestamp_end}",
+                f"RESPONSABLE: {action.actor}",
+                f"SISTEMA: {action.system}",
+                f"RUTA: {action.location_path}",
+                f"ACCION: {action.action}",
+                f"ELEMENTO: {action.interface_element}",
+                f"DATO: {action.data_handled}",
+                f"VALIDACION: {action.validation}",
+                f"RESULTADO: {action.result}",
+                f"EVIDENCIA: {action.evidence}",
+                f"INCERTIDUMBRE: {action.uncertainty}",
+                "",
+            ]
+        )
+    return "\n".join(blocks).strip()
+
+
+def _parse_action_inventory_from_source_text(text: str) -> list[VideoAction]:
+    pattern = re.compile(
+        r"(?ms)^\[ACCION\s+(ACC-\d+)\]\s*$\n(.*?)(?=^\[ACCION\s+ACC-\d+\]\s*$|^\[TRANSCRIPCIÓN COMPLETA\]|\Z)"
+    )
+    actions: list[VideoAction] = []
+    field_map = {
+        "TIEMPO_INICIO": "timestamp_start",
+        "TIEMPO_FIN": "timestamp_end",
+        "RESPONSABLE": "actor",
+        "SISTEMA": "system",
+        "RUTA": "location_path",
+        "ACCION": "action",
+        "ELEMENTO": "interface_element",
+        "DATO": "data_handled",
+        "VALIDACION": "validation",
+        "RESULTADO": "result",
+        "EVIDENCIA": "evidence",
+        "INCERTIDUMBRE": "uncertainty",
+    }
+    for match in pattern.finditer(str(text or "")):
+        payload: dict[str, str] = {"action_id": match.group(1)}
+        for line in match.group(2).splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            target = field_map.get(key.strip().upper())
+            if target:
+                payload[target] = value.strip()
+        action = _video_action_from_mapping(payload)
+        if action is not None:
+            actions.append(action)
+    return actions
 
 
 def render_video_transcript_as_source(
     transcript: VideoTranscript,
     video_name: str,
 ) -> str:
-    """Convierte la transcripción estructurada en texto de origen editable."""
+    """Convierte transcripción y acciones en un origen editable y trazable."""
 
     blocks = [
         f"[DOCUMENTO DE ORIGEN GENERADO DESDE VIDEO: {video_name}]",
@@ -1728,22 +2249,20 @@ def render_video_transcript_as_source(
         blocks.append("[HABLANTES]\n- " + "\n- ".join(transcript.speakers))
 
     blocks.append(
+        f"[TOTAL DE ACCIONES OPERATIVAS] {len(transcript.actions)}\n"
+        "[INVENTARIO DE ACCIONES OPERATIVAS — UNA ACCIÓN POR REGISTRO]\n"
+        + (_render_action_inventory(transcript.actions) or "[Sin acciones detectadas]")
+    )
+
+    blocks.append(
         "[TRANSCRIPCIÓN COMPLETA]\n"
         + (transcript.full_transcript.strip() or "[Sin transcripción]")
     )
 
     if transcript.visual_evidence:
-        blocks.append(
-            "[EVIDENCIA VISUAL]\n- "
-            + "\n- ".join(transcript.visual_evidence)
-        )
-
+        blocks.append("[EVIDENCIA VISUAL]\n- " + "\n- ".join(transcript.visual_evidence))
     if transcript.key_facts:
-        blocks.append(
-            "[HECHOS CLAVE VERIFICABLES]\n- "
-            + "\n- ".join(transcript.key_facts)
-        )
-
+        blocks.append("[HECHOS CLAVE VERIFICABLES]\n- " + "\n- ".join(transcript.key_facts))
     if transcript.uncertainties:
         blocks.append(
             "[FRAGMENTOS QUE REQUIEREN CONFIRMACIÓN]\n- "
@@ -1751,7 +2270,6 @@ def render_video_transcript_as_source(
         )
 
     return "\n\n".join(blocks).strip()
-
 
 def _file_state_name(file_info) -> str:
     state = getattr(file_info, "state", None)
@@ -2140,60 +2658,124 @@ def _video_clock(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+ACTION_VERB_RE = re.compile(
+    r"\b(abrir|acceder|ingresar|iniciar|seleccionar|hacer clic|pulsar|presionar|"
+    r"ubicar|buscar|consultar|diligenciar|registrar|escribir|digitar|modificar|"
+    r"adjuntar|cargar|descargar|guardar|enviar|aprobar|validar|verificar|confirmar|"
+    r"crear|eliminar|cerrar|filtrar|marcar|desmarcar|elegir|visualizar|revisar)\b",
+    flags=re.I,
+)
+TIMESTAMP_RE = re.compile(r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]")
+
+
+def _derive_actions_from_text(transcript: str, visual_evidence: list[str]) -> list[VideoAction]:
+    """Respaldo conservador cuando el modelo omite el arreglo actions."""
+
+    candidates = list(str(transcript or "").splitlines()) + list(visual_evidence)
+    actions: list[VideoAction] = []
+    last_timestamp = ""
+    for raw_line in candidates:
+        line = re.sub(r"\s+", " ", str(raw_line)).strip(" -•\t")
+        if not line:
+            continue
+        timestamp_match = TIMESTAMP_RE.search(line)
+        if timestamp_match:
+            last_timestamp = timestamp_match.group(1)
+        cleaned = TIMESTAMP_RE.sub("", line).strip(" :-")
+        if len(cleaned) < MIN_ACTION_TEXT_CHARS or not ACTION_VERB_RE.search(cleaned):
+            continue
+        actions.append(
+            VideoAction(
+                timestamp_start=last_timestamp,
+                action=cleaned,
+                evidence=line,
+            )
+        )
+    return actions
+
+
 def _merge_video_transcript_chunks(
     chunks: list[tuple[float, float, VideoTranscript]],
     duration_seconds: float,
 ) -> VideoTranscript:
-    """Une transcripciones parciales manteniendo trazabilidad por intervalo."""
+    """Une transcripciones y crea un inventario global de acciones sin duplicados."""
 
     languages: list[str] = []
     speakers: list[str] = []
     transcript_blocks: list[str] = []
+    all_actions: list[VideoAction] = []
     visual_evidence: list[str] = []
     key_facts: list[str] = []
     uncertainties: list[str] = []
 
     for start_seconds, end_seconds, chunk in chunks:
         interval = f"{_video_clock(start_seconds)}–{_video_clock(end_seconds)}"
-
         if chunk.detected_language.strip():
             languages.append(chunk.detected_language.strip())
-
         for speaker in chunk.speakers:
             value = str(speaker).strip()
             if value and value not in speakers:
                 speakers.append(value)
-
         if chunk.full_transcript.strip():
-            transcript_blocks.append(
-                f"[TRAMO {interval}]\n{chunk.full_transcript.strip()}"
+            transcript_blocks.append(f"[TRAMO {interval}]\n{chunk.full_transcript.strip()}")
+
+        chunk_actions = list(chunk.actions)
+        if not chunk_actions:
+            chunk_actions = _derive_actions_from_text(
+                chunk.full_transcript,
+                chunk.visual_evidence,
             )
+        for action in chunk_actions:
+            if not action.timestamp_start.strip():
+                action = action.model_copy(update={"timestamp_start": _video_clock(start_seconds)})
+            all_actions.append(action)
 
         for item in chunk.visual_evidence:
             value = str(item).strip()
             if value:
                 visual_evidence.append(f"[{interval}] {value}")
-
         for item in chunk.key_facts:
             value = str(item).strip()
             if value and value not in key_facts:
                 key_facts.append(value)
-
         for item in chunk.uncertainties:
             value = str(item).strip()
             if value:
                 uncertainties.append(f"[{interval}] {value}")
+
+    normalized_actions: list[VideoAction] = []
+    seen: set[str] = set()
+    for action in all_actions:
+        action_text = _clean_action_value(action.action)
+        if len(action_text) < MIN_ACTION_TEXT_CHARS:
+            continue
+        key = re.sub(
+            r"[^a-záéíóúñ0-9]+",
+            " ",
+            f"{action.timestamp_start} {action_text} {action.interface_element}".lower(),
+        ).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized_actions.append(
+            action.model_copy(
+                update={
+                    "action_id": f"ACC-{len(normalized_actions)+1:04d}",
+                    "action": action_text,
+                }
+            )
+        )
 
     return VideoTranscript(
         detected_language=languages[0] if languages else "",
         duration_estimate=_video_clock(duration_seconds),
         speakers=speakers,
         full_transcript="\n\n".join(transcript_blocks),
+        actions=normalized_actions,
         visual_evidence=visual_evidence,
         key_facts=key_facts,
         uncertainties=uncertainties,
     )
-
 
 def _build_video_file_part(
     uploaded_file,
@@ -2258,6 +2840,32 @@ def _tagged_list(text: str, name: str, next_names: list[str]) -> list[str]:
     return values
 
 
+def _parse_tagged_actions(block: str) -> list[VideoAction]:
+    actions: list[VideoAction] = []
+    for line in str(block or "").splitlines():
+        cleaned = re.sub(r"^\s*(?:[-•*]|\d+[.)])\s*", "", line).strip()
+        if not cleaned:
+            continue
+        values = [value.strip() for value in cleaned.split("|")]
+        values.extend([""] * (9 - len(values)))
+        action = _video_action_from_mapping(
+            {
+                "timestamp_start": values[0],
+                "actor": values[1],
+                "system": values[2],
+                "location_path": values[3],
+                "action": values[4] or cleaned,
+                "interface_element": values[5],
+                "data_handled": values[6],
+                "validation": values[7],
+                "result": values[8],
+            }
+        )
+        if action is not None:
+            actions.append(action)
+    return actions
+
+
 def _parse_tagged_video_response(
     raw_text: str,
     duration_estimate: str = "",
@@ -2270,6 +2878,7 @@ def _parse_tagged_video_response(
         "HABLANTES",
         "TRANSCRIPCION",
         "TRANSCRIPCIÓN",
+        "ACCIONES",
         "EVIDENCIA_VISUAL",
         "HECHOS_CLAVE",
         "INCERTIDUMBRES",
@@ -2277,46 +2886,42 @@ def _parse_tagged_video_response(
 
     language = _tagged_section(cleaned, "IDIOMA", names[1:])
     speakers = _tagged_list(cleaned, "HABLANTES", names[2:])
-
     transcript = _tagged_section(
         cleaned,
         "TRANSCRIPCION",
-        ["EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
+        ["ACCIONES", "EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
     )
     if not transcript:
         transcript = _tagged_section(
             cleaned,
             "TRANSCRIPCIÓN",
-            ["EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
+            ["ACCIONES", "EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
         )
-
-    visual = _tagged_list(
+    action_block = _tagged_section(
         cleaned,
-        "EVIDENCIA_VISUAL",
-        ["HECHOS_CLAVE", "INCERTIDUMBRES"],
+        "ACCIONES",
+        ["EVIDENCIA_VISUAL", "HECHOS_CLAVE", "INCERTIDUMBRES"],
     )
-    facts = _tagged_list(
-        cleaned,
-        "HECHOS_CLAVE",
-        ["INCERTIDUMBRES"],
-    )
+    actions = _parse_tagged_actions(action_block)
+    visual = _tagged_list(cleaned, "EVIDENCIA_VISUAL", ["HECHOS_CLAVE", "INCERTIDUMBRES"])
+    facts = _tagged_list(cleaned, "HECHOS_CLAVE", ["INCERTIDUMBRES"])
     uncertainties = _tagged_list(cleaned, "INCERTIDUMBRES", [])
 
-    # Respaldo final: si el modelo no respetó etiquetas, conserva todo el texto
-    # como transcripción en vez de perder el tramo.
     if not transcript:
         transcript = cleaned
+    if not actions:
+        actions = _derive_actions_from_text(transcript, visual)
 
     return VideoTranscript(
         detected_language=language,
         duration_estimate=duration_estimate,
         speakers=speakers,
         full_transcript=transcript,
+        actions=actions,
         visual_evidence=visual,
         key_facts=facts,
         uncertainties=uncertainties,
     )
-
 
 def _plain_video_fallback_prompt(
     prompt: str,
@@ -2339,13 +2944,16 @@ def _plain_video_fallback_prompt(
           "[IDIOMA]\nIdioma principal\n"
           "[HABLANTES]\n- Hablante 1\n"
           "[TRANSCRIPCION]\nTranscripción cronológica completa del tramo\n"
+          "[ACCIONES]\n"
+          "- HH:MM:SS | responsable | sistema | ruta | UNA acción atómica | "
+          "elemento | dato | validación | resultado\n"
+          "Incluye una línea independiente por cada clic, selección, navegación, "
+          "registro, carga, validación o resultado. No resumas varias acciones.\n"
           "[EVIDENCIA_VISUAL]\n- Evidencia con hora\n"
           "[HECHOS_CLAVE]\n- Hecho verificable\n"
           "[INCERTIDUMBRES]\n- Duda o fragmento inaudible\n"
-          "No agregues una introducción, una descripción del formato ni texto "
-          "fuera de esas etiquetas."
+          "No agregues texto fuera de esas etiquetas."
     )
-
 
 def _call_video_generate_content_fallback(
     client,
@@ -2463,6 +3071,122 @@ def _call_video_generate_content_fallback(
     return parsed_fallback
 
 
+def _merge_action_candidates(
+    primary: list[VideoAction],
+    audited: list[VideoAction],
+) -> list[VideoAction]:
+    """Une inventarios conservando la versión más exhaustiva sin duplicados."""
+
+    combined = list(audited) + list(primary)
+    result: list[VideoAction] = []
+    seen: set[str] = set()
+    for action in combined:
+        value = _clean_action_value(action.action)
+        if len(value) < MIN_ACTION_TEXT_CHARS:
+            continue
+        key = re.sub(
+            r"[^a-záéíóúñ0-9]+",
+            " ",
+            f"{action.timestamp_start} {value} {action.interface_element}".lower(),
+        ).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(action.model_copy(update={"action": value}))
+    return result
+
+
+def _video_action_audit_prompt(start_seconds: float, end_seconds: float) -> str:
+    return f"""
+Actúa exclusivamente como auditor de acciones operativas de un video.
+
+INTERVALO
+{_video_clock(start_seconds)} a {_video_clock(end_seconds)} del video original.
+
+TAREA
+Observa nuevamente TODO el intervalo y registra cada acción operativa como un
+elemento independiente en actions. No redactes un resumen ni una explicación
+general del tramo.
+
+REGLAS ESTRICTAS
+1. Separa cada clic, apertura de menú, selección de pestaña, búsqueda, filtro,
+   consulta, diligenciamiento, modificación, carga, descarga, guardado, envío,
+   validación, aprobación, confirmación, mensaje o revisión de resultado.
+2. Dos verbos operativos diferentes no deben quedar en la misma acción.
+3. No omitas acciones por ser rápidas, repetitivas, obvias o silenciosas.
+4. Usa marcas de tiempo absolutas HH:MM:SS.
+5. Para cada acción completa, cuando sea visible o audible: actor, sistema,
+   ruta, acción, elemento, dato, validación, resultado y evidencia.
+6. No inventes acciones. Cuando el intervalo no contenga ejecución ni
+   instrucciones operativas, devuelve actions vacío.
+7. Antes de responder, recorre nuevamente el intervalo y verifica que no haya
+   ninguna acción operativa sin registrar.
+
+Devuelve únicamente el objeto estructurado solicitado.
+""".strip()
+
+
+def _extract_actions_for_video_range(
+    client,
+    model: str,
+    uploaded_file,
+    start_seconds: float,
+    end_seconds: float,
+) -> list[VideoAction]:
+    """Segunda lectura enfocada solo en acciones para evitar generalizaciones."""
+
+    file_part = _build_video_file_part(
+        uploaded_file=uploaded_file,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+    prompt = _video_action_audit_prompt(start_seconds, end_seconds)
+    schema = _inline_and_clean_json_schema(VideoActionBatch)
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=types.Content(
+                role="user",
+                parts=[file_part, types.Part.from_text(text=prompt)],
+            ),
+            config=types.GenerateContentConfig(
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+                response_mime_type="application/json",
+                response_json_schema=schema,
+                temperature=0.0,
+                max_output_tokens=VIDEO_MAX_OUTPUT_TOKENS,
+            ),
+        )
+        parsed = _validate_structured_output(VideoActionBatch, response)
+        assert isinstance(parsed, VideoActionBatch)
+        return parsed.actions
+    except Exception:
+        fallback_prompt = (
+            prompt
+            + "\n\nFORMATO DE RESPALDO\n"
+              "No uses JSON. Devuelve únicamente [ACCIONES] y una línea por "
+              "acción con este formato:\n"
+              "- HH:MM:SS | responsable | sistema | ruta | UNA acción | "
+              "elemento | dato | validación | resultado"
+        )
+        response = client.models.generate_content(
+            model=model,
+            contents=types.Content(
+                role="user",
+                parts=[file_part, types.Part.from_text(text=fallback_prompt)],
+            ),
+            config=types.GenerateContentConfig(
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+                temperature=0.0,
+                max_output_tokens=VIDEO_MAX_OUTPUT_TOKENS,
+            ),
+        )
+        raw = str(getattr(response, "text", None) or "")
+        block = _tagged_section(raw, "ACCIONES", []) or raw
+        return _parse_tagged_actions(block)
+
+
 def _transcribe_video_by_intervals(
     client,
     model: str,
@@ -2503,6 +3227,30 @@ def _transcribe_video_by_intervals(
                 end_seconds=end_at,
             )
             assert isinstance(result, VideoTranscript)
+            primary_actions = list(result.actions)
+            if VIDEO_ACTION_AUDIT_ENABLED:
+                if progress_callback is not None:
+                    progress_callback(
+                        "Auditando acciones operativas del tramo "
+                        f"{_video_clock(start_at)}–{_video_clock(end_at)}"
+                    )
+                audited_actions = _extract_actions_for_video_range(
+                    client=client,
+                    model=model,
+                    uploaded_file=uploaded_file,
+                    start_seconds=start_at,
+                    end_seconds=end_at,
+                )
+                primary_actions = _merge_action_candidates(
+                    primary_actions,
+                    audited_actions,
+                )
+            if not primary_actions:
+                primary_actions = _derive_actions_from_text(
+                    result.full_transcript,
+                    result.visual_evidence,
+                )
+            result = result.model_copy(update={"actions": primary_actions})
             chunks.append((start_at, end_at, result))
             completed += 1
             return
@@ -2819,6 +3567,8 @@ def transcribe_drive_video_with_gemini(
         "origin_kind": "google_drive",
         "drive_file_id": metadata["file_id"],
         "drive_url": metadata.get("webViewLink") or drive_reference,
+        "video_actions": [action.model_dump() for action in transcript.actions],
+        "video_action_count": len(transcript.actions),
     }
     return transcript, source_record
 
@@ -3665,6 +4415,17 @@ def generate_final_with_gemini(
         )
 
     append_record_to_gemini_input(parts, source, "DOCUMENTO DE ORIGEN")
+    video_actions = _source_video_actions(source)
+    if video_actions:
+        parts.append(
+            types.Part.from_text(
+                text=(
+                    f"CONTROL DE COBERTURA: el origen contiene {len(video_actions)} "
+                    "acciones ACC-XXXX. En una sección procedimental dinámica, "
+                    "ninguna puede omitirse ni fusionarse."
+                )
+            )
+        )
     parts.append(
         types.Part.from_text(
             text=render_exact_guide_structure(guides, analysis.selected_guide_index)
@@ -4668,6 +5429,42 @@ def show_video_transcript_review(source_record: dict) -> str | None:
             )
 
     transcript = st.session_state.get("video_transcript")
+    if transcript:
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("Acciones operativas", len(transcript.actions))
+        metric_columns[1].metric("Hablantes", len(transcript.speakers))
+        metric_columns[2].metric("Alertas", len(transcript.uncertainties))
+
+        if transcript.actions:
+            with st.expander("Inventario de acciones detectadas", expanded=True):
+                st.caption(
+                    "Cada registro debe convertirse en un paso o fila independiente "
+                    "cuando la guía solicite PASO A PASO o PROCEDIMIENTO."
+                )
+                st.dataframe(
+                    [
+                        {
+                            "ID": action.action_id,
+                            "Tiempo": action.timestamp_start,
+                            "Responsable": action.actor,
+                            "Sistema/Ruta": " — ".join(
+                                value for value in (action.system, action.location_path)
+                                if value.strip()
+                            ),
+                            "Acción": action.action,
+                            "Validación/Resultado": action.validation or action.result,
+                        }
+                        for action in transcript.actions
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+        else:
+            st.error(
+                "No se detectaron acciones operativas. Vuelve a transcribir el video "
+                "antes de generar un procedimiento."
+            )
+
     if transcript and transcript.uncertainties:
         with st.expander("Fragmentos que requieren confirmación", expanded=True):
             for uncertainty in transcript.uncertainties:
@@ -5180,6 +5977,13 @@ def show_error_panel(
 
 def show_final_document(final_document: FinalDocument) -> None:
     st.subheader("Documento final")
+    source_record = st.session_state.get("source_record") or {}
+    action_count = int(source_record.get("video_action_count") or 0)
+    if action_count:
+        st.success(
+            f"Cobertura procedimental aplicada: {action_count} acciones "
+            "operativas identificadas en el video."
+        )
     st.markdown(f"## {final_document.title}")
 
     if final_document.subtitle.strip():
@@ -5788,6 +6592,10 @@ def main() -> None:
                             "antes de continuar con el análisis documental."
                         )
                         source_record["video_transcript"] = transcript.model_dump()
+                        source_record["video_actions"] = [
+                            action.model_dump() for action in transcript.actions
+                        ]
+                        source_record["video_action_count"] = len(transcript.actions)
 
                         st.write("4/4 · Video listo para revisión")
                         status.update(
@@ -5835,6 +6643,14 @@ def main() -> None:
                     source_record["role"] = (
                         "transcripción revisada del video de origen"
                     )
+                    edited_actions = _parse_action_inventory_from_source_text(
+                        approved_source_text
+                    )
+                    if edited_actions:
+                        source_record["video_actions"] = [
+                            action.model_dump() for action in edited_actions
+                        ]
+                        source_record["video_action_count"] = len(edited_actions)
                     source_record["warnings"] = [
                         warning
                         for warning in source_record.get("warnings", [])
@@ -5854,8 +6670,10 @@ def main() -> None:
                         ) + len(source_record["text"])
                         if total_text > MAX_TOTAL_TEXT_CHARS:
                             st.warning(
-                                "Los archivos contienen mucho texto. Se limitará "
-                                "el contenido textual por archivo."
+                                "Los archivos contienen mucho texto. Las guías "
+                                "se limitarán cuando sea necesario, pero la "
+                                "transcripción y el inventario del video se "
+                                "conservarán para la generación."
                             )
 
                         st.write("2/4 · Seleccionando la guía aplicable")
