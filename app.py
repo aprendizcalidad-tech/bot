@@ -4091,7 +4091,12 @@ def _strip_list_prefix(text: str) -> str:
 def normalize_final_document_structure(
     final_document: FinalDocument,
 ) -> FinalDocument:
-    """Normaliza listas, espacios, tablas y orden antes de generar."""
+    """Normaliza listas, espacios, tablas y orden antes de generar.
+
+    Conserva todas las ocurrencias de los pasos numerados, incluso cuando
+    dos acciones tengan el mismo texto, porque pueden corresponder a
+    momentos distintos del video.
+    """
 
     normalized_sections: list[FinalSection] = []
 
@@ -4169,9 +4174,13 @@ def normalize_final_document_structure(
         else:
             numbered_candidates.sort(key=lambda item: (item[1], item[2]))
 
-        numbered_items = list(
-            dict.fromkeys(item[3] for item in numbered_candidates)
-        )
+        # IMPORTANTE: no eliminar pasos repetidos.
+        # En un procedimiento basado en video, una misma acción puede ejecutarse
+        # varias veces en momentos distintos. Cada aparición corresponde a una
+        # acción ACC-XXXX independiente y debe conservarse como un paso.
+        numbered_items = [
+            item[3] for item in numbered_candidates
+        ]
         bullets = list(dict.fromkeys(remaining_bullets))
 
         tables: list[FinalTable] = []
