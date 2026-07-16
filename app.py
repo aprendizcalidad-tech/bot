@@ -1841,8 +1841,62 @@ def document_fidelity_issues(
     return issues
 
 
+MISSING_ACTION_VALUES = {
+    "",
+    "null",
+    "none",
+    "n a",
+    "na",
+    "s d",
+    "sd",
+    "no aplica",
+    "no disponible",
+    "sin dato",
+    "sin datos",
+    "sin informacion",
+    "sin información",
+    "no identificado",
+    "no identificada",
+    "no especificado",
+    "no especificada",
+    "no determinado",
+    "no determinada",
+    "desconocido",
+    "desconocida",
+    "por confirmar",
+    "pendiente",
+    "vacio",
+    "vacío",
+    "no se evidencia",
+    "no se observa",
+}
+
+
 def _clean_action_value(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    """Normaliza campos del inventario y elimina marcadores sin información."""
+
+    if value is None:
+        return ""
+
+    cleaned = re.sub(r"\s+", " ", str(value)).strip()
+    if not cleaned:
+        return ""
+
+    normalized = re.sub(
+        r"""[\s"'`´“”‘’.,;:()\[\]{}<>_/\\-]+""",
+        " ",
+        cleaned.casefold(),
+    ).strip()
+
+    if normalized in MISSING_ACTION_VALUES:
+        return ""
+
+    placeholder_tokens = {"null", "none", "na", "n", "a", "sd"}
+    tokens = normalized.split()
+    if tokens and all(token in placeholder_tokens for token in tokens):
+        return ""
+
+    return cleaned
 
 
 def _video_action_from_mapping(payload: dict) -> VideoAction | None:
@@ -1914,49 +1968,275 @@ def _sentence(value: str) -> str:
     return cleaned if cleaned.endswith((".", "!", "?")) else cleaned + "."
 
 
-def _action_to_detailed_step(action: VideoAction) -> str:
-    """Convierte una acción atómica en un paso detallado sin inventar datos."""
+def _lower_first(value: str) -> str:
+    cleaned = _clean_action_value(value)
+    if not cleaned:
+        return ""
+    return cleaned[0].lower() + cleaned[1:]
 
-    parts: list[str] = []
-    actor = action.actor.strip()
-    base_action = action.action.strip()
 
-    if actor and actor.casefold() not in base_action.casefold():
-        parts.append(_sentence(f"El rol {actor} debe {base_action[0].lower() + base_action[1:] if base_action else base_action}"))
+def _starts_with_infinitive(value: str) -> bool:
+    cleaned = _clean_action_value(value)
+    match = re.match(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", cleaned)
+    if not match:
+        return False
+    verb = match.group(0).casefold()
+    return verb.endswith(("ar", "er", "ir"))
+
+
+def _actor_subject(actor: str) -> str:
+    """Devuelve una forma natural para mencionar al responsable."""
+
+    cleaned = _clean_action_value(actor)
+    if not cleaned:
+        return ""
+
+    normalized = cleaned.casefold()
+    if normalized.startswith(("hablante ", "voz ", "persona no identificada")):
+        return ""
+
+    exact_subjects = {
+        "usuario": "el usuario",
+        "usuaria": "la usuaria",
+        "administrador": "el administrador",
+        "administradora": "la administradora",
+        "supervisor": "el supervisor",
+        "supervisora": "la supervisora",
+        "coordinador": "el coordinador",
+        "coordinadora": "la coordinadora",
+        "analista": "el analista",
+        "auxiliar": "el auxiliar",
+        "lider": "el líder",
+        "líder": "el líder",
+    }
+    if normalized in exact_subjects:
+        return exact_subjects[normalized]
+
+    if normalized.startswith(("el ", "la ", "los ", "las ")):
+        return _lower_first(cleaned)
+
+    return f"la persona responsable del rol «{cleaned}»"
+
+
+def _strip_actor_from_action(action_text: str, actor: str) -> str:
+    """Evita construcciones repetidas como 'el usuario el usuario hace...'."""
+
+    action = _clean_action_value(action_text)
+    actor_value = _clean_action_value(actor)
+    if not action or not actor_value:
+        return action
+
+    prefixes = [
+        actor_value,
+        f"el {actor_value}",
+        f"la {actor_value}",
+        f"rol {actor_value}",
+        f"el rol {actor_value}",
+        f"la persona responsable del rol {actor_value}",
+    ]
+    lowered = action.casefold()
+    for prefix in prefixes:
+        prefix_lower = prefix.casefold()
+        if lowered.startswith(prefix_lower + " "):
+            return action[len(prefix):].strip(" :-")
+    return action
+
+
+def _system_location_intro(system: str, location_path: str) -> str:
+    system_value = _clean_action_value(system)
+    path_value = _clean_action_value(location_path)
+    clauses: list[str] = []
+
+    if system_value:
+        system_key = system_value.casefold()
+        if system_key == "explorador de archivos":
+            clauses.append("En el Explorador de archivos")
+        elif system_key.startswith(("el ", "la ", "los ", "las ")):
+            clauses.append(f"En {system_value}")
+        else:
+            clauses.append(f"En la aplicación o sistema «{system_value}»")
+
+    if path_value:
+        path_key = path_value.casefold()
+        path_patterns = (
+            ("carpeta ", "dentro de la carpeta"),
+            ("módulo ", "en el módulo"),
+            ("modulo ", "en el módulo"),
+            ("menú ", "en el menú"),
+            ("menu ", "en el menú"),
+            ("pestaña ", "en la pestaña"),
+            ("pantalla ", "en la pantalla"),
+            ("opción ", "en la opción"),
+            ("opcion ", "en la opción"),
+        )
+        formatted_path = ""
+        for prefix, label in path_patterns:
+            if path_key.startswith(prefix):
+                remainder = path_value[len(prefix):].strip(" :-")
+                formatted_path = (
+                    f"{label} «{remainder}»" if remainder else f"{label} indicada"
+                )
+                break
+        if not formatted_path:
+            formatted_path = f"siguiendo la ruta «{path_value}»"
+        clauses.append(formatted_path)
+
+    return ", ".join(clauses)
+
+
+def _interface_suffix(action_text: str, interface_element: str) -> str:
+    """Integra el elemento de interfaz sin crear una oración robótica separada."""
+
+    action = _clean_action_value(action_text)
+    element = _clean_action_value(interface_element)
+    if not action or not element:
+        return ""
+
+    if element.casefold() in action.casefold():
+        return ""
+
+    element_key = element.casefold()
+    if element_key in {
+        "espacio en blanco",
+        "área en blanco",
+        "area en blanco",
+        "zona en blanco",
+    }:
+        label = "un espacio en blanco"
+    elif element_key.startswith(("el ", "la ", "los ", "las ", "un ", "una ")):
+        label = element
     else:
-        parts.append(_sentence(base_action))
+        label = f"«{element}»"
 
-    location_parts = [value for value in (action.system, action.location_path) if value.strip()]
-    if location_parts:
-        parts.append(_sentence("La acción se realiza en " + " — ".join(location_parts)))
-    if action.interface_element.strip():
-        parts.append(_sentence("Utilice o seleccione el elemento " + action.interface_element.strip()))
-    if action.data_handled.strip():
-        parts.append(_sentence("Gestione la siguiente información: " + action.data_handled.strip()))
-    if action.validation.strip():
-        parts.append(_sentence("Antes de continuar, verifique que " + action.validation.strip()))
-    if action.result.strip():
-        parts.append(_sentence("Confirme la ejecución mediante " + action.result.strip()))
-    elif action.evidence.strip():
-        parts.append(_sentence("La evidencia de la acción corresponde a " + action.evidence.strip()))
-    if action.uncertainty.strip():
-        parts.append(_sentence("Dato pendiente de confirmación: " + action.uncertainty.strip()))
+    action_key = action.casefold()
+    if re.search(r"\b(hacer clic|clic derecho|clic izquierdo|pulsar|presionar)\b", action_key):
+        return f" sobre {label}"
+    if re.search(r"\b(seleccionar|elegir|marcar|desmarcar)\b", action_key):
+        return f" la opción {label}"
+    if re.search(r"\b(diligenciar|escribir|digitar|registrar|ingresar)\b", action_key):
+        return f" en el campo {label}"
+    if re.search(r"\b(adjuntar|cargar|descargar)\b", action_key):
+        return f" mediante {label}"
+    return f" utilizando {label}"
+
+
+def _data_sentence(action_text: str, data_handled: str) -> str:
+    data = _clean_action_value(data_handled)
+    action_key = _clean_action_value(action_text).casefold()
+    if not data or data.casefold() in action_key:
+        return ""
+
+    if re.search(r"\b(diligenciar|registrar|escribir|digitar|ingresar|modificar)\b", action_key):
+        return _sentence(f"La información que debe registrar o actualizar es {data}")
+    if re.search(r"\b(buscar|consultar|revisar|verificar|filtrar|visualizar)\b", action_key):
+        return _sentence(f"La información que debe consultar o comprobar es {data}")
+    if re.search(r"\b(adjuntar|cargar|descargar)\b", action_key):
+        return _sentence(f"El archivo o dato relacionado con esta acción es {data}")
+    return _sentence(f"Durante este paso se gestiona la información correspondiente a {data}")
+
+
+def _action_to_detailed_step(action: VideoAction) -> str:
+    """Redacta una acción atómica de forma natural, detallada y sin marcadores null."""
+
+    actor = _clean_action_value(action.actor)
+    system = _clean_action_value(action.system)
+    path = _clean_action_value(action.location_path)
+    base_action = _strip_actor_from_action(action.action, actor)
+    interface = _clean_action_value(action.interface_element)
+    validation = _clean_action_value(action.validation)
+    result = _clean_action_value(action.result)
+    evidence = _clean_action_value(action.evidence)
+    uncertainty = _clean_action_value(action.uncertainty)
+
+    if not base_action:
+        return ""
+
+    # Evita terminaciones incompletas antes de incorporar el elemento de interfaz.
+    if interface:
+        base_action = re.sub(
+            r"\s+(?:en|sobre|el|la|los|las)\s*$",
+            "",
+            base_action,
+            flags=re.I,
+        ).strip()
+
+    subject = _actor_subject(actor)
+    if subject:
+        if _starts_with_infinitive(base_action):
+            action_clause = f"{subject} debe {_lower_first(base_action)}"
+        elif base_action.casefold().startswith("debe "):
+            action_clause = f"{subject} {_lower_first(base_action)}"
+        else:
+            action_clause = f"{subject} {_lower_first(base_action)}"
+    else:
+        if _starts_with_infinitive(base_action):
+            action_clause = f"se debe {_lower_first(base_action)}"
+        else:
+            action_clause = base_action
+
+    action_clause += _interface_suffix(base_action, interface)
+    location_intro = _system_location_intro(system, path)
+    core = f"{location_intro}, {action_clause}" if location_intro else action_clause
+    core = core[0].upper() + core[1:] if core else core
+
+    parts = [_sentence(core)]
+
+    data_sentence = _data_sentence(base_action, action.data_handled)
+    if data_sentence:
+        parts.append(data_sentence)
+
+    if validation:
+        parts.append(
+            _sentence(
+                "Antes de continuar, realice la siguiente verificación: "
+                + validation
+            )
+        )
+
+    if result:
+        parts.append(
+            _sentence(
+                "El paso se considera completado cuando se obtiene o visualiza "
+                "el siguiente resultado: "
+                + result
+            )
+        )
+
+    if evidence and evidence.casefold() not in " ".join(parts).casefold():
+        parts.append(
+            _sentence("Conserve como evidencia de la ejecución " + evidence)
+        )
+
+    if uncertainty:
+        parts.append(
+            _sentence(
+                "Antes de aprobar el documento, confirme la siguiente información: "
+                + uncertainty
+            )
+        )
 
     return " ".join(part for part in parts if part).strip()
 
 
 def _action_to_procedure_row(action: VideoAction) -> list[str]:
-    activity = action.action.strip()
+    activity = _clean_action_value(action.action)
     description = _action_to_detailed_step(action)
-    responsible = action.actor.strip() or "Por confirmar"
-    evidence_parts = [
-        value.strip()
-        for value in (action.validation, action.result, action.evidence)
-        if value.strip()
-    ]
-    evidence = "; ".join(dict.fromkeys(evidence_parts)) or "Por confirmar"
-    return [activity, description, responsible, evidence]
+    responsible = _clean_action_value(action.actor) or "No identificado en el video"
 
+    evidence_parts = [
+        value
+        for value in (
+            _clean_action_value(action.validation),
+            _clean_action_value(action.result),
+            _clean_action_value(action.evidence),
+        )
+        if value
+    ]
+    evidence = "; ".join(dict.fromkeys(evidence_parts))
+    if not evidence:
+        evidence = "No se identifica una evidencia específica en el video."
+
+    return [activity, description, responsible, evidence]
 
 def _apply_video_action_coverage(
     final_document: FinalDocument,
@@ -2161,6 +2441,8 @@ INVENTARIO DE ACCIONES OBLIGATORIO
 12. Para cada acción completa, cuando la evidencia lo permita: timestamp_start,
     timestamp_end, actor, system, location_path, action, interface_element,
     data_handled, validation, result, evidence y uncertainty.
+    Cuando un campo no tenga información verificable, devuelve una cadena vacía.
+    Nunca escribas null, None, N/A, no aplica, por confirmar ni expresiones equivalentes.
 13. action debe contener UNA sola acción concreta y verificable, redactada con
     suficiente detalle para reconstruir el procedimiento.
 14. Si durante un intervalo no ocurre ninguna actividad operativa y solo existe
@@ -3117,6 +3399,8 @@ REGLAS ESTRICTAS
 4. Usa marcas de tiempo absolutas HH:MM:SS.
 5. Para cada acción completa, cuando sea visible o audible: actor, sistema,
    ruta, acción, elemento, dato, validación, resultado y evidencia.
+   Si un campo no tiene información verificable, devuelve una cadena vacía.
+   Nunca escribas null, None, N/A, no aplica, por confirmar ni equivalentes.
 6. No inventes acciones. Cuando el intervalo no contenga ejecución ni
    instrucciones operativas, devuelve actions vacío.
 7. Antes de responder, recorre nuevamente el intervalo y verifica que no haya
