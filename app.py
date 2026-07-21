@@ -74,7 +74,7 @@ ALLOWED_EXTENSIONS = GUIDE_EXTENSIONS
 
 MODEL_DEFAULT = "gemini-flash-latest"
 VIDEO_MODEL_DEFAULT = "gemini-3.5-flash"
-MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_MB = 2000
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # Los videos grandes deben entrar por Google Drive para no llenar la memoria
 # de Streamlit. El cargador directo queda limitado a archivos pequeños.
