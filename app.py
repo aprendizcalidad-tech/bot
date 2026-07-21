@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from typing import Literal
@@ -31,7 +32,7 @@ from google.genai import types
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as build_drive_api
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from pydantic import BaseModel, ConfigDict, Field
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -80,16 +81,24 @@ MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024
 MAX_DRIVE_VIDEO_SIZE_MB = 1900
 MAX_DRIVE_VIDEO_SIZE_BYTES = MAX_DRIVE_VIDEO_SIZE_MB * 1024 * 1024
 VIDEO_PROCESSING_TIMEOUT_SECONDS = 3600
-VIDEO_CHUNK_SECONDS = 600  # 10 minutos por solicitud
+# Se inicia directamente en cinco minutos. La versión anterior intentaba diez
+# minutos y, al fallar, repetía el mismo contenido en dos tramos de cinco.
+VIDEO_CHUNK_SECONDS = 300
 VIDEO_MIN_CHUNK_SECONDS = 120  # respaldo mínimo de 2 minutos
-VIDEO_LONG_THRESHOLD_SECONDS = 1  # todo video con duración conocida usa tramos auditados
+VIDEO_LONG_THRESHOLD_SECONDS = 1  # todo video con duración conocida usa tramos
 VIDEO_MAX_OUTPUT_TOKENS = 32768
 VIDEO_ACTION_AUDIT_ENABLED = True
+VIDEO_ACTION_AUDIT_MODE = "selective"
+VIDEO_MAX_PARALLEL_CHUNKS = 2
+VIDEO_CHECKPOINT_ENABLED = True
+VIDEO_CHECKPOINT_VERSION = "video-v5-5min-selective-resumable"
+VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
 DRIVE_DOWNLOAD_CHUNK_BYTES = DRIVE_DOWNLOAD_CHUNK_MB * 1024 * 1024
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 MAX_GUIDES = 8
 MAX_TEXT_CHARS_PER_FILE = 80_000
 MAX_VIDEO_SOURCE_CHARS = 1_200_000
@@ -465,8 +474,13 @@ def drive_service_account_email() -> str:
         return ""
 
 
-def build_drive_service():
-    """Crea un cliente de Google Drive autenticado con cuenta de servicio."""
+def build_drive_service(writable: bool = False):
+    """Crea un cliente de Google Drive autenticado con cuenta de servicio.
+
+    El modo normal conserva el acceso de solo lectura usado para descargar
+    videos. El modo writable añade ``drive.file`` exclusivamente para guardar
+    checkpoints dentro de una carpeta compartida con la cuenta de servicio.
+    """
 
     info = read_drive_service_account_info()
     required = {"type", "client_email", "private_key", "token_uri"}
@@ -477,10 +491,14 @@ def build_drive_service():
             "Campos ausentes: " + ", ".join(missing) + "."
         )
 
+    scopes = [DRIVE_READONLY_SCOPE]
+    if writable:
+        scopes.append(DRIVE_FILE_SCOPE)
+
     try:
         credentials = service_account.Credentials.from_service_account_info(
             info,
-            scopes=[DRIVE_READONLY_SCOPE],
+            scopes=scopes,
         )
         return build_drive_api(
             "drive",
@@ -493,7 +511,6 @@ def build_drive_service():
             "No fue posible autenticar la cuenta de servicio de Google Drive. "
             "Revisa el JSON guardado en Secrets."
         ) from error
-
 
 def extract_drive_file_id(reference: str) -> str:
     """Extrae el ID desde un enlace de Drive o acepta directamente el ID."""
@@ -3186,6 +3203,519 @@ def _video_clock(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+
+def _safe_checkpoint_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("._")
+
+
+def _video_checkpoint_id(
+    checkpoint_key: str,
+    model: str,
+    duration_seconds: float,
+) -> str:
+    """Identifica de manera estable el progreso de un video y su configuración."""
+
+    raw = "|".join(
+        (
+            VIDEO_CHECKPOINT_VERSION,
+            str(checkpoint_key or "").strip(),
+            _normalize_model_name(model),
+            str(int(round(duration_seconds))),
+            str(VIDEO_CHUNK_SECONDS),
+        )
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_root_dir(checkpoint_id: str) -> Path:
+    configured = read_secret(
+        "VIDEO_CHECKPOINT_LOCAL_DIR",
+        VIDEO_CHECKPOINT_LOCAL_DIR,
+    ).strip()
+    root = Path(configured or VIDEO_CHECKPOINT_LOCAL_DIR)
+    return root / _safe_checkpoint_component(checkpoint_id)
+
+
+def _checkpoint_filename(start_seconds: float, end_seconds: float) -> str:
+    return (
+        f"chunk_{int(round(start_seconds)):06d}_"
+        f"{int(round(end_seconds)):06d}.json"
+    )
+
+
+def _checkpoint_payload(
+    checkpoint_id: str,
+    model: str,
+    start_seconds: float,
+    end_seconds: float,
+    transcript: VideoTranscript,
+    audited: bool,
+    audit_reasons: list[str],
+) -> dict:
+    return {
+        "version": VIDEO_CHECKPOINT_VERSION,
+        "checkpoint_id": checkpoint_id,
+        "model": _normalize_model_name(model),
+        "start_seconds": float(start_seconds),
+        "end_seconds": float(end_seconds),
+        "audited": bool(audited),
+        "audit_reasons": list(audit_reasons),
+        "saved_at_epoch": time.time(),
+        "transcript": transcript.model_dump(),
+    }
+
+
+def _checkpoint_from_payload(payload: dict) -> tuple[float, float, VideoTranscript] | None:
+    try:
+        if payload.get("version") != VIDEO_CHECKPOINT_VERSION:
+            return None
+        start_seconds = float(payload["start_seconds"])
+        end_seconds = float(payload["end_seconds"])
+        if end_seconds <= start_seconds:
+            return None
+        transcript = VideoTranscript.model_validate(payload["transcript"])
+        if not transcript.full_transcript.strip():
+            return None
+        return start_seconds, end_seconds, transcript
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _drive_checkpoint_folder_id() -> str:
+    return read_secret("DRIVE_CHECKPOINT_FOLDER_ID", "").strip()
+
+
+def _video_parallel_workers() -> int:
+    """Permite reducir la concurrencia desde Secrets si la cuota es limitada."""
+
+    raw = read_secret(
+        "VIDEO_MAX_PARALLEL_CHUNKS",
+        str(VIDEO_MAX_PARALLEL_CHUNKS),
+    ).strip()
+    try:
+        return max(1, min(2, int(raw)))
+    except (TypeError, ValueError):
+        return VIDEO_MAX_PARALLEL_CHUNKS
+
+
+def _drive_query_literal(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _find_drive_item(
+    service,
+    parent_id: str,
+    name: str,
+    mime_type: str | None = None,
+) -> dict | None:
+    terms = [
+        f"'{_drive_query_literal(parent_id)}' in parents",
+        f"name = '{_drive_query_literal(name)}'",
+        "trashed = false",
+    ]
+    if mime_type:
+        terms.append(f"mimeType = '{_drive_query_literal(mime_type)}'")
+    response = (
+        service.files()
+        .list(
+            q=" and ".join(terms),
+            spaces="drive",
+            fields="files(id,name,mimeType,modifiedTime)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    files = response.get("files") or []
+    return files[0] if files else None
+
+
+def _ensure_drive_checkpoint_folder(service, checkpoint_id: str) -> str:
+    root_id = _drive_checkpoint_folder_id()
+    if not root_id:
+        return ""
+
+    folder_name = f"video_checkpoint_{checkpoint_id[:20]}"
+    folder_mime = "application/vnd.google-apps.folder"
+    existing = _find_drive_item(service, root_id, folder_name, folder_mime)
+    if existing:
+        return str(existing["id"])
+
+    created = (
+        service.files()
+        .create(
+            body={
+                "name": folder_name,
+                "mimeType": folder_mime,
+                "parents": [root_id],
+                "appProperties": {
+                    "checkpoint_id": checkpoint_id,
+                    "checkpoint_version": VIDEO_CHECKPOINT_VERSION,
+                },
+            },
+            fields="id",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return str(created.get("id") or "")
+
+
+def _save_checkpoint_to_drive(
+    checkpoint_id: str,
+    filename: str,
+    payload: dict,
+) -> bool:
+    if not _drive_checkpoint_folder_id():
+        return False
+
+    service = None
+    try:
+        service = build_drive_service(writable=True)
+        folder_id = _ensure_drive_checkpoint_folder(service, checkpoint_id)
+        if not folder_id:
+            return False
+
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        media = MediaIoBaseUpload(
+            BytesIO(encoded),
+            mimetype="application/json",
+            resumable=False,
+        )
+        existing = _find_drive_item(
+            service,
+            folder_id,
+            filename,
+            "application/json",
+        )
+        if existing:
+            service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            service.files().create(
+                body={
+                    "name": filename,
+                    "parents": [folder_id],
+                    "mimeType": "application/json",
+                },
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+        return True
+    except Exception:
+        # El checkpoint local sigue protegiendo frente a reruns y reinicios suaves.
+        return False
+    finally:
+        if service is not None:
+            _close_drive_service(service)
+
+
+def _download_drive_file_bytes(service, file_id: str) -> bytes:
+    request = service.files().get_media(
+        fileId=file_id,
+        supportsAllDrives=True,
+    )
+    output = BytesIO()
+    downloader = MediaIoBaseDownload(output, request, chunksize=1024 * 1024)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk(num_retries=2)
+    return output.getvalue()
+
+
+def _load_checkpoints_from_drive(
+    checkpoint_id: str,
+) -> list[tuple[float, float, VideoTranscript]]:
+    if not _drive_checkpoint_folder_id():
+        return []
+
+    service = None
+    try:
+        service = build_drive_service(writable=True)
+        folder_id = _ensure_drive_checkpoint_folder(service, checkpoint_id)
+        if not folder_id:
+            return []
+
+        result: list[tuple[float, float, VideoTranscript]] = []
+        page_token = None
+        while True:
+            response = (
+                service.files()
+                .list(
+                    q=(
+                        f"'{_drive_query_literal(folder_id)}' in parents and "
+                        "mimeType = 'application/json' and trashed = false"
+                    ),
+                    spaces="drive",
+                    fields="nextPageToken,files(id,name)",
+                    pageSize=100,
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            for item in response.get("files") or []:
+                if not str(item.get("name") or "").startswith("chunk_"):
+                    continue
+                try:
+                    raw = _download_drive_file_bytes(service, str(item["id"]))
+                    payload = json.loads(raw.decode("utf-8"))
+                    parsed = _checkpoint_from_payload(payload)
+                    if parsed is not None:
+                        result.append(parsed)
+                except Exception:
+                    continue
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return result
+    except Exception:
+        return []
+    finally:
+        if service is not None:
+            _close_drive_service(service)
+
+
+def _delete_drive_checkpoint_folder(checkpoint_id: str) -> bool:
+    root_id = _drive_checkpoint_folder_id()
+    if not root_id or not checkpoint_id:
+        return False
+
+    service = None
+    try:
+        service = build_drive_service(writable=True)
+        folder_name = f"video_checkpoint_{checkpoint_id[:20]}"
+        folder = _find_drive_item(
+            service,
+            root_id,
+            folder_name,
+            "application/vnd.google-apps.folder",
+        )
+        if not folder:
+            return False
+        service.files().delete(
+            fileId=folder["id"],
+            supportsAllDrives=True,
+        ).execute()
+        return True
+    except Exception:
+        return False
+    finally:
+        if service is not None:
+            _close_drive_service(service)
+
+
+def _clear_video_checkpoints(checkpoint_id: str) -> None:
+    """Elimina el progreso cuando el usuario solicita empezar desde cero."""
+
+    if not checkpoint_id:
+        return
+    local_dir = _checkpoint_root_dir(checkpoint_id)
+    try:
+        if local_dir.exists():
+            shutil.rmtree(local_dir)
+    except Exception:
+        pass
+    _delete_drive_checkpoint_folder(checkpoint_id)
+
+
+def _load_video_chunk_checkpoints(
+    checkpoint_id: str,
+    progress_callback=None,
+) -> list[tuple[float, float, VideoTranscript]]:
+    """Recupera primero el progreso local y después completa desde Drive."""
+
+    if not VIDEO_CHECKPOINT_ENABLED:
+        return []
+
+    by_interval: dict[tuple[int, int], tuple[float, float, VideoTranscript]] = {}
+    local_dir = _checkpoint_root_dir(checkpoint_id)
+    if local_dir.exists():
+        for path in sorted(local_dir.glob("chunk_*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                parsed = _checkpoint_from_payload(payload)
+                if parsed is None:
+                    continue
+                key = (int(round(parsed[0])), int(round(parsed[1])))
+                by_interval[key] = parsed
+            except Exception:
+                continue
+
+    remote = _load_checkpoints_from_drive(checkpoint_id)
+    for parsed in remote:
+        key = (int(round(parsed[0])), int(round(parsed[1])))
+        if key not in by_interval:
+            by_interval[key] = parsed
+            payload = _checkpoint_payload(
+                checkpoint_id=checkpoint_id,
+                model="recuperado",
+                start_seconds=parsed[0],
+                end_seconds=parsed[1],
+                transcript=parsed[2],
+                audited=False,
+                audit_reasons=["Recuperado desde Google Drive"],
+            )
+            # Conserva la versión exacta esperada al materializar localmente.
+            payload["version"] = VIDEO_CHECKPOINT_VERSION
+            _write_json_atomic(
+                local_dir / _checkpoint_filename(parsed[0], parsed[1]),
+                payload,
+            )
+
+    chunks = sorted(by_interval.values(), key=lambda item: (item[0], item[1]))
+    if chunks and progress_callback is not None:
+        progress_callback(
+            f"Progreso recuperado: {len(chunks)} tramo(s) ya procesado(s)."
+        )
+    return chunks
+
+
+def _save_video_chunk_checkpoint(
+    checkpoint_id: str,
+    model: str,
+    start_seconds: float,
+    end_seconds: float,
+    transcript: VideoTranscript,
+    audited: bool,
+    audit_reasons: list[str],
+) -> None:
+    if not VIDEO_CHECKPOINT_ENABLED:
+        return
+
+    payload = _checkpoint_payload(
+        checkpoint_id=checkpoint_id,
+        model=model,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        transcript=transcript,
+        audited=audited,
+        audit_reasons=audit_reasons,
+    )
+    filename = _checkpoint_filename(start_seconds, end_seconds)
+    local_path = _checkpoint_root_dir(checkpoint_id) / filename
+    _write_json_atomic(local_path, payload)
+    _save_checkpoint_to_drive(checkpoint_id, filename, payload)
+
+
+def _interval_is_covered(
+    start_seconds: float,
+    end_seconds: float,
+    chunks: list[tuple[float, float, VideoTranscript]],
+) -> bool:
+    """Valida que uno o varios checkpoints cubran completamente un intervalo."""
+
+    relevant = sorted(
+        (
+            (max(start_seconds, start), min(end_seconds, end))
+            for start, end, _ in chunks
+            if end > start_seconds and start < end_seconds
+        ),
+        key=lambda item: item[0],
+    )
+    cursor = start_seconds
+    for start, end in relevant:
+        if start > cursor + 0.5:
+            return False
+        cursor = max(cursor, end)
+        if cursor >= end_seconds - 0.5:
+            return True
+    return cursor >= end_seconds - 0.5
+
+
+def _action_is_too_general(action: VideoAction) -> bool:
+    value = _normalized_action_key(action.action)
+    generic_phrases = (
+        "realizar el proceso",
+        "continuar con el proceso",
+        "hacer el procedimiento",
+        "gestionar la informacion",
+        "ejecutar la actividad",
+        "realizar las acciones",
+    )
+    return any(phrase in value for phrase in generic_phrases)
+
+
+def _chunk_needs_action_audit(
+    transcript: VideoTranscript,
+) -> tuple[bool, list[str]]:
+    """Decide si el tramo requiere una segunda lectura audiovisual."""
+
+    if not VIDEO_ACTION_AUDIT_ENABLED:
+        return False, []
+    if VIDEO_ACTION_AUDIT_MODE != "selective":
+        return True, ["Auditoría completa configurada"]
+
+    reasons: list[str] = []
+    actions = list(transcript.actions)
+    full_text = transcript.full_transcript.strip()
+
+    if not actions:
+        reasons.append("No se detectaron acciones en la primera lectura")
+    if transcript.uncertainties:
+        reasons.append("El tramo contiene incertidumbres")
+    if any(not _clean_action_value(action.timestamp_start) for action in actions):
+        reasons.append("Hay acciones sin marca de tiempo")
+    if any(_action_is_too_general(action) for action in actions):
+        reasons.append("Hay acciones redactadas de forma demasiado general")
+
+    verb_mentions = len(ACTION_VERB_RE.findall(full_text))
+    if full_text and len(full_text) >= 1800 and len(actions) < 3:
+        reasons.append("La transcripción es extensa para la cantidad de acciones")
+    if verb_mentions >= 8 and verb_mentions > max(5, len(actions) * 2 + 2):
+        reasons.append("La transcripción menciona más operaciones que el inventario")
+
+    return bool(reasons), reasons
+
+
+def _generate_video_range_with_retries(
+    client,
+    model: str,
+    uploaded_file,
+    prompt: str,
+    start_seconds: float,
+    end_seconds: float,
+) -> VideoTranscript:
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            result = _call_video_generate_content_fallback(
+                client=client,
+                model=model,
+                uploaded_file=uploaded_file,
+                prompt=prompt,
+                schema_model=VideoTranscript,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            )
+            assert isinstance(result, VideoTranscript)
+            return result
+        except Exception as error:
+            last_error = error
+            if not _is_retryable_gemini_error(error) or attempt == 2:
+                raise
+            time.sleep(min(8.0, 1.5 * (2 ** attempt)) + random.uniform(0.1, 0.5))
+    assert last_error is not None
+    raise last_error
+
+
 ACTION_VERB_RE = re.compile(
     r"\b(abrir|acceder|ingresar|iniciar|seleccionar|hacer clic|pulsar|presionar|"
     r"ubicar|buscar|consultar|diligenciar|registrar|escribir|digitar|modificar|"
@@ -3724,48 +4254,71 @@ def _transcribe_video_by_intervals(
     prompt: str,
     duration_seconds: float,
     progress_callback=None,
+    api_key: str = "",
+    checkpoint_key: str = "",
 ) -> VideoTranscript:
-    """Transcribe por tramos cortos y divide de nuevo si una salida se corta."""
+    """Procesa el video en tramos reanudables, con auditoría selectiva.
 
-    chunks: list[tuple[float, float, VideoTranscript]] = []
+    - Comienza directamente en intervalos de cinco minutos.
+    - Reutiliza checkpoints locales y, opcionalmente, de Google Drive.
+    - Procesa hasta dos intervalos simultáneamente.
+    - Solo repite el análisis audiovisual cuando existen señales de omisión.
+    """
+
+    checkpoint_id = _video_checkpoint_id(
+        checkpoint_key=checkpoint_key or str(getattr(uploaded_file, "name", "video")),
+        model=model,
+        duration_seconds=duration_seconds,
+    )
+    chunks = _load_video_chunk_checkpoints(
+        checkpoint_id,
+        progress_callback=progress_callback,
+    )
+
     planned: list[tuple[float, float]] = []
     start_seconds = 0.0
-
     while start_seconds < duration_seconds:
         end_seconds = min(duration_seconds, start_seconds + VIDEO_CHUNK_SECONDS)
-        planned.append((start_seconds, end_seconds))
+        if not _interval_is_covered(start_seconds, end_seconds, chunks):
+            planned.append((start_seconds, end_seconds))
         start_seconds = end_seconds
 
-    completed = 0
-
-    def transcribe_range(start_at: float, end_at: float, depth: int = 0) -> None:
-        nonlocal completed
-        if progress_callback is not None:
+    total_intervals = max(1, int((duration_seconds + VIDEO_CHUNK_SECONDS - 1) // VIDEO_CHUNK_SECONDS))
+    recovered_intervals = total_intervals - len(planned)
+    if progress_callback is not None:
+        if recovered_intervals:
             progress_callback(
-                f"Transcribiendo tramo {_video_clock(start_at)}–"
-                f"{_video_clock(end_at)}"
+                f"Reanudando: {recovered_intervals} de {total_intervals} "
+                "intervalos ya estaban completos."
+            )
+        else:
+            progress_callback(
+                f"Iniciando {total_intervals} intervalos de cinco minutos."
             )
 
+    def process_range(
+        worker_client,
+        start_at: float,
+        end_at: float,
+        depth: int = 0,
+    ) -> list[tuple[float, float, VideoTranscript, bool, list[str]]]:
         try:
-            result = _call_video_generate_content_fallback(
-                client=client,
+            result = _generate_video_range_with_retries(
+                client=worker_client,
                 model=model,
                 uploaded_file=uploaded_file,
                 prompt=prompt,
-                schema_model=VideoTranscript,
                 start_seconds=start_at,
                 end_seconds=end_at,
             )
-            assert isinstance(result, VideoTranscript)
+
+            needs_audit, audit_reasons = _chunk_needs_action_audit(result)
             primary_actions = list(result.actions)
-            if VIDEO_ACTION_AUDIT_ENABLED:
-                if progress_callback is not None:
-                    progress_callback(
-                        "Auditando acciones operativas del tramo "
-                        f"{_video_clock(start_at)}–{_video_clock(end_at)}"
-                    )
+            audited = False
+
+            if needs_audit:
                 audited_actions = _extract_actions_for_video_range(
-                    client=client,
+                    client=worker_client,
                     model=model,
                     uploaded_file=uploaded_file,
                     start_seconds=start_at,
@@ -3775,36 +4328,107 @@ def _transcribe_video_by_intervals(
                     primary_actions,
                     audited_actions,
                 )
+                audited = True
+
             if not primary_actions:
                 primary_actions = _derive_actions_from_text(
                     result.full_transcript,
                     result.visual_evidence,
                 )
             result = result.model_copy(update={"actions": primary_actions})
-            chunks.append((start_at, end_at, result))
-            completed += 1
-            return
+            return [(start_at, end_at, result, audited, audit_reasons)]
+
         except Exception:
             duration = end_at - start_at
             if duration <= VIDEO_MIN_CHUNK_SECONDS or depth >= 4:
                 raise
-
             midpoint = start_at + duration / 2
-            if progress_callback is not None:
-                progress_callback(
-                    "La salida fue demasiado extensa; dividiendo el tramo en "
-                    f"{_video_clock(start_at)}–{_video_clock(midpoint)} y "
-                    f"{_video_clock(midpoint)}–{_video_clock(end_at)}"
-                )
-            transcribe_range(start_at, midpoint, depth + 1)
-            transcribe_range(midpoint, end_at, depth + 1)
+            left = process_range(worker_client, start_at, midpoint, depth + 1)
+            right = process_range(worker_client, midpoint, end_at, depth + 1)
+            return left + right
 
-    for start_at, end_at in planned:
-        transcribe_range(start_at, end_at)
+    def worker(start_at: float, end_at: float):
+        # Cada hilo usa su propio cliente. Se comparte únicamente la URI de un
+        # archivo ya procesado por Gemini Files API.
+        worker_client = genai.Client(api_key=api_key) if api_key else client
+        owns_client = worker_client is not client
+        try:
+            return process_range(worker_client, start_at, end_at)
+        finally:
+            if owns_client:
+                try:
+                    worker_client.close()
+                except Exception:
+                    pass
 
-    chunks.sort(key=lambda item: item[0])
-    return _merge_video_transcript_chunks(chunks, duration_seconds)
+    completed_new = 0
+    max_workers = min(_video_parallel_workers(), max(1, len(planned)))
 
+    processing_errors: list[str] = []
+    if planned:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(worker, start_at, end_at): (start_at, end_at)
+                for start_at, end_at in planned
+            }
+            for future in as_completed(future_map):
+                original_start, original_end = future_map[future]
+                if progress_callback is not None:
+                    progress_callback(
+                        "Completando tramo "
+                        f"{_video_clock(original_start)}–{_video_clock(original_end)}"
+                    )
+                try:
+                    produced = future.result()
+                except Exception as error:
+                    processing_errors.append(
+                        f"{_video_clock(original_start)}–{_video_clock(original_end)}: "
+                        f"{str(error)[:300]}"
+                    )
+                    continue
+
+                for start_at, end_at, result, audited, reasons in produced:
+                    chunks.append((start_at, end_at, result))
+                    _save_video_chunk_checkpoint(
+                        checkpoint_id=checkpoint_id,
+                        model=model,
+                        start_seconds=start_at,
+                        end_seconds=end_at,
+                        transcript=result,
+                        audited=audited,
+                        audit_reasons=reasons,
+                    )
+                completed_new += 1
+                if progress_callback is not None:
+                    done = recovered_intervals + completed_new
+                    progress_callback(
+                        f"Progreso: {done} de {total_intervals} intervalos. "
+                        "Cada tramo terminado quedó guardado."
+                    )
+
+    if processing_errors:
+        raise AppError(
+            "Algunos intervalos no pudieron completarse, pero todos los tramos "
+            "exitosos quedaron guardados. Vuelve a ejecutar la transcripción para "
+            "reanudar únicamente los intervalos pendientes. Detalle: "
+            + " | ".join(processing_errors[:4])
+        )
+
+    chunks.sort(key=lambda item: (item[0], item[1]))
+    if not _interval_is_covered(0.0, duration_seconds, chunks):
+        raise AppError(
+            "La transcripción no cubre todavía la duración completa del video. "
+            "Vuelve a ejecutar el proceso para reanudar desde el último checkpoint."
+        )
+
+    merged = _merge_video_transcript_chunks(chunks, duration_seconds)
+    # Se expone el ID para que la interfaz pueda informar y, cuando el usuario
+    # solicite una transcripción completamente nueva, eliminar el progreso local.
+    try:
+        st.session_state["video_checkpoint_id"] = checkpoint_id
+    except Exception:
+        pass
+    return merged
 
 def _transcribe_local_video_path_with_gemini(
     api_key: str,
@@ -3813,8 +4437,9 @@ def _transcribe_local_video_path_with_gemini(
     display_name: str,
     mime_type: str,
     progress_callback=None,
+    checkpoint_key: str = "",
 ) -> VideoTranscript:
-    """Sube el video y lo procesa completo o en intervalos de 10 minutos."""
+    """Sube el video y lo procesa en intervalos reanudables de cinco minutos."""
 
     if not api_key:
         raise AppError("No se encontró GEMINI_API_KEY para transcribir el video.")
@@ -3917,6 +4542,8 @@ def _transcribe_local_video_path_with_gemini(
                         prompt=prompt,
                         duration_seconds=duration_seconds,
                         progress_callback=progress_callback,
+                        api_key=api_key,
+                        checkpoint_key=checkpoint_key or display_name,
                     )
                     st.session_state["active_gemini_model"] = candidate_model
                     return result
@@ -3979,6 +4606,8 @@ def _transcribe_local_video_path_with_gemini(
                             prompt=prompt,
                             duration_seconds=duration_seconds,
                             progress_callback=progress_callback,
+                            api_key=api_key,
+                            checkpoint_key=checkpoint_key or display_name,
                         )
                         st.session_state["active_gemini_model"] = candidate_model
                         return chunked_result
@@ -4049,6 +4678,7 @@ def transcribe_video_with_gemini(
             display_name=video_record["name"],
             mime_type=video_record["mime_type"],
             progress_callback=progress_callback,
+            checkpoint_key=str(video_record.get("fingerprint") or video_record["name"]),
         )
 
 
@@ -4077,6 +4707,14 @@ def transcribe_drive_video_with_gemini(
             display_name=metadata["name"],
             mime_type=metadata["mime_type"],
             progress_callback=progress_callback,
+            checkpoint_key=(
+                "drive:"
+                + str(metadata.get("file_id") or "")
+                + ":"
+                + str(metadata.get("modifiedTime") or "")
+                + ":"
+                + str(metadata.get("size_bytes") or "")
+            ),
         )
 
     source_record = {
@@ -4099,6 +4737,7 @@ def transcribe_drive_video_with_gemini(
         "drive_url": metadata.get("webViewLink") or drive_reference,
         "video_actions": [action.model_dump() for action in transcript.actions],
         "video_action_count": len(transcript.actions),
+        "video_checkpoint_id": st.session_state.get("video_checkpoint_id"),
     }
     return transcript, source_record
 
@@ -5886,6 +6525,7 @@ def initialize_state() -> None:
         "video_transcript": None,
         "video_source_text": None,
         "video_source_fingerprint": None,
+        "video_checkpoint_id": None,
     }
 
     for key, default in defaults.items():
@@ -5906,6 +6546,7 @@ def reset_workflow() -> None:
     st.session_state.video_transcript = None
     st.session_state.video_source_text = None
     st.session_state.video_source_fingerprint = None
+    st.session_state.video_checkpoint_id = None
     st.session_state.upload_key += 1
 
 
@@ -6053,9 +6694,17 @@ def show_video_transcript_review(source_record: dict) -> str | None:
     )
 
     if retranscribe:
+        checkpoint_id = str(
+            source_record.get("video_checkpoint_id")
+            or st.session_state.get("video_checkpoint_id")
+            or ""
+        ).strip()
+        if checkpoint_id:
+            _clear_video_checkpoints(checkpoint_id)
         st.session_state.video_transcript = None
         st.session_state.video_source_text = None
         st.session_state.video_source_fingerprint = None
+        st.session_state.video_checkpoint_id = None
         st.session_state.source_record = None
         st.session_state.analysis = None
         st.rerun()
@@ -6862,10 +7511,11 @@ def main() -> None:
             """
             1. **Carga las guías institucionales** y elige un documento, un video pequeño o un video de Google Drive.
             2. Los videos de Drive se **descargan por bloques al disco temporal**, sin guardarlos completos en la memoria de Streamlit.
-            3. Gemini **transcribe el audio y analiza la evidencia visual** para que puedas revisarlos.
-            4. El sistema **selecciona la guía aplicable y respeta exactamente sus títulos, orden y cantidad de pasos**.
-            5. Solo solicita **datos críticos que realmente estén ausentes**.
-            6. Presenta un **borrador editable** y crea el Word y el PDF institucionales.
+            3. Gemini procesa el video en **tramos reanudables de cinco minutos**, con auditoría selectiva y hasta dos tramos simultáneos.
+            4. Cada tramo terminado se guarda como checkpoint local y, cuando se configura, también en **Google Drive**.
+            5. El sistema **selecciona la guía aplicable y respeta exactamente sus títulos, orden y cantidad de pasos**.
+            6. Solo solicita **datos críticos que realmente estén ausentes**.
+            7. Presenta un **borrador editable** y crea el Word y el PDF institucionales.
             """
         )
 
@@ -6888,6 +7538,18 @@ def main() -> None:
             st.caption(f"Correo de acceso: {drive_email}")
         else:
             st.warning("Google Drive aún no está configurado")
+
+        checkpoint_folder = _drive_checkpoint_folder_id()
+        if checkpoint_folder:
+            st.success("Checkpoints reanudables en Google Drive habilitados")
+            st.caption(
+                "La carpeta debe estar compartida como Editor con la cuenta de servicio."
+            )
+        else:
+            st.info(
+                "Los checkpoints se guardarán localmente. Para conservarlos incluso "
+                "después de reiniciar el servidor, configura DRIVE_CHECKPOINT_FOLDER_ID."
+            )
 
         model = st.text_input(
             "Modelo Gemini preferido",
@@ -7080,9 +7742,9 @@ def main() -> None:
 
     if source_is_video:
         st.info(
-            "El video se procesará en dos fases: primero se genera una "
-            "transcripción completa y editable; después se compara el texto "
-            "aprobado con las guías."
+            "El video se procesa directamente en intervalos de cinco minutos, "
+            "con hasta dos intervalos simultáneos y auditoría selectiva. Cada "
+            "tramo completado se guarda para poder reanudar después de un reinicio."
         )
         if source_from_drive:
             st.caption(
@@ -7107,7 +7769,7 @@ def main() -> None:
                 drive_reference and drive_service_account_email()
             ) if source_from_drive else True
             transcribe_clicked = st.button(
-                "Transcribir video y extraer evidencia visual",
+                "Transcribir o reanudar video y extraer evidencia visual",
                 type="primary",
                 width="stretch",
                 disabled=not api_key or not drive_ready,
@@ -7153,6 +7815,9 @@ def main() -> None:
                             # No conservar otra copia del video dentro del estado.
                             source_record["content"] = b""
                             source_record["origin_kind"] = "direct_upload"
+                            source_record["video_checkpoint_id"] = (
+                                st.session_state.get("video_checkpoint_id")
+                            )
 
                         st.write("3/4 · Preparando el origen textual editable")
                         source_text = render_video_transcript_as_source(
