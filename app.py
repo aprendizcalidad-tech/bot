@@ -74,7 +74,7 @@ ALLOWED_EXTENSIONS = GUIDE_EXTENSIONS
 
 MODEL_DEFAULT = "gemini-flash-latest"
 VIDEO_MODEL_DEFAULT = "gemini-3.5-flash"
-MAX_FILE_SIZE_MB = 2000
+MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # Los videos grandes deben entrar por Google Drive para no llenar la memoria
 # de Streamlit. El cargador directo queda limitado a archivos pequeños.
@@ -98,7 +98,7 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v1-hierarchical"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v3-forced-embedding"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
 VIDEO_VISUAL_MAX_CAPTURES = 90
@@ -6716,12 +6716,20 @@ def _section_display_title(section: FinalSection) -> str:
 
 
 def _section_is_visual_procedure(section: FinalSection, source_record: dict | None) -> bool:
+    """Detecta una sección procedimental sin exigir igualdad exacta de conteos.
+
+    La versión anterior desactivaba por completo la inserción de imágenes cuando
+    el inventario y los pasos diferían siquiera en un elemento. Esa condición era
+    demasiado estricta: las capturas deben insertarse para todos los pasos que
+    puedan relacionarse, y cualquier diferencia se valida por separado.
+    """
+
     if not source_record or not section.numbered_items:
         return False
     title_key = _normalized_action_key(section.title)
     procedural = any(term in title_key for term in PROCEDURAL_TITLE_TERMS)
     actions = _source_video_actions(source_record)
-    return procedural and bool(actions) and len(actions) == len(section.numbered_items)
+    return procedural and bool(actions)
 
 
 def _procedure_render_plan(
@@ -6731,7 +6739,10 @@ def _procedure_render_plan(
     if not _section_is_visual_procedure(section, source_record):
         return []
     actions = _source_video_actions(source_record or {})
-    return _build_visual_procedure_groups(actions)
+    # Solo se agrupan las acciones que tienen un paso correspondiente. Los pasos
+    # adicionales se renderizan después sin perder contenido.
+    aligned_actions = actions[: len(section.numbered_items)]
+    return _build_visual_procedure_groups(aligned_actions)
 
 
 def _recover_source_record_visuals(
@@ -6887,10 +6898,14 @@ def _docx_available_image_width_cm(document: Document) -> float:
         return 15.5
 
 
-def add_docx_visual(document: Document, visual: dict) -> object | None:
+def add_docx_visual(document: Document, visual: dict) -> object:
+    """Inserta una captura y nunca oculta silenciosamente un error."""
+
     content = visual.get("content") if isinstance(visual, dict) else None
     if not isinstance(content, (bytes, bytearray)) or not content:
-        return None
+        raise AppError(
+            "La captura relacionada con el paso no contiene bytes de imagen válidos."
+        )
     try:
         paragraph = document.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -6903,8 +6918,12 @@ def add_docx_visual(document: Document, visual: dict) -> object | None:
             width=Cm(_docx_available_image_width_cm(document)),
         )
         return paragraph
-    except Exception:
-        return None
+    except Exception as error:
+        raise AppError(
+            "La captura fue extraída, pero Word no pudo insertarla. "
+            f"Archivo: {visual.get('filename', 'sin nombre')}. "
+            f"Detalle: {str(error)[:300]}"
+        ) from error
 
 
 def _reportlab_visual(visual: dict, available_width: float):
@@ -7136,18 +7155,36 @@ def add_docx_table(document: Document, table_data: FinalTable) -> None:
     spacer.paragraph_format.space_after = Pt(4)
 
 
+def _count_docx_embedded_images(docx_content: bytes) -> int:
+    """Cuenta imágenes físicas guardadas dentro de word/media."""
+
+    try:
+        with zipfile.ZipFile(BytesIO(docx_content), "r") as archive:
+            return sum(
+                1
+                for name in archive.namelist()
+                if name.startswith("word/media/") and not name.endswith("/")
+            )
+    except Exception:
+        return 0
+
+
 def create_docx(
     final_document: FinalDocument,
     style_guide: dict | None = None,
     source_record: dict | None = None,
 ) -> bytes:
-    """Crea un instructivo institucional jerárquico con evidencia visual."""
+    """Crea el instructivo y fuerza la inserción verificable de capturas."""
 
     final_document = normalize_final_document_structure(final_document)
     document, inherited_layout = load_visual_guide_document(style_guide)
     configure_docx(document, preserve_guide_layout=inherited_layout)
     apply_dynamic_page_numbering(document)
+
+    actions = _source_video_actions(source_record or {})
     visuals = _visuals_by_action_id(source_record)
+    inserted_visuals = 0
+    visual_required = bool(source_record and source_record.get("is_video") and actions)
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -7180,6 +7217,8 @@ def create_docx(
                 _format_body_paragraph(paragraph)
 
         procedure_plan = _procedure_render_plan(section, source_record)
+        rendered_indices: set[int] = set()
+
         if procedure_plan:
             for group in procedure_plan:
                 group_index = int(group["group_index"])
@@ -7193,6 +7232,7 @@ def create_docx(
                     action = item["action"]
                     if global_index >= len(section.numbered_items):
                         continue
+                    rendered_indices.add(global_index)
                     number_label = f"{section.order}.{group_index}.{local_index}"
                     paragraph = add_safe_numbered(
                         document,
@@ -7204,9 +7244,26 @@ def create_docx(
                         if paragraph is not None:
                             paragraph.paragraph_format.keep_with_next = True
                         add_docx_visual(document, visual)
-        else:
-            for number, item in enumerate(section.numbered_items, start=1):
-                add_safe_numbered(document, item, f"{section.order}.{number}")
+                        inserted_visuals += 1
+
+        # Respaldo obligatorio: incluso si no fue posible construir grupos, o si
+        # quedaron pasos fuera del inventario alineado, se renderizan todos y se
+        # intenta asociar la captura por ID o por índice cronológico.
+        for step_index, step_text in enumerate(section.numbered_items):
+            if step_index in rendered_indices:
+                continue
+            paragraph = add_safe_numbered(
+                document,
+                step_text,
+                f"{section.order}.{step_index + 1}",
+            )
+            if step_index < len(actions):
+                visual = _visual_for_action(visuals, actions[step_index], step_index)
+                if visual:
+                    if paragraph is not None:
+                        paragraph.paragraph_format.keep_with_next = True
+                    add_docx_visual(document, visual)
+                    inserted_visuals += 1
 
         for bullet in section.bullets:
             add_safe_bullet(document, bullet)
@@ -7217,7 +7274,24 @@ def create_docx(
     _set_update_fields_on_open(document)
     output = BytesIO()
     document.save(output)
-    return output.getvalue()
+    docx_content = output.getvalue()
+
+    embedded_count = _count_docx_embedded_images(docx_content)
+    if visual_required:
+        if not visuals:
+            raise AppError(
+                "El origen es un video, pero no hay capturas disponibles para el "
+                "PASO A PASO. La generación se detuvo para evitar entregar un "
+                "instructivo sin evidencia visual."
+            )
+        if inserted_visuals <= 0 or embedded_count <= 0:
+            raise AppError(
+                "Se recuperaron capturas, pero ninguna quedó insertada en el Word. "
+                f"Capturas disponibles: {len(visuals)}; intentos de inserción: "
+                f"{inserted_visuals}; imágenes dentro del DOCX: {embedded_count}."
+            )
+
+    return docx_content
 
 def convert_docx_to_pdf(docx_content: bytes) -> bytes | None:
     """Convierte el DOCX a PDF con LibreOffice para conservar encabezado y pie."""
@@ -9426,12 +9500,26 @@ def main() -> None:
                     def visual_progress(message: str) -> None:
                         st.write(f"4/5 · {message}")
 
-                    _ensure_visuals_from_original_video(
+                    visuals_ready = _ensure_visuals_from_original_video(
                         source_record,
                         progress_callback=visual_progress,
                     )
+                    source_record["video_visuals"] = visuals_ready
+                    source_record["video_visual_count"] = len(visuals_ready)
                     st.session_state.source_record = source_record
 
+                    if source_record.get("is_video") and not visuals_ready:
+                        ffmpeg_path = shutil.which("ffmpeg") or "no encontrado"
+                        raise AppError(
+                            "No se obtuvo ninguna captura del video. La generación "
+                            "se detuvo para no entregar un instructivo sin imágenes. "
+                            f"FFmpeg: {ffmpeg_path}. Revisa packages.txt, el acceso "
+                            "al video de Drive y los mensajes del paso 4/5."
+                        )
+
+                    st.write(
+                        f"4/5 · {len(visuals_ready)} capturas listas para insertar"
+                    )
                     docx_output = create_docx(
                         edited_document,
                         style_guide=selected_guide,
