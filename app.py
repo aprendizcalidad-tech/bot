@@ -98,7 +98,7 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v3-forced-embedding"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v4-png-word-compatible"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
 VIDEO_VISUAL_MAX_CAPTURES = 90
@@ -3993,13 +3993,17 @@ def _load_local_video_visuals(
             if not filename or not image_path.exists():
                 continue
             content = image_path.read_bytes()
-            if not content.startswith(b"\xff\xd8"):
+            if content.startswith(b"\x89PNG\r\n\x1a\n"):
+                mime_type = "image/png"
+            elif content.startswith(b"\xff\xd8"):
+                mime_type = "image/jpeg"
+            else:
                 continue
             result.append(
                 {
                     **item,
                     "content": content,
-                    "mime_type": "image/jpeg",
+                    "mime_type": mime_type,
                     "fingerprint_matches": fingerprint_matches,
                 }
             )
@@ -4086,7 +4090,13 @@ def _extract_video_frame_jpeg(
     capture_second: float,
     output_path: Path,
 ) -> bool:
-    """Extrae un fotograma con búsqueda rápida y respaldo de búsqueda precisa."""
+    """Extrae un fotograma PNG compatible con Word.
+
+    El nombre de la función se conserva para no afectar llamadas existentes,
+    pero la salida se normaliza a PNG RGB. Los JPEG producidos directamente por
+    algunos códecs o compilaciones de FFmpeg pueden ser visibles en Streamlit y,
+    aun así, no ser reconocidos por python-docx.
+    """
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -4095,11 +4105,11 @@ def _extract_video_frame_jpeg(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     filters = (
         f"scale={VIDEO_VISUAL_WIDTH_PX}:-2:"
-        "force_original_aspect_ratio=decrease:flags=lanczos"
+        "force_original_aspect_ratio=decrease:flags=lanczos,"
+        "format=rgb24"
     )
 
     commands = [
-        # Búsqueda rápida. Es eficiente en videos largos.
         [
             ffmpeg,
             "-hide_banner",
@@ -4115,13 +4125,11 @@ def _extract_video_frame_jpeg(
             "1",
             "-vf",
             filters,
-            "-q:v",
+            "-compression_level",
             "3",
             "-y",
             str(output_path),
         ],
-        # Búsqueda precisa. Se usa cuando el contenedor o el códec no permite
-        # obtener correctamente el fotograma con la búsqueda rápida.
         [
             ffmpeg,
             "-hide_banner",
@@ -4137,7 +4145,7 @@ def _extract_video_frame_jpeg(
             "1",
             "-vf",
             filters,
-            "-q:v",
+            "-compression_level",
             "3",
             "-y",
             str(output_path),
@@ -4159,9 +4167,13 @@ def _extract_video_frame_jpeg(
                 result.returncode == 0
                 and output_path.exists()
                 and output_path.stat().st_size > 1000
-                and output_path.read_bytes()[:2] == b"\xff\xd8"
             ):
-                return True
+                content = output_path.read_bytes()
+                if (
+                    content.startswith(b"\x89PNG\r\n\x1a\n")
+                    and content.endswith(b"IEND\xaeB`\x82")
+                ):
+                    return True
         except Exception:
             continue
     return False
@@ -4253,7 +4265,7 @@ def _prepare_video_visual_evidence(
         action_id = action.action_id or f"ACC-{action_index + 1:04d}"
         filename = (
             f"{visual_id}_{safe_filename(action_id)}_"
-            f"{int(round(second)):06d}.jpg"
+            f"{int(round(second)):06d}.png"
         )
         jobs.append((action_index, action, second, visual_dir / filename, visual_id))
 
@@ -4288,7 +4300,7 @@ def _prepare_video_visual_evidence(
                         "timestamp_seconds": second,
                         "title": _build_step_title(action),
                         "filename": path.name,
-                        "mime_type": "image/jpeg",
+                        "mime_type": "image/png",
                         "content": path.read_bytes(),
                     }
                 )
@@ -6898,31 +6910,156 @@ def _docx_available_image_width_cm(document: Document) -> float:
         return 15.5
 
 
+def _image_error_detail(error: Exception) -> str:
+    """Devuelve un detalle útil incluso cuando la excepción no trae mensaje."""
+
+    name = type(error).__name__
+    message = str(error).strip()
+    return f"{name}: {message}" if message else name
+
+
+def _visual_bytes_to_png(content: bytes, filename: str = "") -> bytes:
+    """Convierte cualquier captura reconocible a PNG RGB válido para python-docx.
+
+    Primero valida directamente el archivo con el lector interno de python-docx.
+    Si el archivo no es reconocido, intenta normalizarlo con Pillow y, como
+    último respaldo, con FFmpeg.
+    """
+
+    raw = bytes(content or b"")
+    if not raw:
+        raise AppError("La captura está vacía.")
+
+    # Si ya es un PNG que python-docx reconoce, se conserva sin recodificar.
+    try:
+        from docx.image.image import Image as DocxImage
+
+        DocxImage.from_blob(raw)
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return raw
+    except Exception:
+        pass
+
+    pillow_error: Exception | None = None
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(raw)) as image:
+            image.load()
+            image = ImageOps.exif_transpose(image)
+
+            if image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            ):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+
+            if image.width <= 0 or image.height <= 0:
+                raise ValueError("La imagen no tiene dimensiones válidas.")
+
+            normalized = BytesIO()
+            image.save(
+                normalized,
+                format="PNG",
+                optimize=False,
+                compress_level=3,
+                dpi=(96, 96),
+            )
+            png = normalized.getvalue()
+
+        from docx.image.image import Image as DocxImage
+
+        DocxImage.from_blob(png)
+        return png
+    except Exception as error:
+        pillow_error = error
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                suffix = Path(filename).suffix.lower()
+                if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}:
+                    suffix = ".img"
+                input_path = temp_path / f"captura_origen{suffix}"
+                output_path = temp_path / "captura_normalizada.png"
+                input_path.write_bytes(raw)
+
+                result = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        str(input_path),
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "format=rgb24",
+                        "-compression_level",
+                        "3",
+                        "-y",
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    check=False,
+                )
+                if result.returncode == 0 and output_path.exists():
+                    png = output_path.read_bytes()
+                    from docx.image.image import Image as DocxImage
+
+                    DocxImage.from_blob(png)
+                    return png
+        except Exception:
+            pass
+
+    raise AppError(
+        "La captura no pudo normalizarse a un formato compatible con Word. "
+        f"Archivo: {filename or 'sin nombre'}. "
+        f"Detalle de validación: {_image_error_detail(pillow_error) if pillow_error else 'formato no reconocido'}."
+    )
+
+
 def add_docx_visual(document: Document, visual: dict) -> object:
-    """Inserta una captura y nunca oculta silenciosamente un error."""
+    """Inserta una captura normalizada y reporta el tipo real del error."""
 
     content = visual.get("content") if isinstance(visual, dict) else None
     if not isinstance(content, (bytes, bytearray)) or not content:
         raise AppError(
             "La captura relacionada con el paso no contiene bytes de imagen válidos."
         )
+
+    filename = str(visual.get("filename") or "sin nombre")
+    normalized_png = _visual_bytes_to_png(bytes(content), filename)
+
     try:
         paragraph = document.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.paragraph_format.space_before = Pt(2)
         paragraph.paragraph_format.space_after = Pt(8)
         paragraph.paragraph_format.keep_together = True
+
+        stream = BytesIO(normalized_png)
+        stream.seek(0)
         run = paragraph.add_run()
         run.add_picture(
-            BytesIO(bytes(content)),
+            stream,
             width=Cm(_docx_available_image_width_cm(document)),
         )
         return paragraph
     except Exception as error:
         raise AppError(
-            "La captura fue extraída, pero Word no pudo insertarla. "
-            f"Archivo: {visual.get('filename', 'sin nombre')}. "
-            f"Detalle: {str(error)[:300]}"
+            "La captura fue normalizada correctamente, pero Word no pudo insertarla. "
+            f"Archivo: {filename}. "
+            f"Detalle: {_image_error_detail(error)}"
         ) from error
 
 
@@ -6931,7 +7068,11 @@ def _reportlab_visual(visual: dict, available_width: float):
     if not isinstance(content, (bytes, bytearray)) or not content:
         return None
     try:
-        image = RLImage(BytesIO(bytes(content)))
+        png = _visual_bytes_to_png(
+            bytes(content),
+            str(visual.get("filename") or ""),
+        )
+        image = RLImage(BytesIO(png))
         if image.drawWidth > available_width:
             scale = available_width / image.drawWidth
             image.drawWidth *= scale
@@ -6940,7 +7081,6 @@ def _reportlab_visual(visual: dict, available_width: float):
         return image
     except Exception:
         return None
-
 
 def add_safe_heading(document: Document, text: str):
     """Agrega un título unido al primer elemento de su sección."""
