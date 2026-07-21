@@ -98,15 +98,22 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v4-png-word-compatible"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v5-every-step-smart-crop"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
-VIDEO_VISUAL_MAX_CAPTURES = 90
-VIDEO_VISUAL_MIN_GAP_SECONDS = 10
+VIDEO_VISUAL_MAX_CAPTURES = 600
+VIDEO_VISUAL_MIN_GAP_SECONDS = 0
 VIDEO_VISUAL_FORCE_GAP_SECONDS = 60
 VIDEO_VISUAL_CAPTURE_OFFSET_SECONDS = 1.10
-VIDEO_VISUAL_WIDTH_PX = 1440
+VIDEO_VISUAL_WIDTH_PX = 1280
 VIDEO_VISUAL_FFMPEG_WORKERS = 2
+# Una evidencia por cada acción/subpaso. El límite es de seguridad y nunca se
+# usa para muestrear silenciosamente: si se supera, la aplicación informa.
+VIDEO_VISUAL_REQUIRE_EVERY_STEP = True
+VIDEO_VISUAL_SMART_CROP_ENABLED = True
+VIDEO_VISUAL_MAX_SAFE_ACTIONS = 600
+VIDEO_VISUAL_CANDIDATE_RETRIES = 4
+VIDEO_VISUAL_EARLY_ACCEPT_SCORE = 52.0
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -3860,87 +3867,90 @@ def _visual_action_score(
     return score
 
 
+def _capture_second_for_action_index(
+    actions: list[VideoAction],
+    action_index: int,
+) -> float | None:
+    """Obtiene o interpola un tiempo para cada acción sin dejar subpasos sin imagen."""
+
+    if action_index < 0 or action_index >= len(actions):
+        return None
+
+    direct = _action_capture_second(actions[action_index])
+    if direct is not None:
+        return direct
+
+    previous_index: int | None = None
+    previous_second: float | None = None
+    for index in range(action_index - 1, -1, -1):
+        value = _action_capture_second(actions[index])
+        if value is not None:
+            previous_index = index
+            previous_second = value
+            break
+
+    next_index: int | None = None
+    next_second: float | None = None
+    for index in range(action_index + 1, len(actions)):
+        value = _action_capture_second(actions[index])
+        if value is not None:
+            next_index = index
+            next_second = value
+            break
+
+    if (
+        previous_index is not None
+        and previous_second is not None
+        and next_index is not None
+        and next_second is not None
+        and next_index > previous_index
+    ):
+        fraction = (action_index - previous_index) / (next_index - previous_index)
+        return previous_second + (next_second - previous_second) * fraction
+
+    if previous_second is not None and previous_index is not None:
+        return previous_second + min(8.0, 0.8 * (action_index - previous_index))
+
+    if next_second is not None and next_index is not None:
+        return max(0.0, next_second - min(8.0, 0.8 * (next_index - action_index)))
+
+    return None
+
+
 def _select_visual_actions(actions: list[VideoAction]) -> list[tuple[int, VideoAction]]:
-    """Selecciona capturas útiles, evitando una imagen repetitiva por microacción."""
+    """Selecciona TODAS las acciones para garantizar una captura por subpaso.
+
+    La versión anterior aplicaba puntajes, separación mínima y un máximo de
+    capturas. Esa lógica era útil para un resumen visual, pero no para un
+    instructivo en el que cada numeral y subnumeral exige evidencia propia.
+    """
 
     if not actions:
         return []
-    max_captures = _read_int_setting(
+
+    configured_limit = _read_int_setting(
         "VIDEO_VISUAL_MAX_CAPTURES",
         VIDEO_VISUAL_MAX_CAPTURES,
-        8,
-        140,
+        1,
+        1000,
     )
-    min_gap = float(
-        _read_int_setting(
-            "VIDEO_VISUAL_MIN_GAP_SECONDS",
-            VIDEO_VISUAL_MIN_GAP_SECONDS,
-            4,
-            90,
+    safe_limit = min(configured_limit, VIDEO_VISUAL_MAX_SAFE_ACTIONS)
+    if len(actions) > safe_limit:
+        raise AppError(
+            "El video contiene "
+            f"{len(actions)} acciones y el límite de seguridad visual es {safe_limit}. "
+            "Aumenta VIDEO_VISUAL_MAX_CAPTURES y VIDEO_VISUAL_MAX_SAFE_ACTIONS "
+            "solo si el servidor dispone de espacio suficiente. No se omitieron "
+            "capturas silenciosamente."
         )
-    )
-    groups = _build_visual_procedure_groups(actions)
-    group_starts = {
-        group["items"][0]["global_index"]
-        for group in groups
-        if group.get("items")
-    }
-    group_ends = {
-        group["items"][-1]["global_index"]
-        for group in groups
-        if group.get("items")
-    }
 
     selected: list[tuple[int, VideoAction]] = []
-    last_second: float | None = None
-    last_selected_index = -10
     for index, action in enumerate(actions):
-        second = _action_capture_second(action)
-        if second is None:
+        capture_second = _capture_second_for_action_index(actions, index)
+        if capture_second is None:
             continue
-        previous = actions[index - 1] if index > 0 else None
-        score = _visual_action_score(action, previous, index in group_starts)
-        gap = second - last_second if last_second is not None else 10**9
-        force = (
-            index in group_starts
-            or index in group_ends
-            or gap >= VIDEO_VISUAL_FORCE_GAP_SECONDS
-            or index - last_selected_index >= 7
-        )
-        if (score >= 4 and gap >= min_gap) or (force and gap >= min_gap / 2):
-            selected.append((index, action))
-            last_second = second
-            last_selected_index = index
-
-    # Garantiza al menos una evidencia por macroactividad cuando haya tiempo válido.
-    selected_indices = {index for index, _ in selected}
-    for group in groups:
-        if any(item["global_index"] in selected_indices for item in group["items"]):
-            continue
-        valid = [
-            (item["global_index"], item["action"])
-            for item in group["items"]
-            if _action_capture_second(item["action"]) is not None
-        ]
-        if valid:
-            selected.append(valid[len(valid) // 2])
-
-    selected = sorted(
-        {index: action for index, action in selected}.items(),
-        key=lambda item: item[0],
-    )
-    if len(selected) > max_captures:
-        # Muestreo uniforme que conserva el inicio y el cierre del proceso.
-        if max_captures <= 1:
-            selected = selected[:1]
-        else:
-            positions = {
-                round(i * (len(selected) - 1) / (max_captures - 1))
-                for i in range(max_captures)
-            }
-            selected = [selected[position] for position in sorted(positions)]
+        selected.append((index, action))
     return selected
-
 
 def _video_visual_action_fingerprint(actions: list[VideoAction]) -> str:
     payload = [
@@ -4090,65 +4100,32 @@ def _extract_video_frame_jpeg(
     capture_second: float,
     output_path: Path,
 ) -> bool:
-    """Extrae un fotograma PNG compatible con Word.
-
-    El nombre de la función se conserva para no afectar llamadas existentes,
-    pero la salida se normaliza a PNG RGB. Los JPEG producidos directamente por
-    algunos códecs o compilaciones de FFmpeg pueden ser visibles en Streamlit y,
-    aun así, no ser reconocidos por python-docx.
-    """
+    """Extrae un fotograma PNG RGB sin aplicar todavía el recorte visual."""
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return False
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_width = max(1440, VIDEO_VISUAL_WIDTH_PX)
     filters = (
-        f"scale={VIDEO_VISUAL_WIDTH_PX}:-2:"
+        f"scale={raw_width}:-2:"
         "force_original_aspect_ratio=decrease:flags=lanczos,"
         "format=rgb24"
     )
-
     commands = [
         [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            f"{max(0.0, capture_second):.3f}",
-            "-i",
-            str(local_path),
-            "-an",
-            "-sn",
-            "-frames:v",
-            "1",
-            "-vf",
-            filters,
-            "-compression_level",
-            "3",
-            "-y",
-            str(output_path),
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-ss", f"{max(0.0, capture_second):.3f}",
+            "-i", str(local_path), "-an", "-sn", "-frames:v", "1",
+            "-vf", filters, "-compression_level", "3", "-y", str(output_path),
         ],
         [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(local_path),
-            "-ss",
-            f"{max(0.0, capture_second):.3f}",
-            "-an",
-            "-sn",
-            "-frames:v",
-            "1",
-            "-vf",
-            filters,
-            "-compression_level",
-            "3",
-            "-y",
-            str(output_path),
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-i", str(local_path),
+            "-ss", f"{max(0.0, capture_second):.3f}",
+            "-an", "-sn", "-frames:v", "1", "-vf", filters,
+            "-compression_level", "3", "-y", str(output_path),
         ],
     ]
 
@@ -4178,13 +4155,360 @@ def _extract_video_frame_jpeg(
             continue
     return False
 
+
+def _close_short_false_gaps(mask: list[bool], max_gap: int) -> list[bool]:
+    result = list(mask)
+    index = 0
+    while index < len(result):
+        if result[index]:
+            index += 1
+            continue
+        start = index
+        while index < len(result) and not result[index]:
+            index += 1
+        end = index
+        if start > 0 and end < len(result) and end - start <= max_gap:
+            for gap_index in range(start, end):
+                result[gap_index] = True
+    return result
+
+
+def _largest_density_segment(
+    densities: list[float],
+    minimum_fraction: float,
+) -> tuple[int, int] | None:
+    if not densities:
+        return None
+    maximum = max(densities)
+    if maximum <= 0:
+        return None
+
+    threshold = max(0.055, min(0.34, maximum * 0.34))
+    mask = [value >= threshold for value in densities]
+    mask = _close_short_false_gaps(mask, max(2, round(len(mask) * 0.012)))
+
+    minimum_length = max(2, round(len(mask) * minimum_fraction))
+    best: tuple[float, int, int] | None = None
+    index = 0
+    while index < len(mask):
+        if not mask[index]:
+            index += 1
+            continue
+        start = index
+        while index < len(mask) and mask[index]:
+            index += 1
+        end = index
+        length = end - start
+        if length < minimum_length:
+            continue
+        mean_density = sum(densities[start:end]) / max(1, length)
+        score = length * (0.60 + mean_density)
+        if best is None or score > best[0]:
+            best = (score, start, end)
+    return (best[1], best[2]) if best else None
+
+
+def _detect_shared_screen_bbox(image) -> tuple[int, int, int, int]:
+    """Detecta el rectángulo grande de pantalla compartida dentro de una reunión.
+
+    Usa densidad de contenido y bordes para excluir zonas negras, mosaicos de
+    participantes y paneles laterales con avatares. No depende de una marca de
+    videollamada específica.
+    """
+
+    from PIL import ImageFilter, ImageOps
+
+    width, height = image.size
+    if width <= 10 or height <= 10:
+        return (0, 0, width, height)
+
+    probe = image.convert("RGB")
+    probe.thumbnail((420, 260))
+    small_width, small_height = probe.size
+    gray = ImageOps.grayscale(probe)
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    gray_pixels = list(gray.getdata())
+    edge_pixels = list(edges.getdata())
+
+    active: list[bool] = []
+    for luminance, edge_value in zip(gray_pixels, edge_pixels):
+        active.append(luminance >= 42 or edge_value >= 22)
+
+    column_density = []
+    for x in range(small_width):
+        count = sum(active[y * small_width + x] for y in range(small_height))
+        column_density.append(count / max(1, small_height))
+
+    x_segment = _largest_density_segment(column_density, 0.42)
+    if x_segment is None:
+        x_segment = (0, small_width)
+    x0_small, x1_small = x_segment
+
+    # Si el segmento todavía incluye un panel lateral oscuro, busca un corte que
+    # conserve la zona con mayor densidad de información.
+    segment_width = max(1, x1_small - x0_small)
+    if segment_width >= small_width * 0.82:
+        best_cut: tuple[float, int, str] | None = None
+        for cut in range(round(small_width * 0.55), round(small_width * 0.90)):
+            left = column_density[:cut]
+            right = column_density[cut:]
+            if not left or not right:
+                continue
+            left_mean = sum(left) / len(left)
+            right_mean = sum(right) / len(right)
+            if right_mean < left_mean * 0.52 and len(right) >= small_width * 0.10:
+                score = (left_mean - right_mean) * len(right)
+                if best_cut is None or score > best_cut[0]:
+                    best_cut = (score, cut, "right")
+        for cut in range(round(small_width * 0.10), round(small_width * 0.45)):
+            left = column_density[:cut]
+            right = column_density[cut:]
+            if not left or not right:
+                continue
+            left_mean = sum(left) / len(left)
+            right_mean = sum(right) / len(right)
+            if left_mean < right_mean * 0.52 and len(left) >= small_width * 0.10:
+                score = (right_mean - left_mean) * len(left)
+                if best_cut is None or score > best_cut[0]:
+                    best_cut = (score, cut, "left")
+        if best_cut:
+            _, cut, side = best_cut
+            if side == "right":
+                x0_small, x1_small = 0, cut
+            else:
+                x0_small, x1_small = cut, small_width
+
+    row_density = []
+    for y in range(small_height):
+        start = y * small_width + x0_small
+        end = y * small_width + x1_small
+        row_values = active[start:end]
+        row_density.append(sum(row_values) / max(1, len(row_values)))
+
+    y_segment = _largest_density_segment(row_density, 0.30)
+    if y_segment is None:
+        y_segment = (0, small_height)
+    y0_small, y1_small = y_segment
+
+    scale_x = width / max(1, small_width)
+    scale_y = height / max(1, small_height)
+    x0 = max(0, int(x0_small * scale_x))
+    x1 = min(width, int(x1_small * scale_x))
+    y0 = max(0, int(y0_small * scale_y))
+    y1 = min(height, int(y1_small * scale_y))
+
+    # Pequeño margen para no cortar bordes de ventanas, barras o pestañas.
+    margin_x = max(2, int((x1 - x0) * 0.012))
+    margin_y = max(2, int((y1 - y0) * 0.015))
+    x0 = max(0, x0 - margin_x)
+    y0 = max(0, y0 - margin_y)
+    x1 = min(width, x1 + margin_x)
+    y1 = min(height, y1 + margin_y)
+
+    crop_width = x1 - x0
+    crop_height = y1 - y0
+    if (
+        crop_width < width * 0.38
+        or crop_height < height * 0.28
+        or crop_width <= 20
+        or crop_height <= 20
+    ):
+        return (0, 0, width, height)
+    return (x0, y0, x1, y1)
+
+
+def _smart_crop_shared_screen_png(
+    input_path: Path,
+    output_path: Path,
+) -> dict:
+    """Recorta la interfaz de reunión y conserva la pantalla compartida."""
+
+    metadata = {
+        "crop_applied": False,
+        "crop_box": None,
+        "original_size": None,
+        "final_size": None,
+    }
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(input_path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+            metadata["original_size"] = [image.width, image.height]
+            bbox = (
+                _detect_shared_screen_bbox(image)
+                if VIDEO_VISUAL_SMART_CROP_ENABLED
+                else (0, 0, image.width, image.height)
+            )
+            cropped = image.crop(bbox)
+            metadata["crop_applied"] = bbox != (0, 0, image.width, image.height)
+            metadata["crop_box"] = list(bbox)
+
+            if cropped.width > VIDEO_VISUAL_WIDTH_PX:
+                new_height = max(1, round(cropped.height * VIDEO_VISUAL_WIDTH_PX / cropped.width))
+                cropped = cropped.resize(
+                    (VIDEO_VISUAL_WIDTH_PX, new_height),
+                    resample=Image.Resampling.LANCZOS,
+                )
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cropped.save(
+                output_path,
+                format="PNG",
+                optimize=True,
+                compress_level=6,
+                dpi=(96, 96),
+            )
+            metadata["final_size"] = [cropped.width, cropped.height]
+            return metadata
+    except Exception as error:
+        shutil.copyfile(input_path, output_path)
+        metadata["crop_error"] = _image_error_detail(error)
+        return metadata
+
+
+def _visual_frame_quality(
+    image_path: Path,
+    candidate_second: float,
+    preferred_second: float,
+    action: VideoAction,
+) -> float:
+    """Puntúa nitidez, contraste, contenido útil y cercanía temporal."""
+
+    try:
+        from PIL import Image, ImageFilter, ImageOps, ImageStat
+
+        with Image.open(image_path) as opened:
+            image = opened.convert("RGB")
+            image.thumbnail((520, 320))
+            gray = ImageOps.grayscale(image)
+            stat = ImageStat.Stat(gray)
+            contrast = float(stat.stddev[0])
+            edges = gray.filter(ImageFilter.FIND_EDGES)
+            edge_mean = float(ImageStat.Stat(edges).mean[0])
+            pixels = list(gray.getdata())
+            dark_ratio = sum(value < 24 for value in pixels) / max(1, len(pixels))
+            light_ratio = sum(value > 70 for value in pixels) / max(1, len(pixels))
+
+        score = contrast * 0.55 + edge_mean * 1.05
+        score += light_ratio * 28.0
+        score -= dark_ratio * 26.0
+        score -= abs(candidate_second - preferred_second) * 1.2
+
+        category = _action_category(action.action)
+        if category in {"click", "select", "open", "search", "register"}:
+            if candidate_second >= preferred_second - 0.2:
+                score += 3.5
+        elif category in {"save", "download", "attach", "validate"}:
+            if candidate_second >= preferred_second:
+                score += 2.5
+        return round(score, 3)
+    except Exception:
+        return max(1.0, 20.0 - abs(candidate_second - preferred_second))
+
+
+def _action_candidate_seconds(
+    actions: list[VideoAction],
+    action_index: int,
+    duration_seconds: float | None,
+) -> list[float]:
+    preferred = _capture_second_for_action_index(actions, action_index)
+    if preferred is None:
+        return []
+
+    action = actions[action_index]
+    category = _action_category(action.action)
+    start = _parse_video_timestamp_seconds(action.timestamp_start)
+    end = _parse_video_timestamp_seconds(action.timestamp_end)
+    anchor = preferred
+
+    if category in {"click", "select", "open", "search", "register"}:
+        candidates = [anchor, anchor + 0.8, anchor - 0.6, anchor + 1.7]
+    elif category in {"save", "download", "attach", "validate"}:
+        candidates = [end + 0.35 if end is not None else anchor, anchor, anchor + 1.2, anchor - 0.7]
+    else:
+        candidates = [anchor, anchor + 0.7, anchor - 0.7, anchor + 1.5]
+
+    if start is not None:
+        candidates.append(start + 0.35)
+    if end is not None and end > (start or -1):
+        candidates.append((start + end) / 2 if start is not None else end)
+
+    result: list[float] = []
+    seen: set[int] = set()
+    for value in candidates:
+        maximum = max(0.0, (duration_seconds or value + 1.0) - 0.08)
+        value = max(0.0, min(float(value), maximum))
+        key = int(round(value * 10))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+        if len(result) >= VIDEO_VISUAL_CANDIDATE_RETRIES:
+            break
+    return result
+
+
+def _extract_best_action_visual(
+    local_path: Path,
+    actions: list[VideoAction],
+    action_index: int,
+    final_path: Path,
+    duration_seconds: float | None,
+) -> dict | None:
+    """Extrae el mejor fotograma cercano y lo recorta a la pantalla compartida."""
+
+    action = actions[action_index]
+    candidates = _action_candidate_seconds(actions, action_index, duration_seconds)
+    if not candidates:
+        return None
+
+    preferred = _capture_second_for_action_index(actions, action_index) or candidates[0]
+    best: dict | None = None
+    with tempfile.TemporaryDirectory(prefix=f"visual_{action_index:04d}_") as temp_dir:
+        temp_root = Path(temp_dir)
+        for candidate_number, candidate_second in enumerate(candidates, start=1):
+            raw_path = temp_root / f"raw_{candidate_number}.png"
+            cropped_path = temp_root / f"crop_{candidate_number}.png"
+            if not _extract_video_frame_jpeg(local_path, candidate_second, raw_path):
+                continue
+            crop_metadata = _smart_crop_shared_screen_png(raw_path, cropped_path)
+            if not cropped_path.exists() or cropped_path.stat().st_size <= 1000:
+                continue
+            quality = _visual_frame_quality(
+                cropped_path,
+                candidate_second,
+                preferred,
+                action,
+            )
+            candidate = {
+                "path": cropped_path,
+                "timestamp_seconds": candidate_second,
+                "quality_score": quality,
+                **crop_metadata,
+            }
+            if best is None or quality > float(best["quality_score"]):
+                best = candidate
+            if candidate_number == 1 and quality >= VIDEO_VISUAL_EARLY_ACCEPT_SCORE:
+                break
+
+        if best is None:
+            return None
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(best["path"], final_path)
+        return {
+            key: value
+            for key, value in best.items()
+            if key != "path"
+        }
+
 def _prepare_video_visual_evidence(
     local_path: Path,
     actions: list[VideoAction],
     checkpoint_id: str,
     progress_callback=None,
 ) -> list[dict]:
-    """Extrae y conserva capturas reales del video asociadas a pasos concretos."""
+    """Genera una captura recortada y relacionada para cada acción/subpaso."""
 
     if not VIDEO_VISUAL_EVIDENCE_ENABLED:
         if progress_callback is not None:
@@ -4200,52 +4524,23 @@ def _prepare_video_visual_evidence(
         return []
 
     existing = _load_local_video_visuals(checkpoint_id, actions)
-    if existing:
+    if len(existing) == len(actions):
         if progress_callback is not None:
-            progress_callback(f"Evidencia visual recuperada: {len(existing)} captura(s).")
+            progress_callback(
+                f"Evidencia visual recuperada: {len(existing)} de {len(actions)} pasos."
+            )
         return existing
 
     if _restore_visual_bundle_from_drive(checkpoint_id):
         existing = _load_local_video_visuals(checkpoint_id, actions)
-        if existing:
+        if len(existing) == len(actions):
             if progress_callback is not None:
                 progress_callback(
-                    f"Evidencia visual recuperada desde Drive: {len(existing)} captura(s)."
+                    "Evidencia visual completa recuperada desde Drive: "
+                    f"{len(existing)} de {len(actions)} pasos."
                 )
             return existing
 
-    candidates = _select_visual_actions(actions)
-
-    # Respaldo: si la selección semántica no produjo candidatos, toma acciones
-    # distribuidas cronológicamente. Esto evita terminar con cero imágenes cuando
-    # los campos de sistema o elemento de interfaz vienen incompletos.
-    if not candidates:
-        valid_actions = [
-            (index, action)
-            for index, action in enumerate(actions)
-            if _action_capture_second(action) is not None
-        ]
-        if valid_actions:
-            target_count = min(
-                max(1, len(_build_visual_procedure_groups(actions))),
-                min(12, len(valid_actions)),
-            )
-            if target_count == 1:
-                candidates = [valid_actions[len(valid_actions) // 2]]
-            else:
-                positions = {
-                    round(i * (len(valid_actions) - 1) / (target_count - 1))
-                    for i in range(target_count)
-                }
-                candidates = [valid_actions[position] for position in sorted(positions)]
-
-    if not candidates:
-        if progress_callback is not None:
-            progress_callback(
-                "No fue posible obtener tiempos válidos para extraer capturas. "
-                "Se conservará el texto, pero el instructivo no tendrá imágenes."
-            )
-        return []
     if not shutil.which("ffmpeg"):
         if progress_callback is not None:
             progress_callback(
@@ -4253,44 +4548,51 @@ def _prepare_video_visual_evidence(
             )
         return []
 
+    candidates = _select_visual_actions(actions)
+    if len(candidates) != len(actions):
+        missing = len(actions) - len(candidates)
+        raise AppError(
+            f"No fue posible asignar tiempo visual a {missing} de {len(actions)} acciones. "
+            "La generación se detuvo para no dejar subpasos sin imagen."
+        )
+
     visual_dir = _video_visual_dir(checkpoint_id)
+    if visual_dir.exists():
+        shutil.rmtree(visual_dir, ignore_errors=True)
     visual_dir.mkdir(parents=True, exist_ok=True)
 
-    jobs: list[tuple[int, VideoAction, float, Path, str]] = []
+    duration_seconds = _probe_local_video_duration_seconds(local_path)
+    jobs: list[tuple[int, VideoAction, Path, str]] = []
     for visual_index, (action_index, action) in enumerate(candidates, start=1):
-        second = _action_capture_second(action)
-        if second is None:
-            continue
         visual_id = f"VIS-{visual_index:04d}"
         action_id = action.action_id or f"ACC-{action_index + 1:04d}"
-        filename = (
-            f"{visual_id}_{safe_filename(action_id)}_"
-            f"{int(round(second)):06d}.png"
-        )
-        jobs.append((action_index, action, second, visual_dir / filename, visual_id))
+        filename = f"{visual_id}_{safe_filename(action_id)}.png"
+        jobs.append((action_index, action, visual_dir / filename, visual_id))
 
     extracted: list[dict] = []
     workers = min(VIDEO_VISUAL_FFMPEG_WORKERS, max(1, len(jobs)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
-            executor.submit(_extract_video_frame_jpeg, local_path, second, path): (
+            executor.submit(
+                _extract_best_action_visual,
+                local_path,
+                actions,
                 action_index,
-                action,
-                second,
                 path,
-                visual_id,
-            )
-            for action_index, action, second, path, visual_id in jobs
+                duration_seconds,
+            ): (action_index, action, path, visual_id)
+            for action_index, action, path, visual_id in jobs
         }
         completed = 0
         for future in as_completed(future_map):
-            action_index, action, second, path, visual_id = future_map[future]
+            action_index, action, path, visual_id = future_map[future]
             completed += 1
             try:
-                success = bool(future.result())
+                metadata = future.result()
             except Exception:
-                success = False
-            if success:
+                metadata = None
+            if metadata and path.exists():
+                second = float(metadata.get("timestamp_seconds") or 0.0)
                 extracted.append(
                     {
                         "visual_id": visual_id,
@@ -4302,16 +4604,62 @@ def _prepare_video_visual_evidence(
                         "filename": path.name,
                         "mime_type": "image/png",
                         "content": path.read_bytes(),
+                        "match_strategy": "timestamp_window_and_visual_quality",
+                        **metadata,
                     }
                 )
             if progress_callback is not None and (
                 completed == len(jobs) or completed % 8 == 0
             ):
                 progress_callback(
-                    f"Extrayendo evidencia visual: {completed} de {len(jobs)} captura(s)."
+                    "Analizando, recortando y relacionando capturas: "
+                    f"{completed} de {len(jobs)} pasos."
                 )
 
     extracted.sort(key=lambda item: int(item.get("action_index") or 0))
+    extracted_by_index = {
+        int(item["action_index"]): item
+        for item in extracted
+        if isinstance(item.get("action_index"), int)
+    }
+
+    # Reintento conservador: cuando FFmpeg falla en una acción aislada, reutiliza
+    # la evidencia cronológicamente más cercana. Se identifica en el manifiesto
+    # para que la trazabilidad no quede oculta.
+    missing_indices = [index for index in range(len(actions)) if index not in extracted_by_index]
+    if missing_indices and extracted:
+        available_indices = sorted(extracted_by_index)
+        for missing_index in missing_indices:
+            nearest_index = min(available_indices, key=lambda value: abs(value - missing_index))
+            source_visual = extracted_by_index[nearest_index]
+            action = actions[missing_index]
+            visual_id = f"VIS-{missing_index + 1:04d}"
+            action_id = action.action_id or f"ACC-{missing_index + 1:04d}"
+            filename = f"{visual_id}_{safe_filename(action_id)}_fallback.png"
+            target_path = visual_dir / filename
+            target_path.write_bytes(bytes(source_visual["content"]))
+            fallback = {
+                **source_visual,
+                "visual_id": visual_id,
+                "action_id": action_id,
+                "action_index": missing_index,
+                "title": _build_step_title(action),
+                "filename": filename,
+                "content": target_path.read_bytes(),
+                "match_strategy": "nearest_chronological_fallback",
+                "fallback_from_action_index": nearest_index,
+            }
+            extracted.append(fallback)
+            extracted_by_index[missing_index] = fallback
+
+    extracted.sort(key=lambda item: int(item.get("action_index") or 0))
+    if VIDEO_VISUAL_REQUIRE_EVERY_STEP and len(extracted) != len(actions):
+        raise AppError(
+            "Cobertura visual incompleta: se detectaron "
+            f"{len(actions)} acciones y solo se obtuvieron {len(extracted)} capturas. "
+            "No se generará el instructivo hasta garantizar una imagen por paso."
+        )
+
     manifest_visuals = [
         {key: value for key, value in item.items() if key != "content"}
         for item in extracted
@@ -4322,23 +4670,24 @@ def _prepare_video_visual_evidence(
             "version": VIDEO_VISUAL_CHECKPOINT_VERSION,
             "action_fingerprint": _video_visual_action_fingerprint(actions),
             "action_count": len(actions),
+            "visual_count": len(extracted),
+            "coverage_percent": round(len(extracted) * 100 / max(1, len(actions)), 2),
             "visuals": manifest_visuals,
         },
     )
     _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
 
     if progress_callback is not None:
-        if extracted:
-            progress_callback(
-                f"Evidencia visual lista: {len(extracted)} captura(s) válidas."
-            )
-        else:
-            progress_callback(
-                "FFmpeg no logró extraer ninguna captura válida del video. "
-                "El detalle queda registrado para volver a intentarlo."
-            )
+        fallback_count = sum(
+            item.get("match_strategy") == "nearest_chronological_fallback"
+            for item in extracted
+        )
+        progress_callback(
+            "Evidencia visual completa: "
+            f"{len(extracted)} de {len(actions)} pasos con captura; "
+            f"{fallback_count} respaldo(s) cronológico(s)."
+        )
     return extracted
-
 
 def _interval_is_covered(
     start_seconds: float,
@@ -6794,15 +7143,17 @@ def _recover_source_record_visuals(
     return recovered
 
 
-def _visuals_by_action_id(source_record: dict | None) -> dict[str, dict]:
-    """Indexa capturas por action_id y por posición cronológica."""
+def _visuals_by_action_id(source_record: dict | None) -> dict[str, object]:
+    """Indexa capturas por ID, índice y lista cronológica completa."""
 
-    result: dict[str, dict] = {}
+    result: dict[str, object] = {}
+    ordered: list[dict] = []
     for item in _recover_source_record_visuals(source_record):
         action_id = _clean_action_value(item.get("action_id"))
         content = item.get("content")
         if not isinstance(content, (bytes, bytearray)) or not content:
             continue
+        ordered.append(item)
         if action_id:
             result[action_id] = item
         try:
@@ -6810,21 +7161,37 @@ def _visuals_by_action_id(source_record: dict | None) -> dict[str, dict]:
             result[f"__index__:{action_index}"] = item
         except (TypeError, ValueError):
             pass
+    ordered.sort(key=lambda item: int(item.get("action_index") or 0))
+    result["__all__"] = ordered
     return result
 
 
 def _visual_for_action(
-    visual_map: dict[str, dict],
+    visual_map: dict[str, object],
     action: VideoAction,
     action_index: int,
 ) -> dict | None:
-    """Relaciona la captura incluso si se corrigió el texto o cambió el ID."""
+    """Relaciona cada paso con su captura exacta y aplica respaldo cronológico."""
 
     by_id = visual_map.get(_clean_action_value(action.action_id))
-    if by_id:
+    if isinstance(by_id, dict):
         return by_id
-    return visual_map.get(f"__index__:{int(action_index)}")
 
+    by_index = visual_map.get(f"__index__:{int(action_index)}")
+    if isinstance(by_index, dict):
+        return by_index
+
+    ordered = visual_map.get("__all__")
+    if isinstance(ordered, list) and ordered:
+        valid = [item for item in ordered if isinstance(item, dict)]
+        if valid:
+            return min(
+                valid,
+                key=lambda item: abs(
+                    int(item.get("action_index") or 0) - int(action_index)
+                ),
+            )
+    return None
 
 def _ensure_visuals_from_original_video(
     source_record: dict,
@@ -7324,6 +7691,8 @@ def create_docx(
     actions = _source_video_actions(source_record or {})
     visuals = _visuals_by_action_id(source_record)
     inserted_visuals = 0
+    expected_visual_steps = 0
+    missing_visual_steps: list[str] = []
     visual_required = bool(source_record and source_record.get("is_video") and actions)
 
     title = document.add_paragraph()
@@ -7379,12 +7748,15 @@ def create_docx(
                         section.numbered_items[global_index],
                         number_label,
                     )
+                    expected_visual_steps += 1
                     visual = _visual_for_action(visuals, action, global_index)
                     if visual:
                         if paragraph is not None:
                             paragraph.paragraph_format.keep_with_next = True
                         add_docx_visual(document, visual)
                         inserted_visuals += 1
+                    else:
+                        missing_visual_steps.append(number_label)
 
         # Respaldo obligatorio: incluso si no fue posible construir grupos, o si
         # quedaron pasos fuera del inventario alineado, se renderizan todos y se
@@ -7397,13 +7769,19 @@ def create_docx(
                 step_text,
                 f"{section.order}.{step_index + 1}",
             )
-            if step_index < len(actions):
-                visual = _visual_for_action(visuals, actions[step_index], step_index)
+            if _section_is_visual_procedure(section, source_record):
+                expected_visual_steps += 1
+                if step_index < len(actions):
+                    visual = _visual_for_action(visuals, actions[step_index], step_index)
+                else:
+                    visual = None
                 if visual:
                     if paragraph is not None:
                         paragraph.paragraph_format.keep_with_next = True
                     add_docx_visual(document, visual)
                     inserted_visuals += 1
+                else:
+                    missing_visual_steps.append(f"{section.order}.{step_index + 1}")
 
         for bullet in section.bullets:
             add_safe_bullet(document, bullet)
@@ -7429,6 +7807,15 @@ def create_docx(
                 "Se recuperaron capturas, pero ninguna quedó insertada en el Word. "
                 f"Capturas disponibles: {len(visuals)}; intentos de inserción: "
                 f"{inserted_visuals}; imágenes dentro del DOCX: {embedded_count}."
+            )
+        if VIDEO_VISUAL_REQUIRE_EVERY_STEP and (
+            missing_visual_steps or inserted_visuals < expected_visual_steps
+        ):
+            detail = ", ".join(missing_visual_steps[:12]) or "conteo incompleto"
+            raise AppError(
+                "Cobertura visual incompleta en el Word: se esperaban "
+                f"{expected_visual_steps} imágenes y se insertaron {inserted_visuals}. "
+                f"Pasos pendientes: {detail}."
             )
 
     return docx_content
@@ -7510,6 +7897,7 @@ def create_pdf(
 
     final_document = normalize_final_document_structure(final_document)
     visuals = _visuals_by_action_id(source_record)
+    actions = _source_video_actions(source_record or {})
     output = BytesIO()
     styles = getSampleStyleSheet()
 
@@ -7674,7 +8062,25 @@ def create_pdf(
                         )
                     else:
                         step_html = f"<b>{number_label}.</b> {escape(step_body)}"
-                    section_story.append(Paragraph(step_html, numbered_style))
+                    step_flowable = Paragraph(step_html, numbered_style)
+                    visual_flowable = None
+                    action_index = index - 1
+                    if (
+                        _section_is_visual_procedure(section, source_record)
+                        and action_index < len(actions)
+                    ):
+                        visual_flowable = _reportlab_visual(
+                            (_visual_for_action(visuals, actions[action_index], action_index) or {}),
+                            available_width,
+                        )
+                    if visual_flowable is not None:
+                        section_story.append(
+                            KeepTogether(
+                                [step_flowable, Spacer(1, 4), visual_flowable, Spacer(1, 7)]
+                            )
+                        )
+                    else:
+                        section_story.append(step_flowable)
 
         for bullet in section.bullets:
             if bullet.strip():
