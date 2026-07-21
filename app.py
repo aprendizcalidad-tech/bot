@@ -98,7 +98,7 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v5-every-step-smart-crop"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v6-unique-step-match"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
 VIDEO_VISUAL_MAX_CAPTURES = 600
@@ -112,8 +112,13 @@ VIDEO_VISUAL_FFMPEG_WORKERS = 2
 VIDEO_VISUAL_REQUIRE_EVERY_STEP = True
 VIDEO_VISUAL_SMART_CROP_ENABLED = True
 VIDEO_VISUAL_MAX_SAFE_ACTIONS = 600
-VIDEO_VISUAL_CANDIDATE_RETRIES = 4
+VIDEO_VISUAL_CANDIDATE_RETRIES = 6
 VIDEO_VISUAL_EARLY_ACCEPT_SCORE = 52.0
+VIDEO_VISUAL_HASH_SIZE = 16
+VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE = 10
+VIDEO_VISUAL_REPAIR_DUPLICATES = True
+VIDEO_VISUAL_STRICT_EXACT_MATCH = True
+VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS = 2.2
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -1968,6 +1973,34 @@ def _video_action_from_mapping(payload: dict) -> VideoAction | None:
         return None
 
 
+def _action_duplicate_fingerprint(action: VideoAction) -> str:
+    return "|".join(
+        [
+            _normalized_action_key(action.action),
+            _normalized_action_key(action.system),
+            _normalized_action_key(action.location_path),
+            _normalized_action_key(action.interface_element),
+            _normalized_action_key(action.data_handled),
+            _normalized_action_key(action.validation),
+            _normalized_action_key(action.result),
+        ]
+    )
+
+
+def _likely_duplicate_action(previous: VideoAction, current: VideoAction) -> bool:
+    previous_fp = _action_duplicate_fingerprint(previous)
+    current_fp = _action_duplicate_fingerprint(current)
+    if not previous_fp or not current_fp or previous_fp != current_fp:
+        return False
+
+    prev_start = _parse_video_timestamp_seconds(previous.timestamp_start)
+    curr_start = _parse_video_timestamp_seconds(current.timestamp_start)
+    if prev_start is None or curr_start is None:
+        return _normalized_action_key(previous.timestamp_start) == _normalized_action_key(current.timestamp_start)
+
+    return abs(curr_start - prev_start) <= VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS
+
+
 def _source_video_actions(source: dict) -> list[VideoAction]:
     raw_actions = source.get("video_actions") or []
     if not raw_actions:
@@ -1991,18 +2024,21 @@ def _source_video_actions(source: dict) -> list[VideoAction]:
 
     normalized: list[VideoAction] = []
     seen: set[str] = set()
-    for index, action in enumerate(actions, start=1):
+    previous_kept: VideoAction | None = None
+    for action in actions:
         key = re.sub(
             r"[^a-záéíóúñ0-9]+",
             " ",
-            f"{action.timestamp_start} {action.action} {action.interface_element}".lower(),
+            f"{action.timestamp_start} {action.action} {action.interface_element} {action.system}".lower(),
         ).strip()
         if not key or key in seen:
             continue
+        if previous_kept is not None and _likely_duplicate_action(previous_kept, action):
+            continue
         seen.add(key)
-        normalized.append(
-            action.model_copy(update={"action_id": f"ACC-{len(normalized)+1:04d}"})
-        )
+        prepared = action.model_copy(update={"action_id": f"ACC-{len(normalized)+1:04d}"})
+        normalized.append(prepared)
+        previous_kept = prepared
     return normalized
 
 
@@ -4449,25 +4485,81 @@ def _action_candidate_seconds(
     return result
 
 
+def _visual_hash_from_path(image_path: Path) -> str:
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(image_path) as opened:
+            image = ImageOps.grayscale(opened.convert("RGB")).resize(
+                (VIDEO_VISUAL_HASH_SIZE, VIDEO_VISUAL_HASH_SIZE),
+                resample=Image.Resampling.LANCZOS,
+            )
+            pixels = list(image.getdata())
+        average = sum(pixels) / max(1, len(pixels))
+        bits = ["1" if value >= average else "0" for value in pixels]
+        return "".join(bits)
+    except Exception:
+        return ""
+
+
+def _hash_distance(hash_a: str, hash_b: str) -> int:
+    if not hash_a or not hash_b or len(hash_a) != len(hash_b):
+        return 9999
+    return sum(ch1 != ch2 for ch1, ch2 in zip(hash_a, hash_b))
+
+
+def _actions_are_visually_equivalent(action_a: VideoAction, action_b: VideoAction) -> bool:
+    return (
+        _normalized_action_key(action_a.action) == _normalized_action_key(action_b.action)
+        and _normalized_action_key(action_a.system) == _normalized_action_key(action_b.system)
+        and _normalized_action_key(action_a.location_path) == _normalized_action_key(action_b.location_path)
+        and _normalized_action_key(action_a.interface_element) == _normalized_action_key(action_b.interface_element)
+        and _normalized_action_key(action_a.data_handled) == _normalized_action_key(action_b.data_handled)
+    )
+
+
+def _expand_candidate_seconds(base: list[float], duration_seconds: float | None) -> list[float]:
+    extras = [0.0, 0.9, -0.9, 1.8, -1.8, 3.0, -3.0, 5.0, -5.0]
+    result: list[float] = []
+    seen: set[int] = set()
+    for base_value in base:
+        for extra in extras:
+            value = base_value + extra
+            maximum = max(0.0, (duration_seconds or value + 1.0) - 0.08)
+            value = max(0.0, min(float(value), maximum))
+            key = int(round(value * 10))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(value)
+    return result[: max(VIDEO_VISUAL_CANDIDATE_RETRIES + 4, 10)]
+
 def _extract_best_action_visual(
     local_path: Path,
     actions: list[VideoAction],
     action_index: int,
     final_path: Path,
     duration_seconds: float | None,
+    blocked_hashes: list[str] | None = None,
+    blocked_seconds: list[float] | None = None,
 ) -> dict | None:
-    """Extrae el mejor fotograma cercano y lo recorta a la pantalla compartida."""
+    """Extrae el mejor fotograma cercano y evita repeticiones evidentes."""
 
     action = actions[action_index]
-    candidates = _action_candidate_seconds(actions, action_index, duration_seconds)
-    if not candidates:
+    base_candidates = _action_candidate_seconds(actions, action_index, duration_seconds)
+    if not base_candidates:
         return None
 
+    candidates = _expand_candidate_seconds(base_candidates, duration_seconds)
     preferred = _capture_second_for_action_index(actions, action_index) or candidates[0]
+    blocked_hashes = [value for value in (blocked_hashes or []) if value]
+    blocked_seconds = [float(value) for value in (blocked_seconds or [])]
     best: dict | None = None
+    distinct_best: dict | None = None
     with tempfile.TemporaryDirectory(prefix=f"visual_{action_index:04d}_") as temp_dir:
         temp_root = Path(temp_dir)
         for candidate_number, candidate_second in enumerate(candidates, start=1):
+            if any(abs(candidate_second - value) < 0.20 for value in blocked_seconds):
+                continue
             raw_path = temp_root / f"raw_{candidate_number}.png"
             cropped_path = temp_root / f"crop_{candidate_number}.png"
             if not _extract_video_frame_jpeg(local_path, candidate_second, raw_path):
@@ -4475,6 +4567,8 @@ def _extract_best_action_visual(
             crop_metadata = _smart_crop_shared_screen_png(raw_path, cropped_path)
             if not cropped_path.exists() or cropped_path.stat().st_size <= 1000:
                 continue
+            image_hash = _visual_hash_from_path(cropped_path)
+            hash_distance = min((_hash_distance(image_hash, value) for value in blocked_hashes), default=9999)
             quality = _visual_frame_quality(
                 cropped_path,
                 candidate_second,
@@ -4485,20 +4579,28 @@ def _extract_best_action_visual(
                 "path": cropped_path,
                 "timestamp_seconds": candidate_second,
                 "quality_score": quality,
+                "image_hash": image_hash,
+                "duplicate_distance": hash_distance,
                 **crop_metadata,
             }
             if best is None or quality > float(best["quality_score"]):
                 best = candidate
-            if candidate_number == 1 and quality >= VIDEO_VISUAL_EARLY_ACCEPT_SCORE:
-                break
+            if hash_distance > VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE:
+                adjusted_quality = quality + 2.0
+                candidate["quality_score"] = adjusted_quality
+                if distinct_best is None or adjusted_quality > float(distinct_best["quality_score"]):
+                    distinct_best = candidate
+                if candidate_number == 1 and adjusted_quality >= VIDEO_VISUAL_EARLY_ACCEPT_SCORE:
+                    break
 
-        if best is None:
+        chosen = distinct_best or best
+        if chosen is None:
             return None
         final_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(best["path"], final_path)
+        shutil.copyfile(chosen["path"], final_path)
         return {
             key: value
-            for key, value in best.items()
+            for key, value in chosen.items()
             if key != "path"
         }
 
@@ -4562,59 +4664,49 @@ def _prepare_video_visual_evidence(
     visual_dir.mkdir(parents=True, exist_ok=True)
 
     duration_seconds = _probe_local_video_duration_seconds(local_path)
-    jobs: list[tuple[int, VideoAction, Path, str]] = []
+    extracted: list[dict] = []
+    recent_hashes: list[str] = []
+    recent_seconds: list[float] = []
+
     for visual_index, (action_index, action) in enumerate(candidates, start=1):
         visual_id = f"VIS-{visual_index:04d}"
         action_id = action.action_id or f"ACC-{action_index + 1:04d}"
         filename = f"{visual_id}_{safe_filename(action_id)}.png"
-        jobs.append((action_index, action, visual_dir / filename, visual_id))
-
-    extracted: list[dict] = []
-    workers = min(VIDEO_VISUAL_FFMPEG_WORKERS, max(1, len(jobs)))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {
-            executor.submit(
-                _extract_best_action_visual,
-                local_path,
-                actions,
-                action_index,
-                path,
-                duration_seconds,
-            ): (action_index, action, path, visual_id)
-            for action_index, action, path, visual_id in jobs
-        }
-        completed = 0
-        for future in as_completed(future_map):
-            action_index, action, path, visual_id = future_map[future]
-            completed += 1
-            try:
-                metadata = future.result()
-            except Exception:
-                metadata = None
-            if metadata and path.exists():
-                second = float(metadata.get("timestamp_seconds") or 0.0)
-                extracted.append(
-                    {
-                        "visual_id": visual_id,
-                        "action_id": action.action_id or f"ACC-{action_index + 1:04d}",
-                        "action_index": action_index,
-                        "timestamp": _video_clock(second),
-                        "timestamp_seconds": second,
-                        "title": _build_step_title(action),
-                        "filename": path.name,
-                        "mime_type": "image/png",
-                        "content": path.read_bytes(),
-                        "match_strategy": "timestamp_window_and_visual_quality",
-                        **metadata,
-                    }
-                )
-            if progress_callback is not None and (
-                completed == len(jobs) or completed % 8 == 0
-            ):
-                progress_callback(
-                    "Analizando, recortando y relacionando capturas: "
-                    f"{completed} de {len(jobs)} pasos."
-                )
+        path = visual_dir / filename
+        metadata = _extract_best_action_visual(
+            local_path,
+            actions,
+            action_index,
+            path,
+            duration_seconds,
+            blocked_hashes=recent_hashes[-2:],
+            blocked_seconds=recent_seconds[-2:],
+        )
+        if metadata and path.exists():
+            second = float(metadata.get("timestamp_seconds") or 0.0)
+            item = {
+                "visual_id": visual_id,
+                "action_id": action_id,
+                "action_index": action_index,
+                "timestamp": _video_clock(second),
+                "timestamp_seconds": second,
+                "title": _build_step_title(action),
+                "filename": path.name,
+                "mime_type": "image/png",
+                "content": path.read_bytes(),
+                "match_strategy": "timestamp_window_visual_quality_unique",
+                **metadata,
+            }
+            extracted.append(item)
+            recent_hashes.append(str(metadata.get("image_hash") or ""))
+            recent_seconds.append(second)
+        if progress_callback is not None and (
+            visual_index == len(candidates) or visual_index % 8 == 0
+        ):
+            progress_callback(
+                "Analizando, recortando y relacionando capturas: "
+                f"{visual_index} de {len(candidates)} pasos."
+            )
 
     extracted.sort(key=lambda item: int(item.get("action_index") or 0))
     extracted_by_index = {
@@ -4623,41 +4715,114 @@ def _prepare_video_visual_evidence(
         if isinstance(item.get("action_index"), int)
     }
 
-    # Reintento conservador: cuando FFmpeg falla en una acción aislada, reutiliza
-    # la evidencia cronológicamente más cercana. Se identifica en el manifiesto
-    # para que la trazabilidad no quede oculta.
-    missing_indices = [index for index in range(len(actions)) if index not in extracted_by_index]
-    if missing_indices and extracted:
-        available_indices = sorted(extracted_by_index)
-        for missing_index in missing_indices:
-            nearest_index = min(available_indices, key=lambda value: abs(value - missing_index))
-            source_visual = extracted_by_index[nearest_index]
-            action = actions[missing_index]
-            visual_id = f"VIS-{missing_index + 1:04d}"
-            action_id = action.action_id or f"ACC-{missing_index + 1:04d}"
-            filename = f"{visual_id}_{safe_filename(action_id)}_fallback.png"
-            target_path = visual_dir / filename
-            target_path.write_bytes(bytes(source_visual["content"]))
-            fallback = {
-                **source_visual,
-                "visual_id": visual_id,
-                "action_id": action_id,
-                "action_index": missing_index,
-                "title": _build_step_title(action),
-                "filename": filename,
-                "content": target_path.read_bytes(),
-                "match_strategy": "nearest_chronological_fallback",
-                "fallback_from_action_index": nearest_index,
-            }
-            extracted.append(fallback)
-            extracted_by_index[missing_index] = fallback
+    def repair_action(index_to_repair: int, blocked_items: list[dict]) -> dict | None:
+        action = actions[index_to_repair]
+        visual_id = f"VIS-{index_to_repair + 1:04d}"
+        action_id = action.action_id or f"ACC-{index_to_repair + 1:04d}"
+        filename = f"{visual_id}_{safe_filename(action_id)}.png"
+        path = visual_dir / filename
+        blocked_hashes = [str(item.get("image_hash") or "") for item in blocked_items if item]
+        blocked_seconds = [float(item.get("timestamp_seconds") or 0.0) for item in blocked_items if item]
+        metadata = _extract_best_action_visual(
+            local_path,
+            actions,
+            index_to_repair,
+            path,
+            duration_seconds,
+            blocked_hashes=blocked_hashes,
+            blocked_seconds=blocked_seconds,
+        )
+        if not metadata or not path.exists():
+            return None
+        second = float(metadata.get("timestamp_seconds") or 0.0)
+        return {
+            "visual_id": visual_id,
+            "action_id": action_id,
+            "action_index": index_to_repair,
+            "timestamp": _video_clock(second),
+            "timestamp_seconds": second,
+            "title": _build_step_title(action),
+            "filename": path.name,
+            "mime_type": "image/png",
+            "content": path.read_bytes(),
+            "match_strategy": "repair_unique_visual_match",
+            **metadata,
+        }
 
-    extracted.sort(key=lambda item: int(item.get("action_index") or 0))
+    missing_indices = [index for index in range(len(actions)) if index not in extracted_by_index]
+    for missing_index in missing_indices:
+        neighbors = [
+            extracted_by_index.get(missing_index - 2),
+            extracted_by_index.get(missing_index - 1),
+            extracted_by_index.get(missing_index + 1),
+            extracted_by_index.get(missing_index + 2),
+        ]
+        repaired = repair_action(missing_index, [item for item in neighbors if isinstance(item, dict)])
+        if repaired:
+            extracted_by_index[missing_index] = repaired
+
+    if VIDEO_VISUAL_REPAIR_DUPLICATES:
+        signatures: dict[int, str] = {}
+        for idx in sorted(extracted_by_index):
+            item = extracted_by_index[idx]
+            signatures[idx] = str(item.get("image_hash") or _visual_hash_from_path(visual_dir / str(item.get("filename"))))
+            item["image_hash"] = signatures[idx]
+
+        duplicate_indices: list[int] = []
+        ordered_indices = sorted(extracted_by_index)
+        for position, idx in enumerate(ordered_indices):
+            if position == 0:
+                continue
+            current = extracted_by_index[idx]
+            previous_idx = ordered_indices[position - 1]
+            previous = extracted_by_index[previous_idx]
+            distance = _hash_distance(signatures.get(idx, ""), signatures.get(previous_idx, ""))
+            if distance <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE:
+                if not _actions_are_visually_equivalent(actions[idx], actions[previous_idx]):
+                    duplicate_indices.append(idx)
+
+        for duplicate_index in duplicate_indices:
+            blocked = []
+            for neighbor in (duplicate_index - 2, duplicate_index - 1, duplicate_index + 1, duplicate_index + 2):
+                item = extracted_by_index.get(neighbor)
+                if isinstance(item, dict):
+                    blocked.append(item)
+            repaired = repair_action(duplicate_index, blocked)
+            if repaired:
+                extracted_by_index[duplicate_index] = repaired
+
+    extracted = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+
     if VIDEO_VISUAL_REQUIRE_EVERY_STEP and len(extracted) != len(actions):
         raise AppError(
             "Cobertura visual incompleta: se detectaron "
             f"{len(actions)} acciones y solo se obtuvieron {len(extracted)} capturas. "
             "No se generará el instructivo hasta garantizar una imagen por paso."
+        )
+
+    residual_duplicates: list[str] = []
+    previous_item: dict | None = None
+    previous_action: VideoAction | None = None
+    for item in extracted:
+        idx = int(item.get("action_index") or 0)
+        action = actions[idx]
+        if previous_item is not None and previous_action is not None:
+            distance = _hash_distance(
+                str(item.get("image_hash") or ""),
+                str(previous_item.get("image_hash") or ""),
+            )
+            if distance <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE and not _actions_are_visually_equivalent(action, previous_action):
+                residual_duplicates.append(
+                    f"{previous_action.action_id} y {action.action_id}"
+                )
+        previous_item = item
+        previous_action = action
+
+    if residual_duplicates:
+        raise AppError(
+            "Se detectaron capturas repetidas en acciones diferentes después del proceso de reparación: "
+            + ", ".join(residual_duplicates[:8])
+            + ". Ajusta el video o reintenta la extracción."
         )
 
     manifest_visuals = [
@@ -4678,14 +4843,14 @@ def _prepare_video_visual_evidence(
     _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
 
     if progress_callback is not None:
-        fallback_count = sum(
-            item.get("match_strategy") == "nearest_chronological_fallback"
+        repair_count = sum(
+            item.get("match_strategy") == "repair_unique_visual_match"
             for item in extracted
         )
         progress_callback(
             "Evidencia visual completa: "
             f"{len(extracted)} de {len(actions)} pasos con captura; "
-            f"{fallback_count} respaldo(s) cronológico(s)."
+            f"{repair_count} captura(s) reparada(s) para evitar repeticiones."
         )
     return extracted
 
@@ -7171,7 +7336,7 @@ def _visual_for_action(
     action: VideoAction,
     action_index: int,
 ) -> dict | None:
-    """Relaciona cada paso con su captura exacta y aplica respaldo cronológico."""
+    """Relaciona cada paso únicamente con su captura exacta."""
 
     by_id = visual_map.get(_clean_action_value(action.action_id))
     if isinstance(by_id, dict):
@@ -7180,6 +7345,9 @@ def _visual_for_action(
     by_index = visual_map.get(f"__index__:{int(action_index)}")
     if isinstance(by_index, dict):
         return by_index
+
+    if VIDEO_VISUAL_STRICT_EXACT_MATCH:
+        return None
 
     ordered = visual_map.get("__all__")
     if isinstance(ordered, list) and ordered:
