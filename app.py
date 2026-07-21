@@ -1869,6 +1869,13 @@ MISSING_ACTION_VALUES = {
     "vacío",
     "no se evidencia",
     "no se observa",
+    "ninguna",
+    "ninguno",
+    "sin validacion",
+    "sin validación",
+    "sin resultado",
+    "no requerida",
+    "no requerido",
 }
 
 
@@ -1975,51 +1982,23 @@ def _lower_first(value: str) -> str:
     return cleaned[0].lower() + cleaned[1:]
 
 
-def _starts_with_infinitive(value: str) -> bool:
+def _capitalize_first(value: str) -> str:
     cleaned = _clean_action_value(value)
-    match = re.match(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", cleaned)
-    if not match:
-        return False
-    verb = match.group(0).casefold()
-    return verb.endswith(("ar", "er", "ir"))
-
-
-def _actor_subject(actor: str) -> str:
-    """Devuelve una forma natural para mencionar al responsable."""
-
-    cleaned = _clean_action_value(actor)
     if not cleaned:
         return ""
+    return cleaned[0].upper() + cleaned[1:]
 
-    normalized = cleaned.casefold()
-    if normalized.startswith(("hablante ", "voz ", "persona no identificada")):
-        return ""
 
-    exact_subjects = {
-        "usuario": "el usuario",
-        "usuaria": "la usuaria",
-        "administrador": "el administrador",
-        "administradora": "la administradora",
-        "supervisor": "el supervisor",
-        "supervisora": "la supervisora",
-        "coordinador": "el coordinador",
-        "coordinadora": "la coordinadora",
-        "analista": "el analista",
-        "auxiliar": "el auxiliar",
-        "lider": "el líder",
-        "líder": "el líder",
-    }
-    if normalized in exact_subjects:
-        return exact_subjects[normalized]
-
-    if normalized.startswith(("el ", "la ", "los ", "las ")):
-        return _lower_first(cleaned)
-
-    return f"la persona responsable del rol «{cleaned}»"
+def _normalized_action_key(value: str) -> str:
+    return re.sub(
+        r"[^a-záéíóúüñ0-9]+",
+        " ",
+        _clean_action_value(value).casefold(),
+    ).strip()
 
 
 def _strip_actor_from_action(action_text: str, actor: str) -> str:
-    """Evita construcciones repetidas como 'el usuario el usuario hace...'."""
+    """Evita repetir el rol dentro de la acción operativa."""
 
     action = _clean_action_value(action_text)
     actor_value = _clean_action_value(actor)
@@ -2036,191 +2015,453 @@ def _strip_actor_from_action(action_text: str, actor: str) -> str:
     ]
     lowered = action.casefold()
     for prefix in prefixes:
-        prefix_lower = prefix.casefold()
-        if lowered.startswith(prefix_lower + " "):
+        if lowered.startswith(prefix.casefold() + " "):
             return action[len(prefix):].strip(" :-")
     return action
 
 
-def _system_location_intro(system: str, location_path: str) -> str:
+def _remove_leading_preposition(value: str) -> str:
+    cleaned = _clean_action_value(value)
+    return re.sub(r"^(?:de|del|en|la|el)\s+", "", cleaned, flags=re.I).strip()
+
+
+def _folder_name(location_path: str) -> str:
+    value = _clean_action_value(location_path)
+    if not value:
+        return ""
+    value = re.sub(r"^carpeta\s+", "", value, flags=re.I).strip(" :-")
+    value = re.sub(r"^(?:de|del)\s+", "", value, flags=re.I).strip()
+    return _capitalize_first(value)
+
+
+def _with_article(value: str) -> str:
+    """Agrega un artículo cuando mejora la naturalidad del título."""
+
+    cleaned = _clean_action_value(value)
+    if not cleaned:
+        return ""
+    if re.match(r"^(?:el|la|los|las|un|una|unos|unas)\s+", cleaned, flags=re.I):
+        return cleaned
+
+    first_word = re.split(r"\s+", cleaned, maxsplit=1)[0].casefold()
+    feminine_singular = {
+        "acción", "actividad", "aplicación", "carpeta", "celda", "clave",
+        "contraseña", "cuenta", "evidencia", "factura", "fecha", "fila",
+        "información", "lista", "opción", "pantalla", "plataforma", "ruta",
+        "solicitud", "tabla", "ventana",
+    }
+    if first_word.endswith("as"):
+        article = "las"
+    elif first_word.endswith(("os", "es")) or first_word in {
+        "datos", "totales", "registros", "archivos", "campos", "giros",
+    }:
+        article = "los"
+    elif first_word in feminine_singular or first_word.endswith(("ción", "sión", "dad")):
+        article = "la"
+    else:
+        article = "el"
+    return f"{article} {cleaned}"
+
+
+TITLE_VERB_RULES = (
+    (("comparar", "validar", "verificar", "cotejar", "conciliar"), "Validar"),
+    (("guardar", "almacenar"), "Guardar"),
+    (("descargar", "exportar"), "Descargar"),
+    (("adjuntar", "cargar archivo"), "Adjuntar"),
+    (("abrir",), "Abrir"),
+    (("seleccionar", "elegir", "marcar", "desmarcar"), "Seleccionar"),
+    (("hacer clic derecho", "clic derecho"), "Abrir las opciones"),
+    (("hacer clic", "pulsar", "presionar"), "Seleccionar"),
+    (("ingresar", "acceder", "iniciar sesión"), "Ingresar"),
+    (("buscar", "ubicar", "localizar"), "Buscar"),
+    (("diligenciar", "registrar", "escribir", "digitar", "modificar"), "Registrar"),
+    (("enviar",), "Enviar"),
+    (("aprobar",), "Aprobar"),
+    (("crear",), "Crear"),
+    (("eliminar",), "Eliminar"),
+    (("filtrar",), "Filtrar"),
+    (("consultar", "visualizar", "revisar"), "Consultar"),
+    (("cerrar",), "Cerrar"),
+)
+
+
+IMPERATIVE_VERBS = {
+    "abrir": "abre",
+    "acceder": "accede",
+    "ingresar": "ingresa",
+    "iniciar": "inicia",
+    "seleccionar": "selecciona",
+    "elegir": "elige",
+    "marcar": "marca",
+    "desmarcar": "desmarca",
+    "hacer": "haz",
+    "pulsar": "pulsa",
+    "presionar": "presiona",
+    "ubicar": "ubica",
+    "buscar": "busca",
+    "localizar": "localiza",
+    "consultar": "consulta",
+    "diligenciar": "diligencia",
+    "registrar": "registra",
+    "escribir": "escribe",
+    "digitar": "digita",
+    "modificar": "modifica",
+    "adjuntar": "adjunta",
+    "cargar": "carga",
+    "descargar": "descarga",
+    "guardar": "guarda",
+    "enviar": "envía",
+    "aprobar": "aprueba",
+    "validar": "valida",
+    "verificar": "verifica",
+    "confirmar": "confirma",
+    "comparar": "compara",
+    "cotejar": "coteja",
+    "conciliar": "concilia",
+    "crear": "crea",
+    "eliminar": "elimina",
+    "cerrar": "cierra",
+    "filtrar": "filtra",
+    "visualizar": "visualiza",
+    "revisar": "revisa",
+    "exportar": "exporta",
+}
+
+
+def _action_category(action_text: str) -> str:
+    key = _normalized_action_key(action_text)
+    for phrases, category in (
+        (("guardar", "almacenar"), "save"),
+        (("comparar", "validar", "verificar", "cotejar", "conciliar"), "validate"),
+        (("descargar", "exportar"), "download"),
+        (("adjuntar", "cargar archivo"), "attach"),
+        (("abrir",), "open"),
+        (("seleccionar", "elegir", "marcar", "desmarcar"), "select"),
+        (("hacer clic", "clic derecho", "pulsar", "presionar"), "click"),
+        (("buscar", "ubicar", "localizar", "filtrar"), "search"),
+        (("diligenciar", "registrar", "escribir", "digitar", "modificar"), "register"),
+    ):
+        if any(phrase in key for phrase in phrases):
+            return category
+    return "generic"
+
+
+def _title_verb(action_text: str) -> str:
+    key = _normalized_action_key(action_text)
+    for phrases, replacement in TITLE_VERB_RULES:
+        if any(phrase in key for phrase in phrases):
+            return replacement
+
+    match = re.match(r"^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", _clean_action_value(action_text))
+    return _capitalize_first(match.group(0)) if match else "Ejecutar"
+
+
+def _build_step_title(action: VideoAction) -> str:
+    base_action = _strip_actor_from_action(action.action, action.actor)
+    data = _clean_action_value(action.data_handled)
+    element = _clean_action_value(action.interface_element)
+    system = _clean_action_value(action.system)
+    category = _action_category(base_action)
+    verb = _title_verb(base_action)
+
+    if category == "validate" and data:
+        title = f"{verb} {_with_article(data)}"
+        if system:
+            title += f" en {system}"
+        return title
+
+    if data:
+        return f"{verb} {_with_article(data)}"
+
+    if element and _normalized_action_key(element) not in {
+        "ventana de guardado", "celdas de excel", "espacio en blanco",
+    }:
+        return f"{verb} {_with_article(element)}"
+
+    cleaned_action = _clean_action_value(base_action).rstrip(".:")
+    if cleaned_action:
+        return _capitalize_first(cleaned_action)
+    return "Ejecutar la actividad"
+
+
+def _to_imperative(action_text: str) -> str:
+    cleaned = _clean_action_value(action_text).rstrip(".:")
+    if not cleaned:
+        return ""
+
+    special = (
+        (r"^hacer clic derecho\b", "haz clic derecho"),
+        (r"^hacer clic izquierdo\b", "haz clic izquierdo"),
+        (r"^hacer clic\b", "haz clic"),
+    )
+    for pattern, replacement in special:
+        if re.search(pattern, cleaned, flags=re.I):
+            return re.sub(pattern, replacement, cleaned, count=1, flags=re.I)
+
+    match = re.match(r"^([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)(\b.*)$", cleaned)
+    if not match:
+        return _lower_first(cleaned)
+    verb = match.group(1).casefold()
+    remainder = match.group(2)
+    imperative = IMPERATIVE_VERBS.get(verb)
+    if imperative:
+        return imperative + remainder
+    return _lower_first(cleaned)
+
+
+def _corporate_location(system: str, path: str, interface: str = "") -> str:
     system_value = _clean_action_value(system)
-    path_value = _clean_action_value(location_path)
-    clauses: list[str] = []
+    path_value = _clean_action_value(path)
+    interface_value = _clean_action_value(interface)
+
+    if system_value.casefold() == "explorador de archivos":
+        if "ventana de guardado" in interface_value.casefold():
+            return "En la ventana de guardado del Explorador de archivos"
+        if path_value:
+            folder = _folder_name(path_value)
+            return (
+                f"En el Explorador de archivos, dentro de la carpeta «{folder}»"
+                if folder else "En el Explorador de archivos"
+            )
+        return "En el Explorador de archivos"
 
     if system_value:
-        system_key = system_value.casefold()
-        if system_key == "explorador de archivos":
-            clauses.append("En el Explorador de archivos")
-        elif system_key.startswith(("el ", "la ", "los ", "las ")):
-            clauses.append(f"En {system_value}")
-        else:
-            clauses.append(f"En la aplicación o sistema «{system_value}»")
+        if path_value and not re.search(r"^archivo\b", path_value, flags=re.I):
+            return f"En {system_value}, en {_with_article(path_value)}"
+        return f"En {system_value}"
 
     if path_value:
-        path_key = path_value.casefold()
-        path_patterns = (
-            ("carpeta ", "dentro de la carpeta"),
-            ("módulo ", "en el módulo"),
-            ("modulo ", "en el módulo"),
-            ("menú ", "en el menú"),
-            ("menu ", "en el menú"),
-            ("pestaña ", "en la pestaña"),
-            ("pantalla ", "en la pantalla"),
-            ("opción ", "en la opción"),
-            ("opcion ", "en la opción"),
-        )
-        formatted_path = ""
-        for prefix, label in path_patterns:
-            if path_key.startswith(prefix):
-                remainder = path_value[len(prefix):].strip(" :-")
-                formatted_path = (
-                    f"{label} «{remainder}»" if remainder else f"{label} indicada"
+        return f"En {_with_article(path_value)}"
+    return ""
+
+
+def _quoted(value: str) -> str:
+    cleaned = _clean_action_value(value)
+    return f"«{cleaned}»" if cleaned else ""
+
+
+def _base_instruction(action: VideoAction) -> str:
+    base_action = _strip_actor_from_action(action.action, action.actor)
+    category = _action_category(base_action)
+    system = _clean_action_value(action.system)
+    path = _clean_action_value(action.location_path)
+    interface = _clean_action_value(action.interface_element)
+    data = _clean_action_value(action.data_handled)
+    location = _corporate_location(system, path, interface)
+    folder = _folder_name(path)
+
+    if category == "save":
+        if system.casefold() == "explorador de archivos":
+            if folder:
+                return (
+                    f"{location}, selecciona la carpeta «{folder}» y guarda el documento."
                 )
-                break
-        if not formatted_path:
-            formatted_path = f"siguiendo la ruta «{path_value}»"
-        clauses.append(formatted_path)
+            return f"{location}, selecciona la ubicación correspondiente y guarda el documento."
+        object_text = _with_article(data) if data else "el archivo"
+        return _sentence(f"{location}, guarda {object_text}" if location else f"Guarda {object_text}")
 
-    return ", ".join(clauses)
+    if category == "validate":
+        sentences: list[str] = []
+        if system and path and re.search(r"^archivo\b", path, flags=re.I):
+            file_name = _remove_leading_preposition(path)
+            if file_name.casefold() in {"archivo", "archivo de reporte", "archivo del reporte"}:
+                sentences.append(f"Abre el archivo del reporte en {system}.")
+            else:
+                sentences.append(f"Abre {_with_article(file_name)} en {system}.")
+        elif system:
+            sentences.append(f"Abre el archivo correspondiente en {system}.")
+
+        if interface and "celda" in interface.casefold():
+            if data:
+                sentences.append(
+                    f"Ubica las celdas correspondientes a {_with_article(_quoted(data))} y compara los datos."
+                )
+            else:
+                sentences.append("Ubica las celdas que contienen los valores que se deben revisar y compara los datos.")
+        else:
+            target = _quoted(data or interface)
+            if target:
+                sentences.append(f"Ubica {target} y compara la información registrada.")
+            else:
+                sentences.append(_sentence(_to_imperative(base_action)))
+        return " ".join(sentences)
+
+    if category == "download":
+        target = _with_article(data) if data else "el archivo"
+        if interface:
+            sentence = f"{location}, selecciona {_quoted(interface)} para descargar {target}"
+        else:
+            sentence = f"{location}, descarga {target}" if location else f"Descarga {target}"
+        return _sentence(sentence)
+
+    if category == "attach":
+        target = _with_article(data) if data else "el archivo requerido"
+        if interface:
+            sentence = f"{location}, selecciona {_quoted(interface)} y adjunta {target}"
+        else:
+            sentence = f"{location}, adjunta {target}" if location else f"Adjunta {target}"
+        return _sentence(sentence)
+
+    if category == "register":
+        if interface and data:
+            return _sentence(
+                f"{location}, ubica el campo {_quoted(interface)} y registra {_quoted(data)}"
+                if location else
+                f"Ubica el campo {_quoted(interface)} y registra {_quoted(data)}"
+            )
+        if data:
+            return _sentence(
+                f"{location}, registra {_quoted(data)}" if location else f"Registra {_quoted(data)}"
+            )
+
+    if category == "search":
+        if interface and data:
+            return _sentence(
+                f"{location}, ingresa {_quoted(data)} en {_with_article(interface)} y ejecuta la búsqueda"
+                if location else
+                f"Ingresa {_quoted(data)} en {_with_article(interface)} y ejecuta la búsqueda"
+            )
+
+    imperative = _to_imperative(base_action)
+    if interface and interface.casefold() not in imperative.casefold():
+        if "clic" in imperative.casefold():
+            imperative += f" sobre {_with_article(interface)}"
+        elif category == "select":
+            imperative += f" {_with_article(interface)}"
+        else:
+            imperative += f" mediante {_with_article(interface)}"
+
+    if data and data.casefold() not in imperative.casefold():
+        if category in {"open", "select"}:
+            imperative += f" correspondiente a {_quoted(data)}"
+        else:
+            imperative += f" para gestionar {_quoted(data)}"
+
+    sentence = f"{location}, {imperative}" if location else imperative
+    return _sentence(_capitalize_first(sentence))
 
 
-def _interface_suffix(action_text: str, interface_element: str) -> str:
-    """Integra el elemento de interfaz sin crear una oración robótica separada."""
-
-    action = _clean_action_value(action_text)
-    element = _clean_action_value(interface_element)
-    if not action or not element:
+def _validation_instruction(validation: str, data: str) -> str:
+    value = _clean_action_value(validation)
+    if not value:
         return ""
+    key = _normalized_action_key(value)
+    data_value = _clean_action_value(data)
 
-    if element.casefold() in action.casefold():
+    if any(term in key for term in ("coincidencia", "cuadre", "cuadrar", "coincidan")):
+        noun = "las cifras" if data_value else "los datos"
+        return (
+            "Verificación obligatoria: Antes de continuar, debes asegurarte de "
+            f"que {noun} coincidan."
+        )
+
+    stripped = re.sub(
+        r"^(?:verificación|validación|comprobación)\s+(?:de|del|de la|de los|de las)\s+",
+        "",
+        value,
+        flags=re.I,
+    ).strip()
+    if stripped != value:
+        return _sentence(
+            "Verificación obligatoria: Antes de continuar, debes comprobar "
+            + _lower_first(stripped)
+        )
+
+    imperative = _to_imperative(value)
+    return _sentence(
+        "Verificación obligatoria: Antes de continuar, debes "
+        + re.sub(r"^(?:debes?|se debe)\s+", "", imperative, flags=re.I)
+    )
+
+
+def _result_instruction(result: str, data: str) -> str:
+    value = _clean_action_value(result)
+    if not value:
         return ""
+    key = _normalized_action_key(value)
 
-    element_key = element.casefold()
-    if element_key in {
-        "espacio en blanco",
-        "área en blanco",
-        "area en blanco",
-        "zona en blanco",
-    }:
-        label = "un espacio en blanco"
-    elif element_key.startswith(("el ", "la ", "los ", "las ", "un ", "una ")):
-        label = element
-    else:
-        label = f"«{element}»"
+    if "archivo guardado" in key or "documento guardado" in key:
+        return (
+            "Este paso finaliza una vez confirmes que el archivo se ha guardado "
+            "correctamente en la ruta indicada."
+        )
+    if "coincidencia confirmada" in key or "datos coinciden" in key:
+        return (
+            "El paso se considera completado cuando confirmes la coincidencia "
+            "exacta de los datos."
+        )
+    if "registro creado" in key or "registro guardado" in key:
+        return (
+            "El paso se considera completado cuando confirmes que el registro "
+            "se creó correctamente."
+        )
+    if "mensaje" in key:
+        return _sentence(
+            "El paso se considera completado cuando el sistema muestre "
+            + _lower_first(value)
+        )
+    return _sentence(
+        "El paso se considera completado cuando confirmes " + _lower_first(value)
+    )
 
-    action_key = action.casefold()
-    if re.search(r"\b(hacer clic|clic derecho|clic izquierdo|pulsar|presionar)\b", action_key):
-        return f" sobre {label}"
-    if re.search(r"\b(seleccionar|elegir|marcar|desmarcar)\b", action_key):
-        return f" la opción {label}"
-    if re.search(r"\b(diligenciar|escribir|digitar|registrar|ingresar)\b", action_key):
-        return f" en el campo {label}"
-    if re.search(r"\b(adjuntar|cargar|descargar)\b", action_key):
-        return f" mediante {label}"
-    return f" utilizando {label}"
 
-
-def _data_sentence(action_text: str, data_handled: str) -> str:
-    data = _clean_action_value(data_handled)
-    action_key = _clean_action_value(action_text).casefold()
-    if not data or data.casefold() in action_key:
+def _evidence_instruction(evidence: str, existing_text: str) -> str:
+    value = _clean_action_value(evidence)
+    if not value or value.casefold() in existing_text.casefold():
         return ""
+    key = _normalized_action_key(value)
+    if key.startswith(("se observa", "el video muestra", "captura de", "registro de")):
+        return _sentence("Como evidencia de la ejecución, conserva " + _lower_first(value))
+    return ""
 
-    if re.search(r"\b(diligenciar|registrar|escribir|digitar|ingresar|modificar)\b", action_key):
-        return _sentence(f"La información que debe registrar o actualizar es {data}")
-    if re.search(r"\b(buscar|consultar|revisar|verificar|filtrar|visualizar)\b", action_key):
-        return _sentence(f"La información que debe consultar o comprobar es {data}")
-    if re.search(r"\b(adjuntar|cargar|descargar)\b", action_key):
-        return _sentence(f"El archivo o dato relacionado con esta acción es {data}")
-    return _sentence(f"Durante este paso se gestiona la información correspondiente a {data}")
+
+def _split_step_title_body(text: str) -> tuple[str, str]:
+    cleaned = _strip_list_prefix(text)
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        return lines[0].rstrip(":"), " ".join(lines[1:]).strip()
+    if lines and ":" in lines[0]:
+        title, body = lines[0].split(":", 1)
+        if 2 <= len(title.split()) <= 18:
+            return title.strip(), body.strip()
+    return "", cleaned
 
 
 def _action_to_detailed_step(action: VideoAction) -> str:
-    """Redacta una acción atómica de forma natural, detallada y sin marcadores null."""
+    """Genera un título operativo y una descripción empresarial natural."""
 
-    actor = _clean_action_value(action.actor)
-    system = _clean_action_value(action.system)
-    path = _clean_action_value(action.location_path)
-    base_action = _strip_actor_from_action(action.action, actor)
-    interface = _clean_action_value(action.interface_element)
-    validation = _clean_action_value(action.validation)
-    result = _clean_action_value(action.result)
-    evidence = _clean_action_value(action.evidence)
-    uncertainty = _clean_action_value(action.uncertainty)
+    title = _build_step_title(action).rstrip(".:")
+    body_parts = [_base_instruction(action)]
 
-    if not base_action:
-        return ""
-
-    # Evita terminaciones incompletas antes de incorporar el elemento de interfaz.
-    if interface:
-        base_action = re.sub(
-            r"\s+(?:en|sobre|el|la|los|las)\s*$",
-            "",
-            base_action,
-            flags=re.I,
-        ).strip()
-
-    subject = _actor_subject(actor)
-    if subject:
-        if _starts_with_infinitive(base_action):
-            action_clause = f"{subject} debe {_lower_first(base_action)}"
-        elif base_action.casefold().startswith("debe "):
-            action_clause = f"{subject} {_lower_first(base_action)}"
-        else:
-            action_clause = f"{subject} {_lower_first(base_action)}"
-    else:
-        if _starts_with_infinitive(base_action):
-            action_clause = f"se debe {_lower_first(base_action)}"
-        else:
-            action_clause = base_action
-
-    action_clause += _interface_suffix(base_action, interface)
-    location_intro = _system_location_intro(system, path)
-    core = f"{location_intro}, {action_clause}" if location_intro else action_clause
-    core = core[0].upper() + core[1:] if core else core
-
-    parts = [_sentence(core)]
-
-    data_sentence = _data_sentence(base_action, action.data_handled)
-    if data_sentence:
-        parts.append(data_sentence)
-
+    validation = _validation_instruction(action.validation, action.data_handled)
     if validation:
-        parts.append(
-            _sentence(
-                "Antes de continuar, realice la siguiente verificación: "
-                + validation
-            )
-        )
+        body_parts.append(validation)
 
+    result = _result_instruction(action.result, action.data_handled)
     if result:
-        parts.append(
-            _sentence(
-                "El paso se considera completado cuando se obtiene o visualiza "
-                "el siguiente resultado: "
-                + result
-            )
-        )
+        body_parts.append(result)
 
-    if evidence and evidence.casefold() not in " ".join(parts).casefold():
-        parts.append(
-            _sentence("Conserve como evidencia de la ejecución " + evidence)
-        )
+    existing = " ".join(body_parts)
+    evidence = _evidence_instruction(action.evidence, existing)
+    if evidence:
+        body_parts.append(evidence)
 
+    uncertainty = _clean_action_value(action.uncertainty)
     if uncertainty:
-        parts.append(
+        body_parts.append(
             _sentence(
-                "Antes de aprobar el documento, confirme la siguiente información: "
+                "Información pendiente de validación antes de aprobar el documento: "
                 + uncertainty
             )
         )
 
-    return " ".join(part for part in parts if part).strip()
+    description = " ".join(part for part in body_parts if part).strip()
+    return f"{title}:\n{description}" if description else f"{title}:"
 
 
 def _action_to_procedure_row(action: VideoAction) -> list[str]:
-    activity = _clean_action_value(action.action)
-    description = _action_to_detailed_step(action)
+    step_text = _action_to_detailed_step(action)
+    activity, description = _split_step_title_body(step_text)
     responsible = _clean_action_value(action.actor) or "No identificado en el video"
 
     evidence_parts = [
@@ -2236,7 +2477,7 @@ def _action_to_procedure_row(action: VideoAction) -> list[str]:
     if not evidence:
         evidence = "No se identifica una evidencia específica en el video."
 
-    return [activity, description, responsible, evidence]
+    return [activity or _clean_action_value(action.action), description, responsible, evidence]
 
 def _apply_video_action_coverage(
     final_document: FinalDocument,
@@ -2443,12 +2684,17 @@ INVENTARIO DE ACCIONES OBLIGATORIO
     data_handled, validation, result, evidence y uncertainty.
     Cuando un campo no tenga información verificable, devuelve una cadena vacía.
     Nunca escribas null, None, N/A, no aplica, por confirmar ni expresiones equivalentes.
-13. action debe contener UNA sola acción concreta y verificable, redactada con
-    suficiente detalle para reconstruir el procedimiento.
-14. Si durante un intervalo no ocurre ninguna actividad operativa y solo existe
+13. action debe contener UNA sola acción concreta y verificable, preferiblemente
+    iniciada con un verbo en infinitivo y con un objeto específico, por ejemplo:
+    "Guardar el reporte de giros" o "Comparar los totales de giros". No incluyas
+    al responsable, el sistema ni frases de relleno dentro de action.
+14. Los campos validation y result deben contener hechos concretos. Cuando no
+    exista una validación o un resultado visible, usa una cadena vacía; nunca
+    escribas "Ninguna" ni expresiones equivalentes.
+15. Si durante un intervalo no ocurre ninguna actividad operativa y solo existe
     conversación sin instrucciones o ejecución, actions puede quedar vacío para
     ese intervalo. No inventes pasos para aumentar la cantidad.
-15. Antes de responder, revisa nuevamente el tramo y confirma que cada acción
+16. Antes de responder, revisa nuevamente el tramo y confirma que cada acción
     visible o mencionada tenga un registro independiente en actions.
 
 Devuelve únicamente el objeto estructurado solicitado.
@@ -4365,11 +4611,17 @@ def _deduplicate_missing_questions(analysis: GuideAnalysis) -> GuideAnalysis:
 
 
 def _strip_list_prefix(text: str) -> str:
-    """Elimina viñetas y numeración ya incorporadas en el texto."""
+    """Elimina numeración sin borrar la separación entre título y descripción."""
 
-    cleaned = re.sub(r"^\s*[•●▪◦\-–—]\s*", "", text.strip())
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^\s*[•●▪◦\-–—]\s*", "", cleaned)
     cleaned = re.sub(r"^\s*\(?\d+\)?[.)\-:]\s*", "", cleaned)
-    return re.sub(r"\s+", " ", cleaned).strip()
+    lines = [
+        re.sub(r"[ \t]+", " ", line).strip()
+        for line in cleaned.splitlines()
+        if line.strip()
+    ]
+    return "\n".join(lines).strip()
 
 
 def normalize_final_document_structure(
@@ -5038,17 +5290,27 @@ def add_safe_bullet(document: Document, text: str):
 
 
 def add_safe_numbered(document: Document, text: str, number: int):
-    """Agrega numeración limpia, sin producir combinaciones como “• 1.”."""
+    """Agrega cada paso con título en negrita y descripción en línea aparte."""
 
     clean_text = _strip_list_prefix(text)
     if not clean_text:
         return None
 
+    title, body = _split_step_title_body(clean_text)
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.left_indent = Cm(0.72)
     paragraph.paragraph_format.first_line_indent = Cm(-0.52)
+
     paragraph.add_run(f"{number}. ").bold = True
-    paragraph.add_run(clean_text)
+    if title:
+        title_run = paragraph.add_run(title.rstrip(":") + ":")
+        title_run.bold = True
+        if body:
+            paragraph.add_run().add_break()
+            paragraph.add_run(body)
+    else:
+        paragraph.add_run(body or clean_text)
+
     _format_body_paragraph(paragraph, justify=False)
     paragraph.paragraph_format.keep_together = True
     return paragraph
@@ -5446,12 +5708,15 @@ def create_pdf(final_document: FinalDocument) -> bytes:
 
         for index, item in enumerate(section.numbered_items, start=1):
             if item.strip():
-                section_story.append(
-                    Paragraph(
-                        f"<b>{index}.</b> {escape(_strip_list_prefix(item))}",
-                        numbered_style,
+                step_title, step_body = _split_step_title_body(item)
+                if step_title:
+                    step_html = (
+                        f"<b>{index}. {escape(step_title.rstrip(':'))}:</b>"
+                        + (f"<br/>{escape(step_body)}" if step_body else "")
                     )
-                )
+                else:
+                    step_html = f"<b>{index}.</b> {escape(step_body)}"
+                section_story.append(Paragraph(step_html, numbered_style))
 
         for bullet in section.bullets:
             if bullet.strip():
@@ -6049,13 +6314,27 @@ def _split_paragraph_editor(value: str) -> list[str]:
 
 
 def _split_list_editor(value: str) -> list[str]:
-    """Convierte una línea por elemento en una lista limpia."""
+    """Convierte una línea por elemento en una lista simple."""
 
     return [
         _strip_list_prefix(item)
         for item in value.splitlines()
         if _strip_list_prefix(item)
     ]
+
+
+def _split_numbered_editor(value: str) -> list[str]:
+    """Conserva el título y la descripción de cada paso como una sola unidad."""
+
+    blocks = [
+        _strip_list_prefix(block)
+        for block in re.split(r"\n\s*\n+", str(value or "").strip())
+        if _strip_list_prefix(block)
+    ]
+    if blocks:
+        return blocks
+
+    return _split_list_editor(value)
 
 
 def _records_from_data_editor(edited_data) -> list[dict]:
@@ -6132,12 +6411,12 @@ def edit_final_document_form(
                 )
                 numbered_value = st.text_area(
                     "Pasos numerados",
-                    value="\n".join(section.numbered_items),
+                    value="\n\n".join(section.numbered_items),
                     height=max(90, min(250, 70 + 25 * len(section.numbered_items))),
                     key=f"edit_numbered_{section.order}",
                     help=(
-                        "Escribe un paso por línea. No agregues 1., 2. ni viñetas; "
-                        "el bot aplicará la numeración."
+                        "Cada paso contiene un título y una descripción. Separa un paso "
+                        "de otro con una línea en blanco; el bot aplicará la numeración."
                     ),
                 )
                 bullets_value = st.text_area(
@@ -6238,7 +6517,7 @@ def edit_final_document_form(
                 update={
                     "title": values["title"].strip(),
                     "paragraphs": _split_paragraph_editor(values["paragraphs"]),
-                    "numbered_items": _split_list_editor(values["numbered"]),
+                    "numbered_items": _split_numbered_editor(values["numbered"]),
                     "bullets": _split_list_editor(values["bullets"]),
                     "tables": rebuilt_tables,
                 }
@@ -6291,7 +6570,13 @@ def show_final_document(final_document: FinalDocument) -> None:
                 st.write(paragraph_text)
 
             for index, item in enumerate(section.numbered_items, start=1):
-                st.write(f"{index}. {item}")
+                step_title, step_body = _split_step_title_body(item)
+                if step_title:
+                    st.markdown(f"**{index}. {step_title.rstrip(':')}:**")
+                    if step_body:
+                        st.write(step_body)
+                else:
+                    st.write(f"{index}. {step_body}")
 
             for bullet in section.bullets:
                 st.write(f"- {bullet}")
