@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
@@ -41,6 +42,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.platypus import (
+    Image as RLImage,
     KeepTogether,
     Paragraph,
     SimpleDocTemplate,
@@ -93,6 +95,18 @@ VIDEO_MAX_PARALLEL_CHUNKS = 2
 VIDEO_CHECKPOINT_ENABLED = True
 VIDEO_CHECKPOINT_VERSION = "video-v5-5min-selective-resumable"
 VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
+# Evidencia visual del instructivo. Las capturas se extraen del video real,
+# se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
+VIDEO_VISUAL_EVIDENCE_ENABLED = True
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v1-hierarchical"
+VIDEO_VISUAL_DIR_NAME = "visuals"
+VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
+VIDEO_VISUAL_MAX_CAPTURES = 72
+VIDEO_VISUAL_MIN_GAP_SECONDS = 14
+VIDEO_VISUAL_FORCE_GAP_SECONDS = 75
+VIDEO_VISUAL_CAPTURE_OFFSET_SECONDS = 0.70
+VIDEO_VISUAL_WIDTH_PX = 1280
+VIDEO_VISUAL_FFMPEG_WORKERS = 3
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -3615,6 +3629,597 @@ def _save_video_chunk_checkpoint(
     _save_checkpoint_to_drive(checkpoint_id, filename, payload)
 
 
+
+def _read_int_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = read_secret(name, str(default)).strip()
+    try:
+        return max(minimum, min(maximum, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_video_timestamp_seconds(value: object) -> float | None:
+    """Convierte HH:MM:SS o MM:SS a segundos absolutos."""
+
+    cleaned = _clean_action_value(value)
+    if not cleaned:
+        return None
+    match = re.search(r"(?<!\d)(\d{1,3}:\d{2}(?::\d{2})?)(?!\d)", cleaned)
+    if not match:
+        return None
+    parts = match.group(1).split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = [int(part) for part in parts]
+        else:
+            hours = 0
+            minutes, seconds = [int(part) for part in parts]
+        if minutes < 0 or seconds < 0 or seconds >= 60:
+            return None
+        return float(hours * 3600 + minutes * 60 + seconds)
+    except (TypeError, ValueError):
+        return None
+
+
+def _action_capture_second(action: VideoAction) -> float | None:
+    start = _parse_video_timestamp_seconds(action.timestamp_start)
+    if start is None:
+        return None
+    end = _parse_video_timestamp_seconds(action.timestamp_end)
+    if end is not None and end > start:
+        return start + min(VIDEO_VISUAL_CAPTURE_OFFSET_SECONDS, (end - start) / 2)
+    return start + VIDEO_VISUAL_CAPTURE_OFFSET_SECONDS
+
+
+def _procedure_phase(action: VideoAction) -> str:
+    key = _normalized_action_key(
+        " ".join(
+            value
+            for value in (
+                action.action,
+                action.interface_element,
+                action.data_handled,
+                action.result,
+            )
+            if _clean_action_value(value)
+        )
+    )
+    category = _action_category(action.action)
+    if any(term in key for term in ("iniciar sesion", "acceder", "credencial", "login")):
+        return "access"
+    if category in {"download", "save", "attach"}:
+        return "files"
+    if category == "validate" or any(
+        term in key for term in ("coincidencia", "verificacion", "validacion", "comparar")
+    ):
+        return "validation"
+    if any(term in key for term in ("enviar", "correo", "aprobar", "socializar")):
+        return "communication"
+    if any(term in key for term in ("grafica", "grafico", "informe final", "informe directivo")):
+        return "reporting"
+    if any(term in key for term in ("filtrar", "ordenar", "formula", "copiar", "pegar", "celda", "hoja")):
+        return "data"
+    return "operation"
+
+
+def _procedure_system_key(action: VideoAction) -> str:
+    system = _normalized_action_key(action.system)
+    if system:
+        return system
+    path = _normalized_action_key(action.location_path)
+    return path.split(" ", 1)[0] if path else "proceso"
+
+
+def _group_title_from_actions(actions: list[VideoAction]) -> str:
+    systems = [
+        _clean_action_value(action.system)
+        for action in actions
+        if _clean_action_value(action.system)
+    ]
+    system = max(set(systems), key=systems.count) if systems else ""
+    phases = [_procedure_phase(action) for action in actions]
+    system_key = _normalized_action_key(system)
+    phase_counts = {name: phases.count(name) for name in set(phases)}
+
+    # El sistema aporta contexto más estable que una microacción aislada.
+    if "correo" in system_key or "email" in system_key:
+        phase = "communication"
+    elif system_key == "explorador de archivos":
+        phase = "files"
+    elif "excel" in system_key and phase_counts.get("validation", 0) >= max(2, len(actions) // 2):
+        phase = "validation"
+    else:
+        priority = ("communication", "reporting", "validation", "files", "access", "data", "operation")
+        phase = max(
+            priority,
+            key=lambda name: (phase_counts.get(name, 0), -priority.index(name)),
+        )
+
+    if phase == "access":
+        return f"ACCESO A {system.upper()}" if system else "ACCESO A LA PLATAFORMA"
+    if phase == "files":
+        if system_key == "explorador de archivos":
+            return "DESCARGA Y ALMACENAMIENTO DE ARCHIVOS"
+        return f"DESCARGA Y GESTIÓN DE ARCHIVOS EN {system.upper()}" if system else "DESCARGA Y GESTIÓN DE ARCHIVOS"
+    if phase == "validation":
+        if "excel" in system_key:
+            return "VALIDACIÓN DE LA INFORMACIÓN EN EXCEL"
+        return f"VALIDACIÓN DE LA INFORMACIÓN EN {system.upper()}" if system else "VALIDACIÓN DE LA INFORMACIÓN"
+    if phase == "communication":
+        return "ENVÍO, REVISIÓN Y CONFIRMACIÓN DE LA INFORMACIÓN"
+    if phase == "reporting":
+        return "ELABORACIÓN Y CIERRE DEL INFORME"
+    if phase == "data":
+        if "excel" in system_key:
+            return "CONSOLIDACIÓN Y TRATAMIENTO DE LA INFORMACIÓN EN EXCEL"
+        return f"GESTIÓN DE LA INFORMACIÓN EN {system.upper()}" if system else "GESTIÓN DE LA INFORMACIÓN"
+    if system:
+        return f"EJECUCIÓN DEL PROCESO EN {system.upper()}"
+    return "EJECUCIÓN DEL PROCESO"
+
+
+def _build_visual_procedure_groups(actions: list[VideoAction]) -> list[dict]:
+    """Agrupa acciones contiguas en macroactividades sin fusionar pasos."""
+
+    if not actions:
+        return []
+
+    raw_groups: list[list[tuple[int, VideoAction]]] = []
+    current: list[tuple[int, VideoAction]] = []
+    previous_system = ""
+    previous_phase = ""
+    previous_time: float | None = None
+    major_phases = {"access", "files", "validation", "communication", "reporting"}
+
+    for index, action in enumerate(actions):
+        system = _procedure_system_key(action)
+        phase = _procedure_phase(action)
+        timestamp = _action_capture_second(action)
+        time_gap = (
+            timestamp - previous_time
+            if timestamp is not None and previous_time is not None
+            else 0
+        )
+        split = bool(current) and (
+            (system != previous_system)
+            or (time_gap > 210)
+            or (
+                phase != previous_phase
+                and phase in major_phases
+                and len(current) >= 4
+            )
+        )
+        if split:
+            raw_groups.append(current)
+            current = []
+        current.append((index, action))
+        previous_system = system
+        previous_phase = phase
+        if timestamp is not None:
+            previous_time = timestamp
+    if current:
+        raw_groups.append(current)
+
+    # Evita subtítulos con una sola microacción, salvo que sea la única agrupación.
+    merged: list[list[tuple[int, VideoAction]]] = []
+    for group in raw_groups:
+        if len(group) <= 2 and merged:
+            previous_title = _group_title_from_actions([item[1] for item in merged[-1]])
+            current_title = _group_title_from_actions([item[1] for item in group])
+            same_system = _procedure_system_key(merged[-1][-1][1]) == _procedure_system_key(group[0][1])
+            if same_system or previous_title == current_title:
+                merged[-1].extend(group)
+                continue
+        merged.append(group)
+
+    result: list[dict] = []
+    title_counts: dict[str, int] = {}
+    for group_index, group in enumerate(merged, start=1):
+        group_actions = [item[1] for item in group]
+        base_title = _group_title_from_actions(group_actions)
+        title_counts[base_title] = title_counts.get(base_title, 0) + 1
+        occurrence = title_counts[base_title]
+        title = base_title if occurrence == 1 else f"{base_title} — CONTINUACIÓN"
+        result.append(
+            {
+                "group_index": group_index,
+                "title": title,
+                "items": [
+                    {
+                        "global_index": original_index,
+                        "local_index": local_index,
+                        "action": action,
+                    }
+                    for local_index, (original_index, action) in enumerate(group, start=1)
+                ],
+            }
+        )
+    return result
+
+
+def _visual_action_score(
+    action: VideoAction,
+    previous_action: VideoAction | None,
+    is_group_boundary: bool,
+) -> int:
+    score = 0
+    category = _action_category(action.action)
+    if is_group_boundary:
+        score += 4
+    if category in {"open", "select", "click", "search", "download", "save", "validate", "attach"}:
+        score += 2
+    if _clean_action_value(action.interface_element):
+        score += 1
+    if _clean_action_value(action.validation) or _clean_action_value(action.result):
+        score += 2
+    if previous_action is not None:
+        if _procedure_system_key(action) != _procedure_system_key(previous_action):
+            score += 3
+        if _normalized_action_key(action.location_path) != _normalized_action_key(previous_action.location_path):
+            score += 1
+    return score
+
+
+def _select_visual_actions(actions: list[VideoAction]) -> list[tuple[int, VideoAction]]:
+    """Selecciona capturas útiles, evitando una imagen repetitiva por microacción."""
+
+    if not actions:
+        return []
+    max_captures = _read_int_setting(
+        "VIDEO_VISUAL_MAX_CAPTURES",
+        VIDEO_VISUAL_MAX_CAPTURES,
+        8,
+        140,
+    )
+    min_gap = float(
+        _read_int_setting(
+            "VIDEO_VISUAL_MIN_GAP_SECONDS",
+            VIDEO_VISUAL_MIN_GAP_SECONDS,
+            4,
+            90,
+        )
+    )
+    groups = _build_visual_procedure_groups(actions)
+    group_starts = {
+        group["items"][0]["global_index"]
+        for group in groups
+        if group.get("items")
+    }
+    group_ends = {
+        group["items"][-1]["global_index"]
+        for group in groups
+        if group.get("items")
+    }
+
+    selected: list[tuple[int, VideoAction]] = []
+    last_second: float | None = None
+    last_selected_index = -10
+    for index, action in enumerate(actions):
+        second = _action_capture_second(action)
+        if second is None:
+            continue
+        previous = actions[index - 1] if index > 0 else None
+        score = _visual_action_score(action, previous, index in group_starts)
+        gap = second - last_second if last_second is not None else 10**9
+        force = (
+            index in group_starts
+            or index in group_ends
+            or gap >= VIDEO_VISUAL_FORCE_GAP_SECONDS
+            or index - last_selected_index >= 7
+        )
+        if (score >= 4 and gap >= min_gap) or (force and gap >= min_gap / 2):
+            selected.append((index, action))
+            last_second = second
+            last_selected_index = index
+
+    # Garantiza al menos una evidencia por macroactividad cuando haya tiempo válido.
+    selected_indices = {index for index, _ in selected}
+    for group in groups:
+        if any(item["global_index"] in selected_indices for item in group["items"]):
+            continue
+        valid = [
+            (item["global_index"], item["action"])
+            for item in group["items"]
+            if _action_capture_second(item["action"]) is not None
+        ]
+        if valid:
+            selected.append(valid[len(valid) // 2])
+
+    selected = sorted(
+        {index: action for index, action in selected}.items(),
+        key=lambda item: item[0],
+    )
+    if len(selected) > max_captures:
+        # Muestreo uniforme que conserva el inicio y el cierre del proceso.
+        if max_captures <= 1:
+            selected = selected[:1]
+        else:
+            positions = {
+                round(i * (len(selected) - 1) / (max_captures - 1))
+                for i in range(max_captures)
+            }
+            selected = [selected[position] for position in sorted(positions)]
+    return selected
+
+
+def _video_visual_action_fingerprint(actions: list[VideoAction]) -> str:
+    payload = [
+        {
+            "id": action.action_id,
+            "time": action.timestamp_start,
+            "end": action.timestamp_end,
+            "action": action.action,
+            "system": action.system,
+            "path": action.location_path,
+        }
+        for action in actions
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _video_visual_dir(checkpoint_id: str) -> Path:
+    return _checkpoint_root_dir(checkpoint_id) / VIDEO_VISUAL_DIR_NAME
+
+
+def _visual_manifest_path(checkpoint_id: str) -> Path:
+    return _video_visual_dir(checkpoint_id) / "manifest.json"
+
+
+def _load_local_video_visuals(
+    checkpoint_id: str,
+    actions: list[VideoAction],
+) -> list[dict]:
+    manifest_path = _visual_manifest_path(checkpoint_id)
+    if not manifest_path.exists():
+        return []
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("version") != VIDEO_VISUAL_CHECKPOINT_VERSION:
+            return []
+        if payload.get("action_fingerprint") != _video_visual_action_fingerprint(actions):
+            return []
+        result: list[dict] = []
+        for item in payload.get("visuals") or []:
+            filename = safe_filename(str(item.get("filename") or ""))
+            image_path = _video_visual_dir(checkpoint_id) / filename
+            if not filename or not image_path.exists():
+                continue
+            content = image_path.read_bytes()
+            if not content.startswith(b"\xff\xd8"):
+                continue
+            result.append({**item, "content": content, "mime_type": "image/jpeg"})
+        return result
+    except Exception:
+        return []
+
+
+def _write_visual_bundle_to_drive(checkpoint_id: str, visual_dir: Path) -> bool:
+    if not _drive_checkpoint_folder_id() or not visual_dir.exists():
+        return False
+    service = None
+    try:
+        bundle = BytesIO()
+        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(visual_dir.glob("*")):
+                if path.is_file():
+                    archive.write(path, arcname=path.name)
+        bundle.seek(0)
+        service = build_drive_service(writable=True)
+        folder_id = _ensure_drive_checkpoint_folder(service, checkpoint_id)
+        existing = _find_drive_item(service, folder_id, VIDEO_VISUAL_BUNDLE_NAME, "application/zip")
+        media = MediaIoBaseUpload(
+            bundle,
+            mimetype="application/zip",
+            resumable=False,
+        )
+        if existing:
+            service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            service.files().create(
+                body={
+                    "name": VIDEO_VISUAL_BUNDLE_NAME,
+                    "parents": [folder_id],
+                    "mimeType": "application/zip",
+                },
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+        return True
+    except Exception:
+        return False
+    finally:
+        if service is not None:
+            _close_drive_service(service)
+
+
+def _restore_visual_bundle_from_drive(checkpoint_id: str) -> bool:
+    if not _drive_checkpoint_folder_id():
+        return False
+    service = None
+    try:
+        service = build_drive_service(writable=True)
+        folder_id = _ensure_drive_checkpoint_folder(service, checkpoint_id)
+        item = _find_drive_item(service, folder_id, VIDEO_VISUAL_BUNDLE_NAME, "application/zip")
+        if not item:
+            return False
+        raw = _download_drive_file_bytes(service, str(item["id"]))
+        visual_dir = _video_visual_dir(checkpoint_id)
+        visual_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(BytesIO(raw), "r") as archive:
+            for member in archive.infolist():
+                filename = safe_filename(member.filename)
+                if not filename or member.is_dir():
+                    continue
+                target = visual_dir / filename
+                target.write_bytes(archive.read(member))
+        return True
+    except Exception:
+        return False
+    finally:
+        if service is not None:
+            _close_drive_service(service)
+
+
+def _extract_video_frame_jpeg(
+    local_path: Path,
+    capture_second: float,
+    output_path: Path,
+) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{max(0.0, capture_second):.3f}",
+                "-i",
+                str(local_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={VIDEO_VISUAL_WIDTH_PX}:-2:force_original_aspect_ratio=decrease",
+                "-q:v",
+                "4",
+                "-y",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        return (
+            result.returncode == 0
+            and output_path.exists()
+            and output_path.stat().st_size > 5000
+            and output_path.read_bytes()[:2] == b"\xff\xd8"
+        )
+    except Exception:
+        return False
+
+
+def _prepare_video_visual_evidence(
+    local_path: Path,
+    actions: list[VideoAction],
+    checkpoint_id: str,
+    progress_callback=None,
+) -> list[dict]:
+    """Extrae y conserva capturas reales del video asociadas a pasos concretos."""
+
+    if not VIDEO_VISUAL_EVIDENCE_ENABLED or not actions or not checkpoint_id:
+        return []
+
+    existing = _load_local_video_visuals(checkpoint_id, actions)
+    if existing:
+        if progress_callback is not None:
+            progress_callback(f"Evidencia visual recuperada: {len(existing)} captura(s).")
+        return existing
+
+    if _restore_visual_bundle_from_drive(checkpoint_id):
+        existing = _load_local_video_visuals(checkpoint_id, actions)
+        if existing:
+            if progress_callback is not None:
+                progress_callback(
+                    f"Evidencia visual recuperada desde Drive: {len(existing)} captura(s)."
+                )
+            return existing
+
+    candidates = _select_visual_actions(actions)
+    if not candidates:
+        return []
+    if not shutil.which("ffmpeg"):
+        return []
+
+    visual_dir = _video_visual_dir(checkpoint_id)
+    visual_dir.mkdir(parents=True, exist_ok=True)
+
+    jobs: list[tuple[int, VideoAction, float, Path, str]] = []
+    for visual_index, (action_index, action) in enumerate(candidates, start=1):
+        second = _action_capture_second(action)
+        if second is None:
+            continue
+        visual_id = f"VIS-{visual_index:04d}"
+        action_id = action.action_id or f"ACC-{action_index + 1:04d}"
+        filename = (
+            f"{visual_id}_{safe_filename(action_id)}_"
+            f"{int(round(second)):06d}.jpg"
+        )
+        jobs.append((action_index, action, second, visual_dir / filename, visual_id))
+
+    extracted: list[dict] = []
+    workers = min(VIDEO_VISUAL_FFMPEG_WORKERS, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_extract_video_frame_jpeg, local_path, second, path): (
+                action_index,
+                action,
+                second,
+                path,
+                visual_id,
+            )
+            for action_index, action, second, path, visual_id in jobs
+        }
+        completed = 0
+        for future in as_completed(future_map):
+            action_index, action, second, path, visual_id = future_map[future]
+            completed += 1
+            try:
+                success = bool(future.result())
+            except Exception:
+                success = False
+            if success:
+                extracted.append(
+                    {
+                        "visual_id": visual_id,
+                        "action_id": action.action_id or f"ACC-{action_index + 1:04d}",
+                        "action_index": action_index,
+                        "timestamp": _video_clock(second),
+                        "timestamp_seconds": second,
+                        "title": _build_step_title(action),
+                        "filename": path.name,
+                        "mime_type": "image/jpeg",
+                        "content": path.read_bytes(),
+                    }
+                )
+            if progress_callback is not None and (
+                completed == len(jobs) or completed % 8 == 0
+            ):
+                progress_callback(
+                    f"Extrayendo evidencia visual: {completed} de {len(jobs)} captura(s)."
+                )
+
+    extracted.sort(key=lambda item: int(item.get("action_index") or 0))
+    manifest_visuals = [
+        {key: value for key, value in item.items() if key != "content"}
+        for item in extracted
+    ]
+    _write_json_atomic(
+        _visual_manifest_path(checkpoint_id),
+        {
+            "version": VIDEO_VISUAL_CHECKPOINT_VERSION,
+            "action_fingerprint": _video_visual_action_fingerprint(actions),
+            "action_count": len(actions),
+            "visuals": manifest_visuals,
+        },
+    )
+    _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
+    return extracted
+
+
 def _interval_is_covered(
     start_seconds: float,
     end_seconds: float,
@@ -4671,7 +5276,7 @@ def transcribe_video_with_gemini(
     with tempfile.TemporaryDirectory() as temp_dir:
         local_path = Path(temp_dir) / f"video_origen{suffix}"
         local_path.write_bytes(video_record["content"])
-        return _transcribe_local_video_path_with_gemini(
+        transcript = _transcribe_local_video_path_with_gemini(
             api_key=api_key,
             model=model,
             local_path=local_path,
@@ -4680,6 +5285,22 @@ def transcribe_video_with_gemini(
             progress_callback=progress_callback,
             checkpoint_key=str(video_record.get("fingerprint") or video_record["name"]),
         )
+        checkpoint_id = str(
+            st.session_state.get("video_checkpoint_id")
+            or hashlib.sha256(
+                ("visual-upload:" + str(video_record.get("fingerprint") or video_record["name"])).encode("utf-8")
+            ).hexdigest()
+        )
+        visuals = _prepare_video_visual_evidence(
+            local_path=local_path,
+            actions=list(transcript.actions),
+            checkpoint_id=checkpoint_id,
+            progress_callback=progress_callback,
+        )
+        video_record["video_checkpoint_id"] = checkpoint_id
+        video_record["video_visuals"] = visuals
+        video_record["video_visual_count"] = len(visuals)
+        return transcript
 
 
 def transcribe_drive_video_with_gemini(
@@ -4700,6 +5321,14 @@ def transcribe_drive_video_with_gemini(
             destination_dir=Path(temp_dir),
             progress_callback=progress_callback,
         )
+        drive_checkpoint_key = (
+            "drive:"
+            + str(metadata.get("file_id") or "")
+            + ":"
+            + str(metadata.get("modifiedTime") or "")
+            + ":"
+            + str(metadata.get("size_bytes") or "")
+        )
         transcript = _transcribe_local_video_path_with_gemini(
             api_key=api_key,
             model=model,
@@ -4707,14 +5336,17 @@ def transcribe_drive_video_with_gemini(
             display_name=metadata["name"],
             mime_type=metadata["mime_type"],
             progress_callback=progress_callback,
-            checkpoint_key=(
-                "drive:"
-                + str(metadata.get("file_id") or "")
-                + ":"
-                + str(metadata.get("modifiedTime") or "")
-                + ":"
-                + str(metadata.get("size_bytes") or "")
-            ),
+            checkpoint_key=drive_checkpoint_key,
+        )
+        checkpoint_id = str(
+            st.session_state.get("video_checkpoint_id")
+            or hashlib.sha256(("visual-" + drive_checkpoint_key).encode("utf-8")).hexdigest()
+        )
+        visuals = _prepare_video_visual_evidence(
+            local_path=local_path,
+            actions=list(transcript.actions),
+            checkpoint_id=checkpoint_id,
+            progress_callback=progress_callback,
         )
 
     source_record = {
@@ -4737,7 +5369,9 @@ def transcribe_drive_video_with_gemini(
         "drive_url": metadata.get("webViewLink") or drive_reference,
         "video_actions": [action.model_dump() for action in transcript.actions],
         "video_action_count": len(transcript.actions),
-        "video_checkpoint_id": st.session_state.get("video_checkpoint_id"),
+        "video_checkpoint_id": checkpoint_id,
+        "video_visuals": visuals,
+        "video_visual_count": len(visuals),
     }
     return transcript, source_record
 
@@ -5885,6 +6519,113 @@ def configure_docx(document: Document, preserve_guide_layout: bool = False) -> N
             style.paragraph_format.widow_control = True
 
 
+
+def _strip_leading_document_number(value: str) -> str:
+    return re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s*", "", str(value or "")).strip()
+
+
+def _section_display_title(section: FinalSection) -> str:
+    title = _strip_leading_document_number(section.title)
+    return f"{section.order}. {title}" if title else str(section.order)
+
+
+def _section_is_visual_procedure(section: FinalSection, source_record: dict | None) -> bool:
+    if not source_record or not section.numbered_items:
+        return False
+    title_key = _normalized_action_key(section.title)
+    procedural = any(term in title_key for term in PROCEDURAL_TITLE_TERMS)
+    actions = _source_video_actions(source_record)
+    return procedural and bool(actions) and len(actions) == len(section.numbered_items)
+
+
+def _procedure_render_plan(
+    section: FinalSection,
+    source_record: dict | None,
+) -> list[dict]:
+    if not _section_is_visual_procedure(section, source_record):
+        return []
+    actions = _source_video_actions(source_record or {})
+    return _build_visual_procedure_groups(actions)
+
+
+def _visuals_by_action_id(source_record: dict | None) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    if not source_record:
+        return result
+    for item in source_record.get("video_visuals") or []:
+        if not isinstance(item, dict):
+            continue
+        action_id = _clean_action_value(item.get("action_id"))
+        content = item.get("content")
+        if action_id and isinstance(content, (bytes, bytearray)) and content:
+            result[action_id] = item
+    return result
+
+
+def add_safe_subheading(document: Document, text: str):
+    clean_text = _normalize_document_text(text)
+    if not clean_text:
+        return None
+    if has_docx_style(document, "Heading 2"):
+        paragraph = document.add_paragraph(clean_text, style="Heading 2")
+    else:
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run(clean_text)
+        run.bold = True
+        run.font.name = "Arial"
+        run.font.size = Pt(11)
+    paragraph.paragraph_format.space_before = Pt(10)
+    paragraph.paragraph_format.space_after = Pt(5)
+    paragraph.paragraph_format.keep_with_next = True
+    paragraph.paragraph_format.keep_together = True
+    return paragraph
+
+
+def _docx_available_image_width_cm(document: Document) -> float:
+    try:
+        section = document.sections[-1]
+        usable_emu = int(section.page_width) - int(section.left_margin) - int(section.right_margin)
+        return max(8.0, min(16.5, usable_emu / 360000.0))
+    except Exception:
+        return 15.5
+
+
+def add_docx_visual(document: Document, visual: dict) -> object | None:
+    content = visual.get("content") if isinstance(visual, dict) else None
+    if not isinstance(content, (bytes, bytearray)) or not content:
+        return None
+    try:
+        paragraph = document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_before = Pt(2)
+        paragraph.paragraph_format.space_after = Pt(8)
+        paragraph.paragraph_format.keep_together = True
+        run = paragraph.add_run()
+        run.add_picture(
+            BytesIO(bytes(content)),
+            width=Cm(_docx_available_image_width_cm(document)),
+        )
+        return paragraph
+    except Exception:
+        return None
+
+
+def _reportlab_visual(visual: dict, available_width: float):
+    content = visual.get("content") if isinstance(visual, dict) else None
+    if not isinstance(content, (bytes, bytearray)) or not content:
+        return None
+    try:
+        image = RLImage(BytesIO(bytes(content)))
+        if image.drawWidth > available_width:
+            scale = available_width / image.drawWidth
+            image.drawWidth *= scale
+            image.drawHeight *= scale
+        image.hAlign = "CENTER"
+        return image
+    except Exception:
+        return None
+
+
 def add_safe_heading(document: Document, text: str):
     """Agrega un título unido al primer elemento de su sección."""
 
@@ -5928,7 +6669,7 @@ def add_safe_bullet(document: Document, text: str):
     return paragraph
 
 
-def add_safe_numbered(document: Document, text: str, number: int):
+def add_safe_numbered(document: Document, text: str, number: int | str):
     """Agrega cada paso con título en negrita y descripción en línea aparte."""
 
     clean_text = _strip_list_prefix(text)
@@ -6101,17 +6842,15 @@ def add_docx_table(document: Document, table_data: FinalTable) -> None:
 def create_docx(
     final_document: FinalDocument,
     style_guide: dict | None = None,
+    source_record: dict | None = None,
 ) -> bytes:
-    """
-    Crea el Word final y conserva el diseño institucional de la guía DOCX.
-    También convierte la paginación estática del encabezado y pie en campos
-    PAGE/NUMPAGES dinámicos.
-    """
+    """Crea un instructivo institucional jerárquico con evidencia visual."""
 
     final_document = normalize_final_document_structure(final_document)
     document, inherited_layout = load_visual_guide_document(style_guide)
     configure_docx(document, preserve_guide_layout=inherited_layout)
     apply_dynamic_page_numbering(document)
+    visuals = _visuals_by_action_id(source_record)
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -6132,42 +6871,56 @@ def create_docx(
         subtitle_run.font.size = Pt(10.5)
 
     if final_document.introductory_note.strip():
-        introductory = document.add_paragraph(
-            final_document.introductory_note.strip()
-        )
+        introductory = document.add_paragraph(final_document.introductory_note.strip())
         _format_body_paragraph(introductory)
 
     for section in final_document.sections:
-        add_safe_heading(document, section.title)
-
-        first_content_paragraph = None
+        add_safe_heading(document, _section_display_title(section))
 
         for paragraph_text in section.paragraphs:
             if paragraph_text.strip():
                 paragraph = document.add_paragraph(paragraph_text.strip())
                 _format_body_paragraph(paragraph)
-                if first_content_paragraph is None:
-                    first_content_paragraph = paragraph
 
-        for number, item in enumerate(section.numbered_items, start=1):
-            paragraph = add_safe_numbered(document, item, number)
-            if first_content_paragraph is None and paragraph is not None:
-                first_content_paragraph = paragraph
+        procedure_plan = _procedure_render_plan(section, source_record)
+        if procedure_plan:
+            for group in procedure_plan:
+                group_index = int(group["group_index"])
+                add_safe_subheading(
+                    document,
+                    f"{section.order}.{group_index}. {group['title']}",
+                )
+                for item in group["items"]:
+                    global_index = int(item["global_index"])
+                    local_index = int(item["local_index"])
+                    action = item["action"]
+                    if global_index >= len(section.numbered_items):
+                        continue
+                    number_label = f"{section.order}.{group_index}.{local_index}"
+                    paragraph = add_safe_numbered(
+                        document,
+                        section.numbered_items[global_index],
+                        number_label,
+                    )
+                    visual = visuals.get(action.action_id)
+                    if visual:
+                        if paragraph is not None:
+                            paragraph.paragraph_format.keep_with_next = True
+                        add_docx_visual(document, visual)
+        else:
+            for number, item in enumerate(section.numbered_items, start=1):
+                add_safe_numbered(document, item, f"{section.order}.{number}")
 
         for bullet in section.bullets:
-            paragraph = add_safe_bullet(document, bullet)
-            if first_content_paragraph is None and paragraph is not None:
-                first_content_paragraph = paragraph
+            add_safe_bullet(document, bullet)
 
         for table_data in section.tables:
             add_docx_table(document, table_data)
 
     _set_update_fields_on_open(document)
-
     output = BytesIO()
     document.save(output)
     return output.getvalue()
-
 
 def convert_docx_to_pdf(docx_content: bytes) -> bytes | None:
     """Convierte el DOCX a PDF con LibreOffice para conservar encabezado y pie."""
@@ -6238,10 +6991,14 @@ class NumberedCanvas(pdf_canvas.Canvas):
             super().showPage()
         super().save()
 
-def create_pdf(final_document: FinalDocument) -> bytes:
+def create_pdf(
+    final_document: FinalDocument,
+    source_record: dict | None = None,
+) -> bytes:
     """Crea una versión PDF estructurada con numeración dinámica."""
 
     final_document = normalize_final_document_structure(final_document)
+    visuals = _visuals_by_action_id(source_record)
     output = BytesIO()
     styles = getSampleStyleSheet()
 
@@ -6271,6 +7028,16 @@ def create_pdf(final_document: FinalDocument) -> bytes:
         leading=14,
         spaceBefore=10,
         spaceAfter=5,
+        keepWithNext=True,
+    )
+    subgroup_style = ParagraphStyle(
+        "ProcedureSubgroup",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=10.5,
+        leading=13,
+        spaceBefore=8,
+        spaceAfter=4,
         keepWithNext=True,
     )
     body_style = ParagraphStyle(
@@ -6336,7 +7103,7 @@ def create_pdf(final_document: FinalDocument) -> bytes:
 
     for section in final_document.sections:
         section_story: list = [
-            pdf_paragraph(section.title.strip(), heading_style),
+            pdf_paragraph(_section_display_title(section), heading_style),
         ]
 
         for paragraph_text in section.paragraphs:
@@ -6345,17 +7112,58 @@ def create_pdf(final_document: FinalDocument) -> bytes:
                     pdf_paragraph(paragraph_text.strip(), body_style)
                 )
 
-        for index, item in enumerate(section.numbered_items, start=1):
-            if item.strip():
-                step_title, step_body = _split_step_title_body(item)
-                if step_title:
-                    step_html = (
-                        f"<b>{index}. {escape(step_title.rstrip(':'))}:</b>"
-                        + (f"<br/>{escape(step_body)}" if step_body else "")
+        procedure_plan = _procedure_render_plan(section, source_record)
+        if procedure_plan:
+            for group in procedure_plan:
+                group_index = int(group["group_index"])
+                section_story.append(
+                    pdf_paragraph(
+                        f"{section.order}.{group_index}. {group['title']}",
+                        subgroup_style,
                     )
-                else:
-                    step_html = f"<b>{index}.</b> {escape(step_body)}"
-                section_story.append(Paragraph(step_html, numbered_style))
+                )
+                for plan_item in group["items"]:
+                    global_index = int(plan_item["global_index"])
+                    local_index = int(plan_item["local_index"])
+                    action = plan_item["action"]
+                    if global_index >= len(section.numbered_items):
+                        continue
+                    item = section.numbered_items[global_index]
+                    step_title, step_body = _split_step_title_body(item)
+                    number_label = f"{section.order}.{group_index}.{local_index}"
+                    if step_title:
+                        step_html = (
+                            f"<b>{number_label}. {escape(step_title.rstrip(':'))}:</b>"
+                            + (f"<br/>{escape(step_body)}" if step_body else "")
+                        )
+                    else:
+                        step_html = f"<b>{number_label}.</b> {escape(step_body)}"
+                    step_flowable = Paragraph(step_html, numbered_style)
+                    visual_flowable = _reportlab_visual(
+                        visuals.get(action.action_id, {}),
+                        available_width,
+                    )
+                    if visual_flowable is not None:
+                        section_story.append(
+                            KeepTogether(
+                                [step_flowable, Spacer(1, 4), visual_flowable, Spacer(1, 7)]
+                            )
+                        )
+                    else:
+                        section_story.append(step_flowable)
+        else:
+            for index, item in enumerate(section.numbered_items, start=1):
+                if item.strip():
+                    step_title, step_body = _split_step_title_body(item)
+                    number_label = f"{section.order}.{index}"
+                    if step_title:
+                        step_html = (
+                            f"<b>{number_label}. {escape(step_title.rstrip(':'))}:</b>"
+                            + (f"<br/>{escape(step_body)}" if step_body else "")
+                        )
+                    else:
+                        step_html = f"<b>{number_label}.</b> {escape(step_body)}"
+                    section_story.append(Paragraph(step_html, numbered_style))
 
         for bullet in section.bullets:
             if bullet.strip():
@@ -6629,10 +7437,11 @@ def show_video_transcript_review(source_record: dict) -> str | None:
 
     transcript = st.session_state.get("video_transcript")
     if transcript:
-        metric_columns = st.columns(3)
+        metric_columns = st.columns(4)
         metric_columns[0].metric("Acciones operativas", len(transcript.actions))
-        metric_columns[1].metric("Hablantes", len(transcript.speakers))
-        metric_columns[2].metric("Alertas", len(transcript.uncertainties))
+        metric_columns[1].metric("Capturas", int(source_record.get("video_visual_count") or 0))
+        metric_columns[2].metric("Hablantes", len(transcript.speakers))
+        metric_columns[3].metric("Alertas", len(transcript.uncertainties))
 
         if transcript.actions:
             with st.expander("Inventario de acciones detectadas", expanded=True):
@@ -6663,6 +7472,29 @@ def show_video_transcript_review(source_record: dict) -> str | None:
                 "No se detectaron acciones operativas. Vuelve a transcribir el video "
                 "antes de generar un procedimiento."
             )
+
+        visuals = source_record.get("video_visuals") or []
+        if visuals:
+            with st.expander("Evidencia visual extraída del video", expanded=False):
+                st.caption(
+                    "Estas capturas se insertarán automáticamente debajo del paso "
+                    "que corresponda en el Word y el PDF."
+                )
+                for visual in visuals[:12]:
+                    st.image(
+                        visual.get("content"),
+                        caption=(
+                            f"{visual.get('action_id', '')} · "
+                            f"{visual.get('timestamp', '')} · "
+                            f"{visual.get('title', '')}"
+                        ),
+                        width=720,
+                    )
+                if len(visuals) > 12:
+                    st.caption(
+                        f"Se muestran 12 de {len(visuals)} capturas. Todas se "
+                        "conservarán para la generación del instructivo."
+                    )
 
     if transcript and transcript.uncertainties:
         with st.expander("Fragmentos que requieren confirmación", expanded=True):
@@ -7200,10 +8032,11 @@ def show_final_document(final_document: FinalDocument) -> None:
     st.subheader("Documento final")
     source_record = st.session_state.get("source_record") or {}
     action_count = int(source_record.get("video_action_count") or 0)
+    visual_count = int(source_record.get("video_visual_count") or 0)
     if action_count:
         st.success(
             f"Cobertura procedimental aplicada: {action_count} acciones "
-            "operativas identificadas en el video."
+            f"y {visual_count} capturas de evidencia visual."
         )
     st.markdown(f"## {final_document.title}")
 
@@ -7213,19 +8046,56 @@ def show_final_document(final_document: FinalDocument) -> None:
     if final_document.introductory_note.strip():
         st.write(final_document.introductory_note)
 
+    visual_map = _visuals_by_action_id(source_record)
     for section in final_document.sections:
-        with st.expander(f"{section.order}. {section.title}", expanded=False):
+        with st.expander(_section_display_title(section), expanded=False):
             for paragraph_text in section.paragraphs:
                 st.write(paragraph_text)
 
-            for index, item in enumerate(section.numbered_items, start=1):
-                step_title, step_body = _split_step_title_body(item)
-                if step_title:
-                    st.markdown(f"**{index}. {step_title.rstrip(':')}:**")
-                    if step_body:
-                        st.write(step_body)
-                else:
-                    st.write(f"{index}. {step_body}")
+            procedure_plan = _procedure_render_plan(section, source_record)
+            if procedure_plan:
+                for group in procedure_plan:
+                    group_index = int(group["group_index"])
+                    st.markdown(
+                        f"### {section.order}.{group_index}. {group['title']}"
+                    )
+                    for plan_item in group["items"]:
+                        global_index = int(plan_item["global_index"])
+                        local_index = int(plan_item["local_index"])
+                        action = plan_item["action"]
+                        if global_index >= len(section.numbered_items):
+                            continue
+                        item = section.numbered_items[global_index]
+                        step_title, step_body = _split_step_title_body(item)
+                        number_label = f"{section.order}.{group_index}.{local_index}"
+                        if step_title:
+                            st.markdown(
+                                f"**{number_label}. {step_title.rstrip(':')}:**"
+                            )
+                            if step_body:
+                                st.write(step_body)
+                        else:
+                            st.write(f"{number_label}. {step_body}")
+                        visual = visual_map.get(action.action_id)
+                        if visual:
+                            st.image(
+                                visual.get("content"),
+                                caption=(
+                                    f"Evidencia visual · {action.action_id} · "
+                                    f"{visual.get('timestamp', action.timestamp_start)}"
+                                ),
+                                width=720,
+                            )
+            else:
+                for index, item in enumerate(section.numbered_items, start=1):
+                    step_title, step_body = _split_step_title_body(item)
+                    number_label = f"{section.order}.{index}"
+                    if step_title:
+                        st.markdown(f"**{number_label}. {step_title.rstrip(':')}:**")
+                        if step_body:
+                            st.write(step_body)
+                    else:
+                        st.write(f"{number_label}. {step_body}")
 
             for bullet in section.bullets:
                 st.write(f"- {bullet}")
@@ -7233,17 +8103,11 @@ def show_final_document(final_document: FinalDocument) -> None:
             for table_data in section.tables:
                 if table_data.title.strip():
                     st.write(f"**{table_data.title}**")
-
                 if table_data.headers and table_data.rows:
                     normalized_rows = []
                     for row in table_data.rows:
-                        padded = list(row) + [""] * (
-                            len(table_data.headers) - len(row)
-                        )
-                        normalized_rows.append(
-                            padded[: len(table_data.headers)]
-                        )
-
+                        padded = list(row) + [""] * (len(table_data.headers) - len(row))
+                        normalized_rows.append(padded[: len(table_data.headers)])
                     st.dataframe(
                         {
                             header: [row[index] for row in normalized_rows]
@@ -7839,8 +8703,21 @@ def main() -> None:
                             action.model_dump() for action in transcript.actions
                         ]
                         source_record["video_action_count"] = len(transcript.actions)
+                        source_record["video_visual_count"] = len(
+                            source_record.get("video_visuals") or []
+                        )
+                        if source_record["video_visual_count"]:
+                            source_record["warnings"].append(
+                                f"Se extrajeron {source_record['video_visual_count']} capturas "
+                                "reales del video para ilustrar el paso a paso."
+                            )
+                        else:
+                            source_record["warnings"].append(
+                                "No fue posible extraer capturas del video. Verifica que "
+                                "ffmpeg esté instalado en packages.txt."
+                            )
 
-                        st.write("4/4 · Video listo para revisión")
+                        st.write("4/4 · Video y evidencia visual listos para revisión")
                         status.update(
                             label="Transcripción lista para revisión",
                             state="complete",
@@ -8245,16 +9122,17 @@ def main() -> None:
                         with st.expander("Ver detalle de la revalidación"):
                             st.code(str(audit_error)[:1600], language=None)
 
-                    st.write("4/5 · Aplicando formato institucional y paginación")
+                    st.write("4/5 · Organizando macroactividades e insertando evidencia visual")
                     docx_output = create_docx(
                         edited_document,
                         style_guide=selected_guide,
+                        source_record=source_record,
                     )
 
-                    st.write("5/5 · Creando la versión PDF")
+                    st.write("5/5 · Aplicando formato institucional y creando la versión PDF")
                     pdf_output = convert_docx_to_pdf(docx_output)
                     if pdf_output is None:
-                        pdf_output = create_pdf(edited_document)
+                        pdf_output = create_pdf(edited_document, source_record=source_record)
 
                     status.update(
                         label="Documento auditado y generado",
