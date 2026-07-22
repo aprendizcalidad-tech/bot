@@ -98,7 +98,7 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v6-unique-step-match"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v7-resumable-low-memory-unique-match"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
 VIDEO_VISUAL_MAX_CAPTURES = 600
@@ -119,6 +119,11 @@ VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE = 10
 VIDEO_VISUAL_REPAIR_DUPLICATES = True
 VIDEO_VISUAL_STRICT_EXACT_MATCH = True
 VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS = 2.2
+VIDEO_VISUAL_DRIVE_SYNC_EVERY = 20
+VIDEO_VISUAL_MANIFEST_SYNC_EVERY = 4
+VIDEO_VISUAL_PREVIEW_LIMIT = 8
+VIDEO_VISUAL_KEEP_BYTES_IN_SESSION = False
+VIDEO_VISUAL_CACHE_DIRECT_UPLOAD = True
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -4013,10 +4018,65 @@ def _visual_manifest_path(checkpoint_id: str) -> Path:
     return _video_visual_dir(checkpoint_id) / "manifest.json"
 
 
+def _visual_content_path(checkpoint_id: str, item: dict) -> Path | None:
+    filename = safe_filename(str(item.get("filename") or ""))
+    if not filename:
+        return None
+    path = _video_visual_dir(checkpoint_id) / filename
+    return path if path.exists() and path.is_file() else None
+
+
+def _visual_bytes(visual: dict | None) -> bytes:
+    """Carga una captura bajo demanda y evita mantener cientos de PNG en sesión."""
+
+    if not isinstance(visual, dict):
+        return b""
+    content = visual.get("content")
+    if isinstance(content, (bytes, bytearray)) and content:
+        return bytes(content)
+
+    candidate_paths = [
+        visual.get("content_path"),
+        visual.get("local_path"),
+    ]
+    for raw_path in candidate_paths:
+        if not raw_path:
+            continue
+        try:
+            path = Path(str(raw_path))
+            if path.exists() and path.is_file():
+                return path.read_bytes()
+        except Exception:
+            continue
+    return b""
+
+
+def _visual_image_source(visual: dict | None):
+    """Fuente compatible con st.image sin copiar bytes al session_state."""
+
+    if not isinstance(visual, dict):
+        return None
+    for key in ("content_path", "local_path"):
+        value = visual.get(key)
+        if value:
+            try:
+                path = Path(str(value))
+                if path.exists() and path.is_file():
+                    return str(path)
+            except Exception:
+                pass
+    content = visual.get("content")
+    if isinstance(content, (bytes, bytearray)) and content:
+        return bytes(content)
+    return None
+
+
 def _load_local_video_visuals(
     checkpoint_id: str,
     actions: list[VideoAction],
 ) -> list[dict]:
+    """Recupera metadatos de capturas sin cargar todas las imágenes en RAM."""
+
     manifest_path = _visual_manifest_path(checkpoint_id)
     if not manifest_path.exists():
         return []
@@ -4025,38 +4085,91 @@ def _load_local_video_visuals(
         if payload.get("version") != VIDEO_VISUAL_CHECKPOINT_VERSION:
             return []
 
-        # La redacción de una acción puede corregirse después de extraer las
-        # capturas. En ese caso cambia la huella textual, pero la evidencia sigue
-        # siendo válida por su posición cronológica y su action_index.
         fingerprint_matches = (
             payload.get("action_fingerprint")
             == _video_visual_action_fingerprint(actions)
         )
         result: list[dict] = []
         for item in payload.get("visuals") or []:
-            filename = safe_filename(str(item.get("filename") or ""))
-            image_path = _video_visual_dir(checkpoint_id) / filename
-            if not filename or not image_path.exists():
+            image_path = _visual_content_path(checkpoint_id, item)
+            if image_path is None:
                 continue
-            content = image_path.read_bytes()
-            if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            try:
+                with image_path.open("rb") as handle:
+                    prefix = handle.read(12)
+            except Exception:
+                continue
+            if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
                 mime_type = "image/png"
-            elif content.startswith(b"\xff\xd8"):
+            elif prefix.startswith(b"\xff\xd8"):
                 mime_type = "image/jpeg"
             else:
                 continue
             result.append(
                 {
                     **item,
-                    "content": content,
+                    "content_path": str(image_path),
                     "mime_type": mime_type,
                     "fingerprint_matches": fingerprint_matches,
                 }
             )
+        result.sort(key=lambda item: int(item.get("action_index") or 0))
         return result
     except Exception:
         return []
 
+
+def _write_visual_manifest(
+    checkpoint_id: str,
+    actions: list[VideoAction],
+    visuals: list[dict],
+    status: str = "partial",
+) -> None:
+    """Guarda progreso visual incremental después de pocos pasos."""
+
+    manifest_visuals = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"content", "content_path", "local_path"}
+        }
+        for item in visuals
+    ]
+    _write_json_atomic(
+        _visual_manifest_path(checkpoint_id),
+        {
+            "version": VIDEO_VISUAL_CHECKPOINT_VERSION,
+            "status": status,
+            "action_fingerprint": _video_visual_action_fingerprint(actions),
+            "action_count": len(actions),
+            "visual_count": len(visuals),
+            "coverage_percent": round(len(visuals) * 100 / max(1, len(actions)), 2),
+            "saved_at_epoch": time.time(),
+            "visuals": manifest_visuals,
+        },
+    )
+
+
+def _cached_direct_upload_video_path(
+    checkpoint_id: str,
+    extension: str,
+) -> Path:
+    suffix = re.sub(r"[^A-Za-z0-9]+", "", extension.lower()) or "mp4"
+    return _checkpoint_root_dir(checkpoint_id) / f"source_video.{suffix}"
+
+
+def _cache_direct_upload_video(
+    local_path: Path,
+    checkpoint_id: str,
+    extension: str,
+) -> Path:
+    target = _cached_direct_upload_video_path(checkpoint_id, extension)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists() or target.stat().st_size != local_path.stat().st_size:
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        shutil.copyfile(local_path, temporary)
+        temporary.replace(target)
+    return target
 
 def _write_visual_bundle_to_drive(checkpoint_id: str, visual_dir: Path) -> bool:
     if not _drive_checkpoint_folder_id() or not visual_dir.exists():
@@ -4610,7 +4723,7 @@ def _prepare_video_visual_evidence(
     checkpoint_id: str,
     progress_callback=None,
 ) -> list[dict]:
-    """Genera una captura recortada y relacionada para cada acción/subpaso."""
+    """Genera capturas reanudables sin guardar cientos de PNG en session_state."""
 
     if not VIDEO_VISUAL_EVIDENCE_ENABLED:
         if progress_callback is not None:
@@ -4624,25 +4737,6 @@ def _prepare_video_visual_evidence(
         if progress_callback is not None:
             progress_callback("No se encontró el identificador de checkpoint para las capturas.")
         return []
-
-    existing = _load_local_video_visuals(checkpoint_id, actions)
-    if len(existing) == len(actions):
-        if progress_callback is not None:
-            progress_callback(
-                f"Evidencia visual recuperada: {len(existing)} de {len(actions)} pasos."
-            )
-        return existing
-
-    if _restore_visual_bundle_from_drive(checkpoint_id):
-        existing = _load_local_video_visuals(checkpoint_id, actions)
-        if len(existing) == len(actions):
-            if progress_callback is not None:
-                progress_callback(
-                    "Evidencia visual completa recuperada desde Drive: "
-                    f"{len(existing)} de {len(actions)} pasos."
-                )
-            return existing
-
     if not shutil.which("ffmpeg"):
         if progress_callback is not None:
             progress_callback(
@@ -4659,16 +4753,33 @@ def _prepare_video_visual_evidence(
         )
 
     visual_dir = _video_visual_dir(checkpoint_id)
-    if visual_dir.exists():
-        shutil.rmtree(visual_dir, ignore_errors=True)
     visual_dir.mkdir(parents=True, exist_ok=True)
-
     duration_seconds = _probe_local_video_duration_seconds(local_path)
-    extracted: list[dict] = []
+
+    recovered = _load_local_video_visuals(checkpoint_id, actions)
+    extracted_by_index: dict[int, dict] = {
+        int(item["action_index"]): item
+        for item in recovered
+        if isinstance(item.get("action_index"), int)
+    }
+    if progress_callback is not None and extracted_by_index:
+        progress_callback(
+            "Reanudando capturas: "
+            f"{len(extracted_by_index)} de {len(actions)} ya estaban guardadas."
+        )
+
     recent_hashes: list[str] = []
     recent_seconds: list[float] = []
+    for index in sorted(extracted_by_index)[-3:]:
+        item = extracted_by_index[index]
+        recent_hashes.append(str(item.get("image_hash") or ""))
+        recent_seconds.append(float(item.get("timestamp_seconds") or 0.0))
 
+    processed_since_sync = 0
     for visual_index, (action_index, action) in enumerate(candidates, start=1):
+        if action_index in extracted_by_index:
+            continue
+
         visual_id = f"VIS-{visual_index:04d}"
         action_id = action.action_id or f"ACC-{action_index + 1:04d}"
         filename = f"{visual_id}_{safe_filename(action_id)}.png"
@@ -4693,27 +4804,38 @@ def _prepare_video_visual_evidence(
                 "title": _build_step_title(action),
                 "filename": path.name,
                 "mime_type": "image/png",
-                "content": path.read_bytes(),
+                "content_path": str(path),
                 "match_strategy": "timestamp_window_visual_quality_unique",
                 **metadata,
             }
-            extracted.append(item)
+            extracted_by_index[action_index] = item
             recent_hashes.append(str(metadata.get("image_hash") or ""))
             recent_seconds.append(second)
+            processed_since_sync += 1
+
+        if processed_since_sync >= VIDEO_VISUAL_MANIFEST_SYNC_EVERY:
+            current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+            _write_visual_manifest(checkpoint_id, actions, current, status="partial")
+            processed_since_sync = 0
+
+        if (
+            _drive_checkpoint_folder_id()
+            and len(extracted_by_index) > 0
+            and len(extracted_by_index) % VIDEO_VISUAL_DRIVE_SYNC_EVERY == 0
+        ):
+            _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
+
         if progress_callback is not None and (
-            visual_index == len(candidates) or visual_index % 8 == 0
+            len(extracted_by_index) == len(actions)
+            or len(extracted_by_index) % 6 == 0
         ):
             progress_callback(
-                "Analizando, recortando y relacionando capturas: "
-                f"{visual_index} de {len(candidates)} pasos."
+                "Extracción reanudable: "
+                f"{len(extracted_by_index)} de {len(actions)} pasos guardados."
             )
 
-    extracted.sort(key=lambda item: int(item.get("action_index") or 0))
-    extracted_by_index = {
-        int(item["action_index"]): item
-        for item in extracted
-        if isinstance(item.get("action_index"), int)
-    }
+    current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+    _write_visual_manifest(checkpoint_id, actions, current, status="partial")
 
     def repair_action(index_to_repair: int, blocked_items: list[dict]) -> dict | None:
         action = actions[index_to_repair]
@@ -4744,7 +4866,7 @@ def _prepare_video_visual_evidence(
             "title": _build_step_title(action),
             "filename": path.name,
             "mime_type": "image/png",
-            "content": path.read_bytes(),
+            "content_path": str(path),
             "match_strategy": "repair_unique_visual_match",
             **metadata,
         }
@@ -4760,99 +4882,68 @@ def _prepare_video_visual_evidence(
         repaired = repair_action(missing_index, [item for item in neighbors if isinstance(item, dict)])
         if repaired:
             extracted_by_index[missing_index] = repaired
+            current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+            _write_visual_manifest(checkpoint_id, actions, current, status="partial")
 
     if VIDEO_VISUAL_REPAIR_DUPLICATES:
         signatures: dict[int, str] = {}
         for idx in sorted(extracted_by_index):
             item = extracted_by_index[idx]
-            signatures[idx] = str(item.get("image_hash") or _visual_hash_from_path(visual_dir / str(item.get("filename"))))
+            path = _visual_content_path(checkpoint_id, item)
+            signatures[idx] = str(
+                item.get("image_hash")
+                or (_visual_hash_from_path(path) if path is not None else "")
+            )
             item["image_hash"] = signatures[idx]
 
-        duplicate_indices: list[int] = []
         ordered_indices = sorted(extracted_by_index)
+        duplicate_indices: list[int] = []
         for position, idx in enumerate(ordered_indices):
             if position == 0:
                 continue
-            current = extracted_by_index[idx]
             previous_idx = ordered_indices[position - 1]
-            previous = extracted_by_index[previous_idx]
             distance = _hash_distance(signatures.get(idx, ""), signatures.get(previous_idx, ""))
-            if distance <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE:
-                if not _actions_are_visually_equivalent(actions[idx], actions[previous_idx]):
-                    duplicate_indices.append(idx)
+            if (
+                distance <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE
+                and not _actions_are_visually_equivalent(actions[idx], actions[previous_idx])
+            ):
+                duplicate_indices.append(idx)
 
         for duplicate_index in duplicate_indices:
-            blocked = []
-            for neighbor in (duplicate_index - 2, duplicate_index - 1, duplicate_index + 1, duplicate_index + 2):
-                item = extracted_by_index.get(neighbor)
-                if isinstance(item, dict):
-                    blocked.append(item)
+            blocked = [
+                extracted_by_index[neighbor]
+                for neighbor in (
+                    duplicate_index - 2,
+                    duplicate_index - 1,
+                    duplicate_index + 1,
+                    duplicate_index + 2,
+                )
+                if neighbor in extracted_by_index
+            ]
             repaired = repair_action(duplicate_index, blocked)
             if repaired:
                 extracted_by_index[duplicate_index] = repaired
+                current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+                _write_visual_manifest(checkpoint_id, actions, current, status="partial")
 
     extracted = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+    status = "complete" if len(extracted) == len(actions) else "partial"
+    _write_visual_manifest(checkpoint_id, actions, extracted, status=status)
+    _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
 
     if VIDEO_VISUAL_REQUIRE_EVERY_STEP and len(extracted) != len(actions):
         raise AppError(
             "Cobertura visual incompleta: se detectaron "
-            f"{len(actions)} acciones y solo se obtuvieron {len(extracted)} capturas. "
-            "No se generará el instructivo hasta garantizar una imagen por paso."
+            f"{len(actions)} acciones y se guardaron {len(extracted)} capturas. "
+            "Vuelve a ejecutar la extracción: continuará solo con los pasos pendientes."
         )
-
-    residual_duplicates: list[str] = []
-    previous_item: dict | None = None
-    previous_action: VideoAction | None = None
-    for item in extracted:
-        idx = int(item.get("action_index") or 0)
-        action = actions[idx]
-        if previous_item is not None and previous_action is not None:
-            distance = _hash_distance(
-                str(item.get("image_hash") or ""),
-                str(previous_item.get("image_hash") or ""),
-            )
-            if distance <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE and not _actions_are_visually_equivalent(action, previous_action):
-                residual_duplicates.append(
-                    f"{previous_action.action_id} y {action.action_id}"
-                )
-        previous_item = item
-        previous_action = action
-
-    if residual_duplicates:
-        raise AppError(
-            "Se detectaron capturas repetidas en acciones diferentes después del proceso de reparación: "
-            + ", ".join(residual_duplicates[:8])
-            + ". Ajusta el video o reintenta la extracción."
-        )
-
-    manifest_visuals = [
-        {key: value for key, value in item.items() if key != "content"}
-        for item in extracted
-    ]
-    _write_json_atomic(
-        _visual_manifest_path(checkpoint_id),
-        {
-            "version": VIDEO_VISUAL_CHECKPOINT_VERSION,
-            "action_fingerprint": _video_visual_action_fingerprint(actions),
-            "action_count": len(actions),
-            "visual_count": len(extracted),
-            "coverage_percent": round(len(extracted) * 100 / max(1, len(actions)), 2),
-            "visuals": manifest_visuals,
-        },
-    )
-    _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
 
     if progress_callback is not None:
-        repair_count = sum(
-            item.get("match_strategy") == "repair_unique_visual_match"
-            for item in extracted
-        )
         progress_callback(
-            "Evidencia visual completa: "
-            f"{len(extracted)} de {len(actions)} pasos con captura; "
-            f"{repair_count} captura(s) reparada(s) para evitar repeticiones."
+            "Evidencia visual completa y guardada: "
+            f"{len(extracted)} de {len(actions)} pasos."
         )
-    return extracted
+    return _load_local_video_visuals(checkpoint_id, actions)
 
 def _interval_is_covered(
     start_seconds: float,
@@ -6003,15 +6094,34 @@ def transcribe_video_with_gemini(
                 ("visual-upload:" + str(video_record.get("fingerprint") or video_record["name"])).encode("utf-8")
             ).hexdigest()
         )
-        visuals = _prepare_video_visual_evidence(
-            local_path=local_path,
-            actions=list(transcript.actions),
-            checkpoint_id=checkpoint_id,
-            progress_callback=progress_callback,
+        cached_path = ""
+        if VIDEO_VISUAL_CACHE_DIRECT_UPLOAD:
+            try:
+                cached_path = str(
+                    _cache_direct_upload_video(
+                        local_path=local_path,
+                        checkpoint_id=checkpoint_id,
+                        extension=video_record.get("extension") or "mp4",
+                    )
+                )
+            except Exception:
+                cached_path = ""
+
+        existing_visuals = _load_local_video_visuals(
+            checkpoint_id,
+            list(transcript.actions),
         )
         video_record["video_checkpoint_id"] = checkpoint_id
-        video_record["video_visuals"] = visuals
-        video_record["video_visual_count"] = len(visuals)
+        video_record["video_cached_path"] = cached_path
+        video_record["video_visuals"] = [
+            {key: value for key, value in item.items() if key != "content"}
+            for item in existing_visuals
+        ]
+        video_record["video_visual_count"] = len(existing_visuals)
+        video_record["video_visual_pending"] = max(
+            0,
+            len(transcript.actions) - len(existing_visuals),
+        )
         return transcript
 
 
@@ -6054,11 +6164,9 @@ def transcribe_drive_video_with_gemini(
             st.session_state.get("video_checkpoint_id")
             or hashlib.sha256(("visual-" + drive_checkpoint_key).encode("utf-8")).hexdigest()
         )
-        visuals = _prepare_video_visual_evidence(
-            local_path=local_path,
-            actions=list(transcript.actions),
-            checkpoint_id=checkpoint_id,
-            progress_callback=progress_callback,
+        existing_visuals = _load_local_video_visuals(
+            checkpoint_id,
+            list(transcript.actions),
         )
 
     source_record = {
@@ -6082,8 +6190,12 @@ def transcribe_drive_video_with_gemini(
         "video_actions": [action.model_dump() for action in transcript.actions],
         "video_action_count": len(transcript.actions),
         "video_checkpoint_id": checkpoint_id,
-        "video_visuals": visuals,
-        "video_visual_count": len(visuals),
+        "video_visuals": [
+            {key: value for key, value in item.items() if key != "content"}
+            for item in existing_visuals
+        ],
+        "video_visual_count": len(existing_visuals),
+        "video_visual_pending": max(0, len(transcript.actions) - len(existing_visuals)),
     }
     return transcript, source_record
 
@@ -7274,21 +7386,10 @@ def _procedure_render_plan(
 def _recover_source_record_visuals(
     source_record: dict | None,
 ) -> list[dict]:
-    """Recupera las capturas aunque el estado de Streamlit haya perdido los bytes."""
+    """Recupera metadatos visuales sin guardar los PNG dentro de la sesión."""
 
     if not source_record:
         return []
-
-    current = [
-        item
-        for item in (source_record.get("video_visuals") or [])
-        if isinstance(item, dict)
-        and isinstance(item.get("content"), (bytes, bytearray))
-        and item.get("content")
-    ]
-    if current:
-        source_record["video_visual_count"] = len(current)
-        return current
 
     checkpoint_id = _clean_action_value(
         source_record.get("video_checkpoint_id")
@@ -7302,11 +7403,18 @@ def _recover_source_record_visuals(
     if not recovered and _restore_visual_bundle_from_drive(checkpoint_id):
         recovered = _load_local_video_visuals(checkpoint_id, actions)
 
-    if recovered:
-        source_record["video_visuals"] = recovered
-        source_record["video_visual_count"] = len(recovered)
+    source_record["video_visual_count"] = len(recovered)
+    source_record["video_visual_pending"] = max(0, len(actions) - len(recovered))
+    # Solo se conservan metadatos ligeros en session_state.
+    source_record["video_visuals"] = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"content", "content_path", "local_path"}
+        }
+        for item in recovered
+    ]
     return recovered
-
 
 def _visuals_by_action_id(source_record: dict | None) -> dict[str, object]:
     """Indexa capturas por ID, índice y lista cronológica completa."""
@@ -7315,8 +7423,7 @@ def _visuals_by_action_id(source_record: dict | None) -> dict[str, object]:
     ordered: list[dict] = []
     for item in _recover_source_record_visuals(source_record):
         action_id = _clean_action_value(item.get("action_id"))
-        content = item.get("content")
-        if not isinstance(content, (bytes, bytearray)) or not content:
+        if not _visual_bytes(item):
             continue
         ordered.append(item)
         if action_id:
@@ -7399,22 +7506,40 @@ def _ensure_visuals_from_original_video(
                 progress_callback=progress_callback,
             )
     else:
-        content = source_record.get("content")
-        extension = _clean_action_value(source_record.get("extension")) or "mp4"
-        if not isinstance(content, (bytes, bytearray)) or not content:
-            return []
-        with tempfile.TemporaryDirectory() as temp_dir:
-            local_path = Path(temp_dir) / f"video_origen.{extension}"
-            local_path.write_bytes(bytes(content))
+        cached_path = _clean_action_value(source_record.get("video_cached_path"))
+        cached = Path(cached_path) if cached_path else None
+        if cached is not None and cached.exists() and cached.is_file():
             visuals = _prepare_video_visual_evidence(
-                local_path=local_path,
+                local_path=cached,
                 actions=actions,
                 checkpoint_id=checkpoint_id,
                 progress_callback=progress_callback,
             )
+        else:
+            content = source_record.get("content")
+            extension = _clean_action_value(source_record.get("extension")) or "mp4"
+            if not isinstance(content, (bytes, bytearray)) or not content:
+                return []
+            with tempfile.TemporaryDirectory() as temp_dir:
+                local_path = Path(temp_dir) / f"video_origen.{extension}"
+                local_path.write_bytes(bytes(content))
+                visuals = _prepare_video_visual_evidence(
+                    local_path=local_path,
+                    actions=actions,
+                    checkpoint_id=checkpoint_id,
+                    progress_callback=progress_callback,
+                )
 
-    source_record["video_visuals"] = visuals
+    source_record["video_visuals"] = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"content", "content_path", "local_path"}
+        }
+        for item in visuals
+    ]
     source_record["video_visual_count"] = len(visuals)
+    source_record["video_visual_pending"] = max(0, len(actions) - len(visuals))
     return visuals
 
 def add_safe_subheading(document: Document, text: str):
@@ -7566,14 +7691,14 @@ def _visual_bytes_to_png(content: bytes, filename: str = "") -> bytes:
 def add_docx_visual(document: Document, visual: dict) -> object:
     """Inserta una captura normalizada y reporta el tipo real del error."""
 
-    content = visual.get("content") if isinstance(visual, dict) else None
-    if not isinstance(content, (bytes, bytearray)) or not content:
+    content = _visual_bytes(visual if isinstance(visual, dict) else None)
+    if not content:
         raise AppError(
             "La captura relacionada con el paso no contiene bytes de imagen válidos."
         )
 
     filename = str(visual.get("filename") or "sin nombre")
-    normalized_png = _visual_bytes_to_png(bytes(content), filename)
+    normalized_png = _visual_bytes_to_png(content, filename)
 
     try:
         paragraph = document.add_paragraph()
@@ -7599,12 +7724,12 @@ def add_docx_visual(document: Document, visual: dict) -> object:
 
 
 def _reportlab_visual(visual: dict, available_width: float):
-    content = visual.get("content") if isinstance(visual, dict) else None
-    if not isinstance(content, (bytes, bytearray)) or not content:
+    content = _visual_bytes(visual if isinstance(visual, dict) else None)
+    if not content:
         return None
     try:
         png = _visual_bytes_to_png(
-            bytes(content),
+            content,
             str(visual.get("filename") or ""),
         )
         image = RLImage(BytesIO(png))
@@ -8558,16 +8683,16 @@ def show_video_transcript_review(source_record: dict) -> str | None:
                 "antes de generar un procedimiento."
             )
 
-        visuals = source_record.get("video_visuals") or []
+        visuals = _recover_source_record_visuals(source_record)
         if visuals:
             with st.expander("Evidencia visual extraída del video", expanded=False):
                 st.caption(
                     "Estas capturas se insertarán automáticamente debajo del paso "
                     "que corresponda en el Word y el PDF."
                 )
-                for visual in visuals[:12]:
+                for visual in visuals[:VIDEO_VISUAL_PREVIEW_LIMIT]:
                     st.image(
-                        visual.get("content"),
+                        _visual_image_source(visual),
                         caption=(
                             f"{visual.get('action_id', '')} · "
                             f"{visual.get('timestamp', '')} · "
@@ -8575,9 +8700,9 @@ def show_video_transcript_review(source_record: dict) -> str | None:
                         ),
                         width=720,
                     )
-                if len(visuals) > 12:
+                if len(visuals) > VIDEO_VISUAL_PREVIEW_LIMIT:
                     st.caption(
-                        f"Se muestran 12 de {len(visuals)} capturas. Todas se "
+                        f"Se muestran {VIDEO_VISUAL_PREVIEW_LIMIT} de {len(visuals)} capturas. Todas se "
                         "conservarán para la generación del instructivo."
                     )
 
@@ -8585,6 +8710,55 @@ def show_video_transcript_review(source_record: dict) -> str | None:
         with st.expander("Fragmentos que requieren confirmación", expanded=True):
             for uncertainty in transcript.uncertainties:
                 st.warning(uncertainty)
+
+    action_total = len(transcript.actions) if transcript else 0
+    visual_total = int(source_record.get("video_visual_count") or 0)
+    if transcript and action_total and visual_total < action_total:
+        st.info(
+            "La transcripción ya quedó guardada. La evidencia visual se procesa "
+            "en una fase separada para evitar que un reinicio borre el avance."
+        )
+        extract_visuals_clicked = st.button(
+            f"Extraer o reanudar capturas ({visual_total}/{action_total})",
+            type="secondary",
+            width="stretch",
+            key=f"resume_visuals_{st.session_state.upload_key}",
+        )
+        if extract_visuals_clicked:
+            try:
+                with st.status("Extrayendo evidencia visual...", expanded=True) as visual_status:
+                    progress_slot = st.empty()
+
+                    def visual_progress(message: str) -> None:
+                        progress_slot.write(message)
+
+                    recovered_visuals = _ensure_visuals_from_original_video(
+                        source_record,
+                        progress_callback=visual_progress,
+                    )
+                    source_record["video_visual_count"] = len(recovered_visuals)
+                    source_record["video_visual_pending"] = max(
+                        0,
+                        action_total - len(recovered_visuals),
+                    )
+                    st.session_state.source_record = source_record
+                    visual_status.update(
+                        label=(
+                            "Evidencia visual completa"
+                            if len(recovered_visuals) == action_total
+                            else "Avance visual guardado"
+                        ),
+                        state="complete",
+                        expanded=False,
+                    )
+                st.success(
+                    f"Capturas guardadas: {len(recovered_visuals)} de {action_total}."
+                )
+                st.rerun()
+            except AppError as error:
+                show_error_panel("No fue posible completar las capturas.", error)
+            except Exception as error:
+                show_error_panel("La extracción visual se interrumpió.", error)
 
     editor_key = f"video_source_editor_{st.session_state.upload_key}"
     edited_text = st.text_area(
@@ -9164,7 +9338,7 @@ def show_final_document(final_document: FinalDocument) -> None:
                         visual = _visual_for_action(visual_map, action, global_index)
                         if visual:
                             st.image(
-                                visual.get("content"),
+                                _visual_image_source(visual),
                                 caption=(
                                     f"Evidencia visual · {action.action_id} · "
                                     f"{visual.get('timestamp', action.timestamp_start)}"
@@ -9788,8 +9962,11 @@ def main() -> None:
                             action.model_dump() for action in transcript.actions
                         ]
                         source_record["video_action_count"] = len(transcript.actions)
-                        source_record["video_visual_count"] = len(
-                            source_record.get("video_visuals") or []
+                        recovered_visuals = _recover_source_record_visuals(source_record)
+                        source_record["video_visual_count"] = len(recovered_visuals)
+                        source_record["video_visual_pending"] = max(
+                            0,
+                            len(transcript.actions) - len(recovered_visuals),
                         )
                         if source_record["video_visual_count"]:
                             source_record["warnings"].append(
@@ -9804,9 +9981,9 @@ def main() -> None:
                                 "esté instalado en packages.txt."
                             )
 
-                        st.write("4/4 · Video y evidencia visual listos para revisión")
+                        st.write("4/4 · Transcripción guardada; las capturas se procesan por separado")
                         status.update(
-                            label="Transcripción lista para revisión",
+                            label="Transcripción guardada para revisión",
                             state="complete",
                             expanded=False,
                         )
@@ -10218,8 +10395,19 @@ def main() -> None:
                         source_record,
                         progress_callback=visual_progress,
                     )
-                    source_record["video_visuals"] = visuals_ready
+                    source_record["video_visuals"] = [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key not in {"content", "content_path", "local_path"}
+                        }
+                        for item in visuals_ready
+                    ]
                     source_record["video_visual_count"] = len(visuals_ready)
+                    source_record["video_visual_pending"] = max(
+                        0,
+                        len(_source_video_actions(source_record)) - len(visuals_ready),
+                    )
                     st.session_state.source_record = source_record
 
                     if source_record.get("is_video") and not visuals_ready:
