@@ -7472,11 +7472,13 @@ def _ensure_visuals_from_original_video(
     source_record: dict,
     progress_callback=None,
 ) -> list[dict]:
-    """Repara automáticamente capturas ausentes sin repetir el análisis de Gemini."""
+    """Recupera o completa las capturas sin repetir la transcripción.
 
-    recovered = _recover_source_record_visuals(source_record)
-    if recovered:
-        return recovered
+    Un checkpoint parcial no se considera terminado. La versión anterior
+    devolvía inmediatamente cualquier lista no vacía; por eso, si existían
+    304 de 338 capturas, el botón de reanudación y la generación usaban solo
+    esas 304 y nunca procesaban las 34 pendientes.
+    """
 
     actions = _source_video_actions(source_record)
     checkpoint_id = _clean_action_value(
@@ -7485,6 +7487,17 @@ def _ensure_visuals_from_original_video(
     )
     if not actions or not checkpoint_id:
         return []
+
+    recovered = _recover_source_record_visuals(source_record)
+    if len(recovered) == len(actions):
+        return recovered
+
+    if progress_callback is not None and recovered:
+        progress_callback(
+            "Checkpoint visual parcial recuperado: "
+            f"{len(recovered)} de {len(actions)} capturas. "
+            "Se procesarán únicamente las pendientes."
+        )
 
     origin_kind = _clean_action_value(source_record.get("origin_kind")).casefold()
     reference = _clean_action_value(
@@ -8719,7 +8732,7 @@ def show_video_transcript_review(source_record: dict) -> str | None:
             "en una fase separada para evitar que un reinicio borre el avance."
         )
         extract_visuals_clicked = st.button(
-            f"Extraer o reanudar capturas ({visual_total}/{action_total})",
+            f"Completar capturas pendientes ({visual_total}/{action_total})",
             type="secondary",
             width="stretch",
             key=f"resume_visuals_{st.session_state.upload_key}",
@@ -10417,6 +10430,19 @@ def main() -> None:
                             "se detuvo para no entregar un instructivo sin imágenes. "
                             f"FFmpeg: {ffmpeg_path}. Revisa packages.txt, el acceso "
                             "al video de Drive y los mensajes del paso 4/5."
+                        )
+
+                    expected_visuals = len(_source_video_actions(source_record))
+                    if (
+                        source_record.get("is_video")
+                        and expected_visuals
+                        and len(visuals_ready) != expected_visuals
+                    ):
+                        raise AppError(
+                            "La evidencia visual todavía está incompleta: "
+                            f"{len(visuals_ready)} de {expected_visuals} capturas. "
+                            "El avance quedó guardado. Vuelve a ejecutar la extracción "
+                            "o la generación para continuar únicamente con las pendientes."
                         )
 
                     st.write(
