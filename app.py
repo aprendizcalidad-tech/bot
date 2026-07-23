@@ -133,6 +133,14 @@ VIDEO_VISUAL_ALIGNMENT_TIME_TOLERANCE_SECONDS = 3.0
 VIDEO_VISUAL_ALIGNMENT_SECOND_PASS_CONTEXT_SECONDS = 90
 VIDEO_VISUAL_ALIGNMENT_MAX_OUTPUT_TOKENS = 16384
 VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY = 1
+# Política de cobertura: una pantalla estática puede demostrar varias acciones
+# consecutivas. Cuando Gemini comprobó semánticamente cada acción, una imagen
+# idéntica no se elimina solo por repetirse; primero se valida que corresponda al
+# mismo sistema y que no sea reunión, Alt+Tab ni transición.
+VIDEO_VISUAL_ALLOW_SHARED_SEMANTIC_EVIDENCE = True
+VIDEO_VISUAL_SHARED_STATE_MAX_DELTA_SECONDS = 12.0
+VIDEO_VISUAL_SEMANTIC_FALLBACK_LEVELS = 3
+VIDEO_VISUAL_EXTRACTION_POLICY_VERSION = "semantic-coverage-v3"
 VIDEO_VISUAL_DRIVE_SYNC_EVERY = 20
 VIDEO_VISUAL_MANIFEST_SYNC_EVERY = 4
 VIDEO_VISUAL_PREVIEW_LIMIT = 8
@@ -5771,6 +5779,7 @@ def _action_candidate_seconds(
     duration_seconds: float | None,
     preferred_override: float | None = None,
     semantic_strict: bool = False,
+    semantic_fallback_level: int = 0,
 ) -> list[float]:
     """Genera candidatos alrededor del tiempo comprobado semánticamente."""
 
@@ -5789,17 +5798,19 @@ def _action_candidate_seconds(
     anchor = preferred
 
     if semantic_strict:
-        # La auditoría de video ya ubicó la acción. Solo se explora una vecindad
-        # corta para evitar que la optimización de nitidez salte a otra pantalla.
-        candidates = [
-            anchor,
-            anchor + 0.30,
-            anchor - 0.30,
-            anchor + 0.65,
-            anchor - 0.65,
-            anchor + 1.05,
-            anchor - 1.05,
-        ]
+        # La primera pasada permanece muy cerca del instante comprobado. Las
+        # pasadas de rescate amplían gradualmente la ventana, pero nunca regresan
+        # a la búsqueda cronológica genérica de la versión antigua.
+        if semantic_fallback_level <= 0:
+            offsets = [0.0, 0.30, -0.30, 0.65, -0.65, 1.05, -1.05]
+        elif semantic_fallback_level == 1:
+            offsets = [0.0, 0.18, -0.18, 0.45, -0.45, 0.90, -0.90, 1.60, -1.60]
+        else:
+            offsets = [
+                0.0, 0.12, -0.12, 0.35, -0.35, 0.75, -0.75,
+                1.40, -1.40, 2.20, -2.20, 3.20, -3.20,
+            ]
+        candidates = [anchor + offset for offset in offsets]
     elif category in {"click", "select", "open", "search", "register"}:
         candidates = [anchor, anchor + 0.8, anchor - 0.6, anchor + 1.7]
     elif category in {"save", "download", "attach", "validate"}:
@@ -5865,6 +5876,116 @@ def _actions_are_visually_equivalent(action_a: VideoAction, action_b: VideoActio
     )
 
 
+def _semantic_alignment_system_key(action: VideoAction, alignment: dict | None) -> str:
+    """Sistema realmente comprobado para decidir si una captura repetida es válida."""
+
+    observed = ""
+    if isinstance(alignment, dict):
+        observed = _normalized_action_key(str(alignment.get("observed_system") or ""))
+    if observed:
+        return observed
+
+    expected = _normalized_action_key(action.system)
+    if expected:
+        return expected
+    return _procedure_system_key(action)
+
+
+def _semantic_duplicate_can_be_shared(
+    actions: list[VideoAction],
+    alignments: dict[str, dict],
+    first_index: int,
+    second_index: int,
+    first_visual: dict,
+    second_visual: dict,
+) -> bool:
+    """Permite evidencia idéntica cuando representa un estado estático válido.
+
+    El error anterior eliminaba toda imagen repetida, incluso cuando varias
+    acciones consecutivas ocurrían sobre la misma pantalla sin un cambio visual.
+    Eso producía un ciclo permanente: se extraía la captura, se eliminaba y en el
+    siguiente rerun se volvía a obtener exactamente la misma imagen.
+    """
+
+    if not VIDEO_VISUAL_ALLOW_SHARED_SEMANTIC_EVIDENCE:
+        return False
+    if not (0 <= first_index < len(actions) and 0 <= second_index < len(actions)):
+        return False
+
+    first_action = actions[first_index]
+    second_action = actions[second_index]
+    first_alignment = alignments.get(first_action.action_id)
+    second_alignment = alignments.get(second_action.action_id)
+    if not (
+        _visual_alignment_item_is_trusted(first_alignment)
+        and _visual_alignment_item_is_trusted(second_alignment)
+    ):
+        return False
+
+    first_system = _semantic_alignment_system_key(first_action, first_alignment)
+    second_system = _semantic_alignment_system_key(second_action, second_alignment)
+    if first_system and second_system and first_system != second_system:
+        return False
+
+    # Las banderas de rechazo ya forman parte de _visual_alignment_item_is_trusted,
+    # pero se vuelven a comprobar para proteger manifiestos antiguos.
+    for alignment in (first_alignment, second_alignment):
+        if not isinstance(alignment, dict):
+            return False
+        if any(
+            bool(alignment.get(flag))
+            for flag in (
+                "meeting_only_or_recursive",
+                "task_switcher_visible",
+                "transition_frame",
+            )
+        ):
+            return False
+
+    first_time = float(
+        (first_alignment or {}).get("timestamp_seconds")
+        or first_visual.get("timestamp_seconds")
+        or 0.0
+    )
+    second_time = float(
+        (second_alignment or {}).get("timestamp_seconds")
+        or second_visual.get("timestamp_seconds")
+        or 0.0
+    )
+    time_delta = abs(first_time - second_time)
+
+    # Para acciones cercanas, la pantalla puede permanecer literalmente idéntica.
+    # Para acciones lejanas se permite únicamente si Gemini comprobó el mismo
+    # sistema y el mismo estado visible en ambos instantes.
+    if time_delta <= VIDEO_VISUAL_SHARED_STATE_MAX_DELTA_SECONDS:
+        return True
+
+    first_observed_element = _normalized_action_key(
+        str((first_alignment or {}).get("observed_element") or "")
+    )
+    second_observed_element = _normalized_action_key(
+        str((second_alignment or {}).get("observed_element") or "")
+    )
+    return bool(
+        first_system
+        and first_system == second_system
+        and first_observed_element
+        and second_observed_element
+    )
+
+
+def _mark_shared_semantic_evidence(
+    visual: dict,
+    other_action_id: str,
+) -> None:
+    shared = list(visual.get("shared_semantic_evidence_with") or [])
+    if other_action_id and other_action_id not in shared:
+        shared.append(other_action_id)
+    visual["shared_semantic_evidence"] = True
+    visual["shared_semantic_evidence_with"] = shared
+    visual["duplicate_policy"] = "accepted_semantic_static_state"
+
+
 def _expand_candidate_seconds(
     base: list[float],
     duration_seconds: float | None,
@@ -5905,6 +6026,7 @@ def _extract_best_action_visual(
     preferred_second: float | None = None,
     semantic_strict: bool = False,
     semantic_bbox: tuple[float, float, float, float] | None = None,
+    semantic_fallback_level: int = 0,
 ) -> dict | None:
     """Extrae el mejor fotograma sin abandonar el instante validado por Gemini."""
 
@@ -5915,6 +6037,7 @@ def _extract_best_action_visual(
         duration_seconds,
         preferred_override=preferred_second,
         semantic_strict=semantic_strict,
+        semantic_fallback_level=semantic_fallback_level,
     )
     if not base_candidates:
         return None
@@ -6111,6 +6234,7 @@ def _prepare_video_visual_evidence(
             "match_strategy": strategy,
             "semantic_valid": True,
             "semantic_alignment_version": VIDEO_VISUAL_ALIGNMENT_VERSION,
+            "visual_extraction_policy_version": VIDEO_VISUAL_EXTRACTION_POLICY_VERSION,
             "semantic_confidence": float(alignment.get("confidence") or 0.0),
             "semantic_observed_system": alignment.get("observed_system") or "",
             "semantic_observed_element": alignment.get("observed_element") or "",
@@ -6125,6 +6249,7 @@ def _prepare_video_visual_evidence(
         action_index: int,
         blocked_items: list[dict],
         strategy: str,
+        fallback_level: int = 0,
     ) -> dict | None:
         action = actions[action_index]
         alignment = alignments.get(action.action_id)
@@ -6163,6 +6288,7 @@ def _prepare_video_visual_evidence(
             preferred_second=preferred_second,
             semantic_strict=True,
             semantic_bbox=semantic_bbox,
+            semantic_fallback_level=fallback_level,
         )
         if not metadata or not path.exists():
             return None
@@ -6190,7 +6316,17 @@ def _prepare_video_visual_evidence(
             action_index,
             blocked_items=blocked_items,
             strategy="semantic_video_alignment_exact_frame",
+            fallback_level=0,
         )
+        if item is None:
+            # Una acción puede ocurrir a pocos milisegundos de otra. Los tiempos
+            # cercanos no deben impedir extraer una evidencia semánticamente válida.
+            item = extract_for_action(
+                action_index,
+                blocked_items=[],
+                strategy="semantic_exact_frame_unblocked",
+                fallback_level=1,
+            )
         if item:
             extracted_by_index[action_index] = item
             all_hashes.append(str(item.get("image_hash") or ""))
@@ -6232,8 +6368,43 @@ def _prepare_video_visual_evidence(
     ]
     _write_visual_manifest(checkpoint_id, actions, current, status="partial")
 
-    # Repara duplicados adyacentes y duplicados físicos globales. No se acepta la
-    # misma captura para dos acciones distintas aunque estén separadas en el Word.
+    # Pasada de cobertura: cualquier acción con alineación confiable debe tener
+    # una oportunidad final sin bloqueos por tiempo o hash. Esto evita que una
+    # pantalla estática deje el proceso atrapado permanentemente en X/Y.
+    missing_after_primary = [
+        index
+        for index in range(len(actions))
+        if index not in extracted_by_index
+        and _visual_alignment_item_is_trusted(
+            alignments.get(actions[index].action_id)
+        )
+    ]
+    for missing_index in missing_after_primary:
+        recovered_item = None
+        for fallback_level in range(1, VIDEO_VISUAL_SEMANTIC_FALLBACK_LEVELS):
+            recovered_item = extract_for_action(
+                missing_index,
+                blocked_items=[],
+                strategy=f"semantic_coverage_repair_pass_{fallback_level}",
+                fallback_level=fallback_level,
+            )
+            if recovered_item is not None:
+                break
+        if recovered_item is not None:
+            extracted_by_index[missing_index] = recovered_item
+            current = [
+                extracted_by_index[index]
+                for index in sorted(extracted_by_index)
+            ]
+            _write_visual_manifest(
+                checkpoint_id,
+                actions,
+                current,
+                status="partial",
+            )
+
+    # Repara duplicados únicamente cuando la repetición contradice la auditoría
+    # semántica. Una pantalla estática comprobada puede documentar varias acciones.
     if VIDEO_VISUAL_REPAIR_DUPLICATES:
         signatures: dict[int, str] = {}
         for idx in sorted(extracted_by_index):
@@ -6278,6 +6449,23 @@ def _prepare_video_visual_evidence(
                     <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE
                 )
                 if exact_physical_duplicate or near_adjacent_duplicate:
+                    if _semantic_duplicate_can_be_shared(
+                        actions=actions,
+                        alignments=alignments,
+                        first_index=previous_idx,
+                        second_index=idx,
+                        first_visual=extracted_by_index[previous_idx],
+                        second_visual=extracted_by_index[idx],
+                    ):
+                        _mark_shared_semantic_evidence(
+                            extracted_by_index[previous_idx],
+                            actions[idx].action_id,
+                        )
+                        _mark_shared_semantic_evidence(
+                            extracted_by_index[idx],
+                            actions[previous_idx].action_id,
+                        )
+                        continue
                     duplicate_indices.append(idx)
                     break
 
@@ -6291,6 +6479,7 @@ def _prepare_video_visual_evidence(
                 duplicate_index,
                 blocked_items=blocked[-40:],
                 strategy="semantic_duplicate_repair",
+                fallback_level=2,
             )
             if repaired:
                 repaired_hash = str(repaired.get("image_hash") or "")
@@ -6320,6 +6509,23 @@ def _prepare_video_visual_evidence(
                         <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE
                     )
                     if exact_physical_duplicate or near_adjacent_duplicate:
+                        if _semantic_duplicate_can_be_shared(
+                            actions=actions,
+                            alignments=alignments,
+                            first_index=previous_index,
+                            second_index=duplicate_index,
+                            first_visual=previous_item,
+                            second_visual=repaired,
+                        ):
+                            _mark_shared_semantic_evidence(
+                                previous_item,
+                                actions[duplicate_index].action_id,
+                            )
+                            _mark_shared_semantic_evidence(
+                                repaired,
+                                actions[previous_index].action_id,
+                            )
+                            continue
                         still_duplicate = True
                         break
                 if not still_duplicate:
@@ -6345,6 +6551,26 @@ def _prepare_video_visual_evidence(
                 current,
                 status="partial",
             )
+
+    # Último rescate determinista. Solo se aplica a acciones cuya auditoría
+    # semántica ya fue aprobada; no se usa como respaldo cronológico genérico.
+    final_missing_trusted = [
+        index
+        for index in range(len(actions))
+        if index not in extracted_by_index
+        and _visual_alignment_item_is_trusted(
+            alignments.get(actions[index].action_id)
+        )
+    ]
+    for missing_index in final_missing_trusted:
+        item = extract_for_action(
+            missing_index,
+            blocked_items=[],
+            strategy="semantic_final_coverage_rescue",
+            fallback_level=2,
+        )
+        if item is not None:
+            extracted_by_index[missing_index] = item
 
     extracted = [
         extracted_by_index[index]
@@ -6376,11 +6602,14 @@ def _prepare_video_visual_evidence(
             if index not in extracted_by_index
         ]
         raise AppError(
-            "Cobertura visual precisa incompleta: se detectaron "
+            "Cobertura visual precisa incompleta después de todas las pasadas de "
+            "rescate: se detectaron "
             f"{len(actions)} acciones y se guardaron {len(extracted)} capturas "
             "semánticamente válidas. Pendientes: "
             + ", ".join(missing_ids[:12])
-            + ". Vuelve a ejecutar la extracción; continuará solo con esos pasos."
+            + ". El avance quedó guardado. Revisa el registro del despliegue si "
+            "alguno continúa pendiente, porque ya no se elimina evidencia válida "
+            "solo por mostrar una pantalla estática repetida."
         )
 
     if progress_callback is not None:
