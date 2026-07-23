@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 import zipfile
+import unicodedata
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
@@ -98,8 +100,8 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v8-semantic-video-alignment"
-VIDEO_VISUAL_ALIGNMENT_VERSION = "semantic-alignment-v1"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v9-semantic-verified-unicode-safe"
+VIDEO_VISUAL_ALIGNMENT_VERSION = "semantic-alignment-v2"
 VIDEO_VISUAL_ALIGNMENT_FILENAME = "semantic_alignment.json"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
@@ -114,20 +116,20 @@ VIDEO_VISUAL_FFMPEG_WORKERS = 2
 VIDEO_VISUAL_REQUIRE_EVERY_STEP = True
 VIDEO_VISUAL_SMART_CROP_ENABLED = True
 VIDEO_VISUAL_MAX_SAFE_ACTIONS = 600
-VIDEO_VISUAL_CANDIDATE_RETRIES = 7
+VIDEO_VISUAL_CANDIDATE_RETRIES = 9
 VIDEO_VISUAL_EARLY_ACCEPT_SCORE = 52.0
 VIDEO_VISUAL_HASH_SIZE = 16
 VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE = 2
 VIDEO_VISUAL_GLOBAL_DUPLICATE_HASH_DISTANCE = 0
 VIDEO_VISUAL_REPAIR_DUPLICATES = True
 VIDEO_VISUAL_STRICT_EXACT_MATCH = True
-VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS = 10.0
+VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS = 4.0
 VIDEO_ACTION_DUPLICATE_LOOKBACK = 5
 VIDEO_VISUAL_ALIGNMENT_ENABLED = True
-VIDEO_VISUAL_ALIGNMENT_MIN_CONFIDENCE = 0.68
-VIDEO_VISUAL_ALIGNMENT_BATCH_ACTIONS = 18
-VIDEO_VISUAL_ALIGNMENT_CONTEXT_SECONDS = 24
-VIDEO_VISUAL_ALIGNMENT_SECOND_PASS_CONTEXT_SECONDS = 65
+VIDEO_VISUAL_ALIGNMENT_MIN_CONFIDENCE = 0.76
+VIDEO_VISUAL_ALIGNMENT_BATCH_ACTIONS = 10
+VIDEO_VISUAL_ALIGNMENT_CONTEXT_SECONDS = 35
+VIDEO_VISUAL_ALIGNMENT_SECOND_PASS_CONTEXT_SECONDS = 90
 VIDEO_VISUAL_ALIGNMENT_MAX_OUTPUT_TOKENS = 16384
 VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY = 1
 VIDEO_VISUAL_DRIVE_SYNC_EVERY = 20
@@ -148,6 +150,15 @@ MAX_TOTAL_TEXT_CHARS = 1_400_000
 MIN_ACTION_TEXT_CHARS = 12
 MAX_TOTAL_UPLOAD_MB = 300
 MAX_TOTAL_UPLOAD_BYTES = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
+# Límite conservador para una sola carga a Gemini Files API. Los videos más
+# grandes deben dividirse o comprimirse antes de enviarse; el bot informa el
+# límite de manera controlada y conserva los checkpoints existentes.
+GEMINI_FILE_API_MAX_BYTES = 1_950_000_000
+GEMINI_UPLOAD_RETRIES = 2
+VIDEO_MEDIA_PREFLIGHT_ENABLED = True
+VIDEO_LARGE_FILE_THRESHOLD_BYTES = 1024 * 1024 * 1024
+VIDEO_LARGE_FILE_PROCESSING_TIMEOUT_SECONDS = 7200
+DRIVE_LARGE_FILE_DOWNLOAD_TIMEOUT_SECONDS = 7200
 
 STATUS_LABELS = {
     "completo": "Completo",
@@ -624,10 +635,145 @@ def extract_drive_file_id(reference: str) -> str:
     )
 
 
-def safe_filename(filename: str) -> str:
-    """Evita utilizar rutas incluidas en el nombre del archivo."""
+def _unicode_safe_text(value: object) -> str:
+    """Normaliza Unicode y elimina caracteres que rompen XML, JSON o rutas."""
 
-    return Path(filename).name
+    raw = unicodedata.normalize("NFC", str(value or ""))
+    cleaned: list[str] = []
+    for character in raw:
+        codepoint = ord(character)
+        if character in {"\t", "\n", "\r"}:
+            cleaned.append(character)
+        elif codepoint == 0 or 0xD800 <= codepoint <= 0xDFFF:
+            continue
+        elif codepoint < 32 or 0x7F <= codepoint <= 0x9F:
+            continue
+        else:
+            cleaned.append(character)
+    return "".join(cleaned)
+
+
+def safe_filename(filename: str) -> str:
+    """Evita rutas incrustadas y conserva nombres Unicode válidos."""
+
+    value = _unicode_safe_text(filename).replace("\\", "/")
+    name = value.rsplit("/", 1)[-1].strip().strip(".")
+    return name or "archivo"
+
+
+def _ascii_safe_token(value: object, fallback: str = "archivo", limit: int = 64) -> str:
+    """Genera un componente ASCII para librerías que usan cabeceras HTTP ASCII."""
+
+    normalized = unicodedata.normalize("NFKD", _unicode_safe_text(value))
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_value = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_value).strip("._-")
+    return (ascii_value[:limit].strip("._-") or fallback)
+
+
+def _ascii_safe_media_filename(
+    display_name: str,
+    extension: str,
+    identity: str = "",
+) -> str:
+    """Crea un alias estable y ASCII sin perder la extensión multimedia."""
+
+    original = safe_filename(display_name)
+    stem = Path(original).stem
+    suffix = re.sub(r"[^A-Za-z0-9]+", "", str(extension or "").lower())
+    if not suffix:
+        suffix = re.sub(r"[^A-Za-z0-9]+", "", Path(original).suffix.lstrip(".").lower())
+    suffix = suffix or "bin"
+    digest_source = f"{original}|{identity}|{suffix}"
+    digest = hashlib.sha256(digest_source.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"{_ascii_safe_token(stem, 'media', 48)}_{digest}.{suffix}"
+
+
+@contextmanager
+def _gemini_ascii_upload_path(local_path: Path, display_name: str = ""):
+    """Expone el archivo mediante una ruta ASCII sin duplicar videos grandes.
+
+    Algunas versiones de clientes HTTP convierten el nombre del archivo en una
+    cabecera ASCII. Un nombre como ``Grabación ...mp4`` puede producir
+    ``UnicodeEncodeError`` antes de que Gemini reciba el contenido. Se crea un
+    alias temporal ASCII mediante enlace duro; si no es posible, se usa enlace
+    simbólico y solo como último recurso se copia el archivo.
+    """
+
+    source = Path(local_path)
+    if not source.exists() or not source.is_file():
+        raise AppError("El archivo temporal que se enviará a Gemini no existe.")
+
+    extension = file_extension(source.name) or file_extension(display_name) or "bin"
+    alias_name = _ascii_safe_media_filename(
+        display_name or source.name,
+        extension,
+        identity=f"{source.stat().st_size}:{source.resolve()}",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="gemini_media_") as alias_dir:
+        alias = Path(alias_dir) / alias_name
+        strategy = "hardlink"
+        try:
+            os.link(source, alias)
+        except Exception:
+            strategy = "symlink"
+            try:
+                alias.symlink_to(source.resolve())
+            except Exception:
+                strategy = "copy"
+                shutil.copyfile(source, alias)
+
+        if not alias.exists() or alias.stat().st_size != source.stat().st_size:
+            raise AppError("No fue posible preparar una ruta segura para cargar el archivo.")
+        try:
+            str(alias).encode("ascii")
+        except UnicodeEncodeError as error:
+            raise AppError(
+                "No fue posible construir una ruta ASCII temporal para Gemini."
+            ) from error
+
+        yield alias, strategy
+
+
+def _upload_gemini_file_with_retries(
+    client,
+    local_path: Path,
+    display_name: str,
+    progress_callback=None,
+    purpose: str = "video",
+):
+    """Carga un archivo con alias ASCII y reintentos de red controlados."""
+
+    last_error: Exception | None = None
+    with _gemini_ascii_upload_path(local_path, display_name) as (upload_path, strategy):
+        if progress_callback is not None:
+            progress_callback(
+                f"Preparando {purpose} con nombre compatible ({strategy}); "
+                "el nombre original se conserva en el documento."
+            )
+        for attempt in range(GEMINI_UPLOAD_RETRIES):
+            try:
+                return client.files.upload(file=str(upload_path))
+            except Exception as error:
+                last_error = error
+                message = str(error).lower()
+                unicode_failure = (
+                    isinstance(error, UnicodeEncodeError)
+                    or "ascii" in message and "encode" in message
+                    or "codec can't encode" in message
+                )
+                if unicode_failure:
+                    raise AppError(
+                        "La librería de carga intentó codificar el nombre con ASCII, "
+                        "aunque el bot ya utilizó un alias seguro. Reinicia la app y "
+                        "verifica que google-genai esté actualizado."
+                    ) from error
+                if not _is_retryable_gemini_error(error) or attempt + 1 >= GEMINI_UPLOAD_RETRIES:
+                    raise
+                time.sleep(2.0 + attempt * 2.0)
+    if last_error is not None:
+        raise last_error
+    raise AppError("Gemini no devolvió respuesta durante la carga del archivo.")
 
 
 def file_extension(filename: str) -> str:
@@ -2625,6 +2771,43 @@ def _action_to_procedure_row(action: VideoAction) -> list[str]:
 
     return [activity or _clean_action_value(action.action), description, responsible, evidence]
 
+def _contextualized_action_steps(actions: list[VideoAction]) -> list[str]:
+    """Diferencia pasos legítimos que tendrían la misma redacción visible."""
+
+    raw_steps = [_action_to_detailed_step(action) for action in actions]
+    keys = [_normalized_action_key(step) for step in raw_steps]
+    counts = {key: keys.count(key) for key in set(keys) if key}
+    result: list[str] = []
+    used: dict[str, int] = {}
+
+    for action, step, key in zip(actions, raw_steps, keys):
+        if counts.get(key, 0) <= 1:
+            result.append(step)
+            continue
+        title, body = _split_step_title_body(step)
+        context = (
+            _clean_action_value(action.system)
+            or _clean_action_value(action.location_path)
+            or _clean_action_value(action.data_handled)
+            or _clean_action_value(action.interface_element)
+            or _clean_action_value(action.timestamp_start)
+        )
+        contextual_title = title
+        if context and _normalized_action_key(context) not in _normalized_action_key(title):
+            contextual_title = f"{title} en {context}"
+        occurrence_key = _normalized_action_key(f"{contextual_title}|{body}")
+        used[occurrence_key] = used.get(occurrence_key, 0) + 1
+        if used[occurrence_key] > 1:
+            timestamp = _clean_action_value(action.timestamp_start)
+            contextual_title += (
+                f" — {timestamp}" if timestamp else f" — actividad {used[occurrence_key]}"
+            )
+        result.append(
+            f"{contextual_title}:\n{body}" if body else f"{contextual_title}:"
+        )
+    return result
+
+
 def _apply_video_action_coverage(
     final_document: FinalDocument,
     selected_manifest: dict,
@@ -2659,7 +2842,7 @@ def _apply_video_action_coverage(
 
         mode = expected.get("step_mode", "none")
         if mode == "dynamic_list":
-            steps = [_action_to_detailed_step(action) for action in actions]
+            steps = _contextualized_action_steps(actions)
             steps = [step for step in steps if step.strip()]
             section = section.model_copy(
                 update={
@@ -3041,15 +3224,28 @@ def download_drive_video_to_path(
                 "Drive no informó el tamaño del archivo. Verifica que sea un video "
                 "normal almacenado en Drive y no un acceso directo."
             )
-        if size_bytes > MAX_DRIVE_VIDEO_SIZE_BYTES:
+        effective_drive_limit = min(
+            MAX_DRIVE_VIDEO_SIZE_BYTES,
+            GEMINI_FILE_API_MAX_BYTES,
+        )
+        if size_bytes > effective_drive_limit:
             raise AppError(
                 f"El video pesa {format_file_size(size_bytes)} y supera el límite "
-                f"seguro de {MAX_DRIVE_VIDEO_SIZE_MB} MB para Gemini."
+                f"seguro de {format_file_size(effective_drive_limit)} para una sola "
+                "carga. Comprímelo o divídelo; el bot conservará los checkpoints "
+                "ya creados."
             )
 
         if not filename.lower().endswith(f".{extension}"):
             filename = f"{filename}.{extension}"
-        local_path = destination_dir / filename
+        # La ruta local se mantiene en ASCII porque algunas versiones del cliente
+        # de Gemini convierten el nombre del archivo en una cabecera HTTP ASCII.
+        local_filename = _ascii_safe_media_filename(
+            filename,
+            extension,
+            identity=file_id,
+        )
+        local_path = destination_dir / local_filename
 
         request = service.files().get_media(
             fileId=file_id,
@@ -3065,7 +3261,7 @@ def download_drive_video_to_path(
             )
             done = False
             while not done:
-                if time.monotonic() - started_at > DRIVE_DOWNLOAD_TIMEOUT_SECONDS:
+                if time.monotonic() - started_at > _drive_download_timeout_seconds(size_bytes):
                     raise AppError(
                         "La descarga desde Google Drive superó el tiempo máximo "
                         "permitido. Prueba con una conexión más estable o un video menor."
@@ -3093,6 +3289,7 @@ def download_drive_video_to_path(
             {
                 "file_id": file_id,
                 "name": filename,
+                "local_name": local_path.name,
                 "size_bytes": actual_size,
                 "mime_type": MIME_TYPES.get(extension, mime_type),
                 "extension": extension,
@@ -3312,6 +3509,8 @@ def _probe_local_video_duration_seconds(local_path: Path) -> float | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=90,
             check=False,
         )
@@ -3323,6 +3522,92 @@ def _probe_local_video_duration_seconds(local_path: Path) -> float | None:
         return duration if duration > 0 else None
     except Exception:
         return None
+
+
+def _probe_local_video_info(local_path: Path) -> dict:
+    """Inspecciona contenedor, duración y códecs sin cargar el video en memoria."""
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,format_name,size:stream=index,codec_type,codec_name,width,height,r_frame_rate",
+                "-of",
+                "json",
+                str(local_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {"probe_error": (result.stderr or "ffprobe no devolvió información")[:500]}
+        payload = json.loads(result.stdout)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as error:
+        return {"probe_error": _unicode_safe_text(error)[:500]}
+
+
+def _validate_local_video_media(local_path: Path, mime_type: str) -> dict:
+    """Valida de forma temprana que el archivo contenga un flujo de video legible."""
+
+    if not VIDEO_MEDIA_PREFLIGHT_ENABLED:
+        return {}
+    info = _probe_local_video_info(local_path)
+    if not info:
+        return {}
+    streams = info.get("streams") or []
+    video_streams = [item for item in streams if str(item.get("codec_type")) == "video"]
+    if not video_streams:
+        detail = _unicode_safe_text(info.get("probe_error") or "sin flujo de video")
+        raise AppError(
+            "El archivo no contiene un flujo de video legible. "
+            f"MIME informado: {mime_type}. Detalle: {detail[:350]}"
+        )
+    format_data = info.get("format") or {}
+    try:
+        duration = float(format_data.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        raise AppError(
+            "El video no informa una duración válida. Puede estar incompleto o "
+            "tener el índice del contenedor dañado."
+        )
+    return info
+
+
+def _processing_timeout_seconds(size_bytes: int) -> int:
+    configured = _read_int_setting(
+        "VIDEO_PROCESSING_TIMEOUT_SECONDS",
+        VIDEO_PROCESSING_TIMEOUT_SECONDS,
+        600,
+        14400,
+    )
+    if size_bytes >= VIDEO_LARGE_FILE_THRESHOLD_BYTES:
+        return max(configured, VIDEO_LARGE_FILE_PROCESSING_TIMEOUT_SECONDS)
+    return configured
+
+
+def _drive_download_timeout_seconds(size_bytes: int) -> int:
+    configured = _read_int_setting(
+        "DRIVE_DOWNLOAD_TIMEOUT_SECONDS",
+        DRIVE_DOWNLOAD_TIMEOUT_SECONDS,
+        600,
+        14400,
+    )
+    if size_bytes >= VIDEO_LARGE_FILE_THRESHOLD_BYTES:
+        return max(configured, DRIVE_LARGE_FILE_DOWNLOAD_TIMEOUT_SECONDS)
+    return configured
 
 
 def _video_clock(seconds: float) -> str:
@@ -3410,12 +3695,24 @@ def _checkpoint_from_payload(payload: dict) -> tuple[float, float, VideoTranscri
         return None
 
 
+def _json_dumps_robust(payload: object, indent: int | None = None) -> str:
+    """Serializa contenido Unicode; usa escapes si existen caracteres anómalos."""
+
+    try:
+        rendered = json.dumps(payload, ensure_ascii=False, indent=indent)
+        rendered.encode("utf-8")
+        return rendered
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return json.dumps(payload, ensure_ascii=True, indent=indent, default=str)
+
+
 def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        _json_dumps_robust(payload, indent=2),
         encoding="utf-8",
+        errors="strict",
     )
     temporary.replace(path)
 
@@ -3516,7 +3813,7 @@ def _save_checkpoint_to_drive(
         if not folder_id:
             return False
 
-        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        encoded = _json_dumps_robust(payload).encode("utf-8")
         media = MediaIoBaseUpload(
             BytesIO(encoded),
             mimetype="application/json",
@@ -4739,13 +5036,19 @@ def _upload_video_for_visual_alignment(client, local_path: Path, progress_callba
         progress_callback(
             "Subiendo temporalmente el video para comprobar cada paso contra la pantalla."
         )
-    uploaded_file = client.files.upload(file=str(local_path))
+    uploaded_file = _upload_gemini_file_with_retries(
+        client=client,
+        local_path=local_path,
+        display_name=local_path.name,
+        progress_callback=progress_callback,
+        purpose="video para auditoría visual",
+    )
     if not getattr(uploaded_file, "name", None):
         raise AppError(
             "Gemini no devolvió un identificador para la auditoría visual."
         )
 
-    deadline = time.monotonic() + VIDEO_PROCESSING_TIMEOUT_SECONDS
+    deadline = time.monotonic() + _processing_timeout_seconds(local_path.stat().st_size)
     while True:
         file_info = client.files.get(name=uploaded_file.name)
         state_name = _file_state_name(file_info)
@@ -5064,6 +5367,8 @@ def _extract_video_frame_jpeg(
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=180,
                 check=False,
             )
@@ -5574,6 +5879,12 @@ def _extract_best_action_visual(
                 preferred,
                 action,
             )
+            semantic_time_delta = abs(candidate_second - preferred)
+            if semantic_strict:
+                # El instante fue comprobado visualmente por Gemini. La nitidez no
+                # puede desplazar la captura hacia otra acción o aplicación.
+                quality += 8.0 if semantic_time_delta <= 0.08 else 0.0
+                quality -= semantic_time_delta * 38.0
             candidate = {
                 "path": cropped_path,
                 "timestamp_seconds": candidate_second,
@@ -5581,6 +5892,7 @@ def _extract_best_action_visual(
                 "image_hash": image_hash,
                 "content_hash": content_hash,
                 "duplicate_distance": hash_distance,
+                "semantic_time_delta": round(semantic_time_delta, 3),
                 **crop_metadata,
             }
             if best is None or quality > float(best["quality_score"]):
@@ -6892,7 +7204,7 @@ def _transcribe_local_video_path_with_gemini(
     if not local_path.exists() or local_path.stat().st_size <= 0:
         raise AppError("El video temporal no existe o está vacío.")
 
-    max_file_api_bytes = 1_950_000_000
+    max_file_api_bytes = GEMINI_FILE_API_MAX_BYTES
     if local_path.stat().st_size > max_file_api_bytes:
         raise AppError(
             "El video supera el límite seguro de 1,95 GB para Gemini Files API. "
@@ -6907,7 +7219,22 @@ def _transcribe_local_video_path_with_gemini(
             progress_callback(message)
 
     try:
+        media_info = _validate_local_video_media(local_path, mime_type)
         local_duration = _probe_local_video_duration_seconds(local_path)
+        if media_info:
+            video_streams = [
+                item for item in (media_info.get("streams") or [])
+                if str(item.get("codec_type")) == "video"
+            ]
+            codecs = ", ".join(
+                str(item.get("codec_name") or "desconocido")
+                for item in video_streams[:3]
+            )
+            report(
+                "Validación multimedia correcta"
+                + (f"; códec(s): {codecs}" if codecs else "")
+                + "."
+            )
         if local_duration is not None:
             report(
                 "Duración verificada localmente: "
@@ -6915,13 +7242,19 @@ def _transcribe_local_video_path_with_gemini(
             )
 
         report("Subiendo el video temporal a Gemini Files API")
-        uploaded_file = client.files.upload(file=str(local_path))
+        uploaded_file = _upload_gemini_file_with_retries(
+            client=client,
+            local_path=local_path,
+            display_name=display_name,
+            progress_callback=progress_callback,
+            purpose="video de transcripción",
+        )
 
         if not getattr(uploaded_file, "name", None):
             raise AppError("Gemini no devolvió un identificador para el video.")
 
         report("Esperando que Gemini procese el audio y los fotogramas")
-        deadline = time.monotonic() + VIDEO_PROCESSING_TIMEOUT_SECONDS
+        deadline = time.monotonic() + _processing_timeout_seconds(local_path.stat().st_size)
 
         while True:
             file_info = client.files.get(name=uploaded_file.name)
@@ -7247,8 +7580,21 @@ def transcribe_drive_video_with_gemini(
 def translate_gemini_error(error: Exception) -> AppError:
     """Convierte errores técnicos frecuentes en mensajes comprensibles."""
 
-    message = str(error)
+    message = _unicode_safe_text(error)
     upper_message = message.upper()
+    lower_message = message.lower()
+
+    if (
+        isinstance(error, UnicodeEncodeError)
+        or "ascii" in lower_message and "encode" in lower_message
+        or "codec can't encode" in lower_message
+    ):
+        return AppError(
+            "El nombre del archivo contiene caracteres Unicode que una dependencia "
+            "intentó enviar como ASCII. Esta versión utiliza un alias temporal "
+            "compatible y conserva el nombre original. Reinicia la aplicación y "
+            "vuelve a seleccionar el mismo video."
+        )
 
     if "API_KEY_INVALID" in upper_message or "INVALID API KEY" in upper_message:
         return AppError(
@@ -8329,7 +8675,7 @@ def _set_row_cant_split(row) -> None:
 
 
 def _normalize_document_text(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text)).strip()
+    return re.sub(r"\s+", " ", _unicode_safe_text(text)).strip()
 
 
 def _format_body_paragraph(paragraph, justify: bool = True) -> None:
@@ -8728,6 +9074,8 @@ def _visual_bytes_to_png(content: bytes, filename: str = "") -> bytes:
                     ],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=90,
                     check=False,
                 )
@@ -9198,6 +9546,8 @@ def convert_docx_to_pdf(docx_content: bytes) -> bytes | None:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
                 check=False,
             )
@@ -9543,11 +9893,17 @@ def create_pdf(
 
 
 def output_filename(title: str, suffix: str) -> str:
-    """Genera un nombre de archivo seguro."""
+    """Genera un nombre de archivo Unicode seguro y estable."""
 
-    normalized = re.sub(r"[^A-Za-z0-9ÁÉÍÓÚáéíóúÑñ_-]+", "_", title).strip("_")
-    normalized = normalized[:80] or "documento_generado"
-    return f"{normalized}.{suffix}"
+    cleaned_title = _unicode_safe_text(title)
+    normalized = re.sub(
+        r"[^A-Za-z0-9ÁÉÍÓÚÜáéíóúüÑñ_-]+",
+        "_",
+        cleaned_title,
+    ).strip("_")
+    normalized = normalized[:80].rstrip("._-") or "documento_generado"
+    safe_suffix = re.sub(r"[^A-Za-z0-9]+", "", str(suffix).lower()) or "bin"
+    return f"{normalized}.{safe_suffix}"
 
 
 def save_generated_file(filename: str, content: bytes) -> Path:
@@ -9555,7 +9911,7 @@ def save_generated_file(filename: str, content: bytes) -> Path:
 
     output_dir = Path("output")
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / Path(filename).name
+    path = output_dir / safe_filename(filename)
     path.write_bytes(content)
     return path
 
@@ -9569,11 +9925,11 @@ def direct_download_link(
     """Crea un enlace de descarga embebido que no depende del endpoint temporal de Streamlit."""
 
     encoded = base64.b64encode(data).decode("ascii")
-    safe_filename = html.escape(Path(filename).name, quote=True)
+    safe_download_name = html.escape(safe_filename(filename), quote=True)
     safe_label = html.escape(label)
 
     return (
-        '<a download="' + safe_filename + '" '
+        '<a download="' + safe_download_name + '" '
         'href="data:' + mime_type + ';base64,' + encoded + '" '
         'style="display:block;text-align:center;padding:0.65rem 1rem;'
         'border-radius:0.5rem;border:1px solid rgba(250,250,250,0.25);'
@@ -11658,4 +12014,22 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except AppError as error:
+        st.error(_unicode_safe_text(error))
+    except UnicodeError as error:
+        st.error(
+            "Se detectó un problema de codificación Unicode. Esta versión ya "
+            "normaliza nombres, rutas, JSON y documentos. Reinicia la aplicación "
+            "y reanuda el mismo archivo. Detalle controlado: "
+            + _unicode_safe_text(error)[:350]
+        )
+    except Exception as error:
+        # Última barrera: evita mostrar un traceback crudo o perder el mensaje
+        # operativo. Los checkpoints terminados antes del fallo permanecen.
+        st.error(
+            "El proceso se detuvo de forma controlada y conservará los avances "
+            "guardados. Tipo de error: "
+            f"{type(error).__name__}. Detalle: {_unicode_safe_text(error)[:500]}"
+        )
