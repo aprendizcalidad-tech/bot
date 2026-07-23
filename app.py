@@ -129,6 +129,7 @@ VIDEO_VISUAL_ALIGNMENT_ENABLED = True
 VIDEO_VISUAL_ALIGNMENT_MIN_CONFIDENCE = 0.76
 VIDEO_VISUAL_ALIGNMENT_BATCH_ACTIONS = 10
 VIDEO_VISUAL_ALIGNMENT_CONTEXT_SECONDS = 35
+VIDEO_VISUAL_ALIGNMENT_TIME_TOLERANCE_SECONDS = 3.0
 VIDEO_VISUAL_ALIGNMENT_SECOND_PASS_CONTEXT_SECONDS = 90
 VIDEO_VISUAL_ALIGNMENT_MAX_OUTPUT_TOKENS = 16384
 VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY = 1
@@ -4789,8 +4790,10 @@ REGLAS DE ACEPTACIÓN
 3. element_match solo puede ser true cuando se observa el botón, campo, pestaña,
    archivo, celda, filtro, dato, selección o resultado específico de la acción.
 4. Devuelve timestamp_seconds como tiempo ABSOLUTO desde el inicio del video,
-   con la mayor precisión posible. Elige un instante estable, posterior al clic o
-   cambio, donde la evidencia pueda leerse.
+   con la mayor precisión posible. Aunque recibas un recorte del video, NO reinicies
+   el reloj en cero. Ejemplo: si el intervalo auditado inicia en 00:10:00 y la acción
+   aparece 42 segundos después, devuelve 642.0, no 42.0. Elige un instante estable,
+   posterior al clic o cambio, donde la evidencia pueda leerse.
 5. shared_screen_visible debe ser true cuando se observa la pantalla de trabajo
    que contiene la aplicación. La barra externa de una reunión puede estar
    presente, pero la aplicación compartida debe ser el contenido dominante.
@@ -4953,6 +4956,75 @@ def _visual_alignment_batches(
     return batches
 
 
+def _normalize_visual_alignment_timestamp(
+    raw_value: object,
+    search_start: float,
+    search_end: float,
+    action: VideoAction | None = None,
+) -> tuple[float | None, str]:
+    """Normaliza tiempos absolutos o relativos devueltos por Gemini.
+
+    Cuando Gemini recibe un video con start_offset/end_offset, algunos modelos
+    reinician el reloj del recorte en cero aunque el prompt pida tiempo absoluto.
+    Esta función prueba segundos y milisegundos, tanto absolutos como relativos,
+    y selecciona el candidato compatible con el intervalo y más cercano al tiempo
+    aproximado de la acción.
+    """
+
+    try:
+        raw = float(raw_value)
+    except (TypeError, ValueError):
+        return None, "invalid"
+
+    if raw < 0:
+        return None, "negative"
+
+    tolerance = float(VIDEO_VISUAL_ALIGNMENT_TIME_TOLERANCE_SECONDS)
+    duration = max(0.0, float(search_end) - float(search_start))
+    approximate = (
+        _parse_video_timestamp_seconds(action.timestamp_start)
+        if action is not None
+        else None
+    )
+
+    raw_candidates: list[tuple[str, float, int]] = [
+        ("absolute_seconds", raw, 0),
+        ("relative_seconds", float(search_start) + raw, 1),
+    ]
+    if raw >= 1000.0:
+        raw_candidates.extend(
+            [
+                ("absolute_milliseconds", raw / 1000.0, 2),
+                ("relative_milliseconds", float(search_start) + raw / 1000.0, 3),
+            ]
+        )
+
+    valid: list[tuple[float, int, str, float]] = []
+    for mode, candidate, priority in raw_candidates:
+        if not (float(search_start) - tolerance <= candidate <= float(search_end) + tolerance):
+            continue
+        # Un tiempo relativo solo es razonable si el valor cabe dentro de la
+        # duración del recorte. Evita convertir accidentalmente un tiempo absoluto.
+        if mode.startswith("relative"):
+            relative_value = raw if "milliseconds" not in mode else raw / 1000.0
+            if relative_value > duration + tolerance:
+                continue
+        distance = (
+            abs(candidate - approximate)
+            if approximate is not None
+            else 0.0
+        )
+        valid.append((distance, priority, mode, candidate))
+
+    if not valid:
+        return None, "outside_interval"
+
+    valid.sort(key=lambda item: (item[0], item[1]))
+    _, _, mode, candidate = valid[0]
+    candidate = max(float(search_start), min(float(candidate), float(search_end)))
+    return round(candidate, 3), mode
+
+
 def _merge_visual_alignment_result(
     stored: dict[str, dict],
     requested_actions: list[VideoAction],
@@ -4982,21 +5054,30 @@ def _merge_visual_alignment_result(
                 reject_reason="Gemini no devolvió una evaluación para esta acción.",
             )
 
-        if item.matched and not (
-            search_start - 1.0
-            <= float(item.timestamp_seconds)
-            <= search_end + 1.0
-        ):
-            item = item.model_copy(
-                update={
-                    "matched": False,
-                    "application_match": False,
-                    "element_match": False,
-                    "reject_reason": (
-                        "El tiempo devuelto quedó fuera del intervalo auditado."
-                    ),
-                }
+        timestamp_mode = "not_evaluated"
+        if item.matched:
+            normalized_timestamp, timestamp_mode = _normalize_visual_alignment_timestamp(
+                raw_value=item.timestamp_seconds,
+                search_start=search_start,
+                search_end=search_end,
+                action=action,
             )
+            if normalized_timestamp is None:
+                item = item.model_copy(
+                    update={
+                        "matched": False,
+                        "application_match": False,
+                        "element_match": False,
+                        "reject_reason": (
+                            "Gemini devolvió un tiempo que no pudo interpretarse "
+                            "como absoluto ni como relativo al intervalo auditado."
+                        ),
+                    }
+                )
+            else:
+                item = item.model_copy(
+                    update={"timestamp_seconds": normalized_timestamp}
+                )
 
         candidate = item.model_dump()
         candidate.update(
@@ -5007,6 +5088,7 @@ def _merge_visual_alignment_result(
                 "expected_system": action.system,
                 "expected_element": action.interface_element,
                 "expected_action": action.action,
+                "timestamp_normalization": timestamp_mode,
             }
         )
         candidate["trusted"] = _visual_alignment_item_is_trusted(candidate)
