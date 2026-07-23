@@ -98,7 +98,9 @@ VIDEO_CHECKPOINT_LOCAL_DIR = ".video_checkpoints"
 # Evidencia visual del instructivo. Las capturas se extraen del video real,
 # se relacionan con acciones ACC-XXXX y se reutilizan mediante checkpoints.
 VIDEO_VISUAL_EVIDENCE_ENABLED = True
-VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v7-resumable-low-memory-unique-match"
+VIDEO_VISUAL_CHECKPOINT_VERSION = "visual-v8-semantic-video-alignment"
+VIDEO_VISUAL_ALIGNMENT_VERSION = "semantic-alignment-v1"
+VIDEO_VISUAL_ALIGNMENT_FILENAME = "semantic_alignment.json"
 VIDEO_VISUAL_DIR_NAME = "visuals"
 VIDEO_VISUAL_BUNDLE_NAME = "visuals_bundle.zip"
 VIDEO_VISUAL_MAX_CAPTURES = 600
@@ -112,13 +114,22 @@ VIDEO_VISUAL_FFMPEG_WORKERS = 2
 VIDEO_VISUAL_REQUIRE_EVERY_STEP = True
 VIDEO_VISUAL_SMART_CROP_ENABLED = True
 VIDEO_VISUAL_MAX_SAFE_ACTIONS = 600
-VIDEO_VISUAL_CANDIDATE_RETRIES = 6
+VIDEO_VISUAL_CANDIDATE_RETRIES = 7
 VIDEO_VISUAL_EARLY_ACCEPT_SCORE = 52.0
 VIDEO_VISUAL_HASH_SIZE = 16
-VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE = 10
+VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE = 2
+VIDEO_VISUAL_GLOBAL_DUPLICATE_HASH_DISTANCE = 0
 VIDEO_VISUAL_REPAIR_DUPLICATES = True
 VIDEO_VISUAL_STRICT_EXACT_MATCH = True
-VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS = 2.2
+VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS = 10.0
+VIDEO_ACTION_DUPLICATE_LOOKBACK = 5
+VIDEO_VISUAL_ALIGNMENT_ENABLED = True
+VIDEO_VISUAL_ALIGNMENT_MIN_CONFIDENCE = 0.68
+VIDEO_VISUAL_ALIGNMENT_BATCH_ACTIONS = 18
+VIDEO_VISUAL_ALIGNMENT_CONTEXT_SECONDS = 24
+VIDEO_VISUAL_ALIGNMENT_SECOND_PASS_CONTEXT_SECONDS = 65
+VIDEO_VISUAL_ALIGNMENT_MAX_OUTPUT_TOKENS = 16384
+VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY = 1
 VIDEO_VISUAL_DRIVE_SYNC_EVERY = 20
 VIDEO_VISUAL_MANIFEST_SYNC_EVERY = 4
 VIDEO_VISUAL_PREVIEW_LIMIT = 8
@@ -437,6 +448,40 @@ class VideoTranscript(BaseModel):
             "información que requiere confirmación humana."
         ),
     )
+
+class VisualAlignmentItem(BaseModel):
+    """Resultado semántico para relacionar una acción con un instante del video."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action_id: str
+    matched: bool = False
+    timestamp_seconds: float = Field(default=0.0, ge=0.0)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    observed_system: str = ""
+    observed_element: str = ""
+    evidence_summary: str = ""
+    reject_reason: str = ""
+    application_match: bool = False
+    element_match: bool = False
+    shared_screen_visible: bool = False
+    shared_screen_left: float = Field(default=0.0, ge=0.0, le=1.0)
+    shared_screen_top: float = Field(default=0.0, ge=0.0, le=1.0)
+    shared_screen_right: float = Field(default=1.0, ge=0.0, le=1.0)
+    shared_screen_bottom: float = Field(default=1.0, ge=0.0, le=1.0)
+    meeting_chrome_visible: bool = False
+    meeting_only_or_recursive: bool = False
+    task_switcher_visible: bool = False
+    transition_frame: bool = False
+
+
+class VisualAlignmentBatch(BaseModel):
+    """Alineación visual de varias acciones dentro de un intervalo del video."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    items: list[VisualAlignmentItem] = Field(default_factory=list)
+
 
 class AppError(Exception):
     """Error controlado que puede mostrarse al usuario."""
@@ -2006,6 +2051,45 @@ def _likely_duplicate_action(previous: VideoAction, current: VideoAction) -> boo
     return abs(curr_start - prev_start) <= VIDEO_VISUAL_DUPLICATE_TIME_TOLERANCE_SECONDS
 
 
+def _deduplicate_video_actions(actions: list[VideoAction]) -> list[VideoAction]:
+    """Elimina duplicados técnicos cercanos sin borrar acciones legítimas posteriores.
+
+    Los duplicados reales suelen aparecer en los límites de los tramos de cinco
+    minutos o cuando la auditoría y la transcripción primaria describen el mismo
+    clic. Solo se elimina una acción cuando su huella operativa completa coincide
+    y ocurre dentro de una ventana temporal corta.
+    """
+
+    normalized: list[VideoAction] = []
+    exact_seen: set[str] = set()
+
+    for action in actions:
+        key = re.sub(
+            r"[^a-záéíóúñ0-9]+",
+            " ",
+            (
+                f"{action.timestamp_start} {action.action} "
+                f"{action.interface_element} {action.system} "
+                f"{action.location_path} {action.data_handled}"
+            ).lower(),
+        ).strip()
+        if not key or key in exact_seen:
+            continue
+
+        recent = normalized[-max(1, VIDEO_ACTION_DUPLICATE_LOOKBACK):]
+        if any(_likely_duplicate_action(previous, action) for previous in recent):
+            continue
+
+        exact_seen.add(key)
+        normalized.append(
+            action.model_copy(
+                update={"action_id": f"ACC-{len(normalized) + 1:04d}"}
+            )
+        )
+
+    return normalized
+
+
 def _source_video_actions(source: dict) -> list[VideoAction]:
     raw_actions = source.get("video_actions") or []
     if not raw_actions:
@@ -2027,24 +2111,7 @@ def _source_video_actions(source: dict) -> list[VideoAction]:
     if not actions:
         actions = _parse_action_inventory_from_source_text(str(source.get("text") or ""))
 
-    normalized: list[VideoAction] = []
-    seen: set[str] = set()
-    previous_kept: VideoAction | None = None
-    for action in actions:
-        key = re.sub(
-            r"[^a-záéíóúñ0-9]+",
-            " ",
-            f"{action.timestamp_start} {action.action} {action.interface_element} {action.system}".lower(),
-        ).strip()
-        if not key or key in seen:
-            continue
-        if previous_kept is not None and _likely_duplicate_action(previous_kept, action):
-            continue
-        seen.add(key)
-        prepared = action.model_copy(update={"action_id": f"ACC-{len(normalized)+1:04d}"})
-        normalized.append(prepared)
-        previous_kept = prepared
-    return normalized
+    return _deduplicate_video_actions(actions)
 
 
 def _sentence(value: str) -> str:
@@ -4244,6 +4311,717 @@ def _restore_visual_bundle_from_drive(checkpoint_id: str) -> bool:
             _close_drive_service(service)
 
 
+
+def _visual_alignment_path(checkpoint_id: str) -> Path:
+    return _video_visual_dir(checkpoint_id) / VIDEO_VISUAL_ALIGNMENT_FILENAME
+
+
+def _visual_alignment_item_is_trusted(item: VisualAlignmentItem | dict | None) -> bool:
+    """Acepta únicamente evidencia visual semánticamente comprobada."""
+
+    if item is None:
+        return False
+    try:
+        parsed = (
+            item
+            if isinstance(item, VisualAlignmentItem)
+            else VisualAlignmentItem.model_validate(item)
+        )
+    except Exception:
+        return False
+
+    return bool(
+        parsed.matched
+        and parsed.confidence >= VIDEO_VISUAL_ALIGNMENT_MIN_CONFIDENCE
+        and parsed.application_match
+        and parsed.element_match
+        and parsed.shared_screen_visible
+        and not parsed.meeting_only_or_recursive
+        and not parsed.task_switcher_visible
+        and not parsed.transition_frame
+    )
+
+
+def _load_visual_alignment(
+    checkpoint_id: str,
+    actions: list[VideoAction],
+) -> dict[str, dict]:
+    """Recupera la alineación semántica si corresponde al inventario actual."""
+
+    path = _visual_alignment_path(checkpoint_id)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != VIDEO_VISUAL_ALIGNMENT_VERSION:
+            return {}
+        if (
+            payload.get("action_fingerprint")
+            != _video_visual_action_fingerprint(actions)
+        ):
+            return {}
+
+        result: dict[str, dict] = {}
+        for raw in payload.get("items") or []:
+            try:
+                parsed = VisualAlignmentItem.model_validate(raw)
+            except Exception:
+                continue
+            action_id = _clean_action_value(parsed.action_id)
+            if action_id:
+                item = parsed.model_dump()
+                item["trusted"] = _visual_alignment_item_is_trusted(parsed)
+                result[action_id] = item
+        return result
+    except Exception:
+        return {}
+
+
+def _write_visual_alignment(
+    checkpoint_id: str,
+    actions: list[VideoAction],
+    items_by_action_id: dict[str, dict],
+    status: str = "partial",
+) -> None:
+    """Guarda cada lote semántico para reanudar sin repetir llamadas."""
+
+    serializable: list[dict] = []
+    for action in actions:
+        action_id = _clean_action_value(action.action_id)
+        item = items_by_action_id.get(action_id)
+        if not isinstance(item, dict):
+            continue
+        cleaned = dict(item)
+        cleaned.pop("trusted", None)
+        serializable.append(cleaned)
+
+    trusted_count = sum(
+        1
+        for item in serializable
+        if _visual_alignment_item_is_trusted(item)
+    )
+    _write_json_atomic(
+        _visual_alignment_path(checkpoint_id),
+        {
+            "version": VIDEO_VISUAL_ALIGNMENT_VERSION,
+            "status": status,
+            "action_fingerprint": _video_visual_action_fingerprint(actions),
+            "action_count": len(actions),
+            "aligned_count": len(serializable),
+            "trusted_count": trusted_count,
+            "saved_at_epoch": time.time(),
+            "items": serializable,
+        },
+    )
+
+
+def _visual_alignment_model_candidates(configured_model: str = "") -> list[str]:
+    """Modelos multimodales usados para revisar el video, sin modelos retirados."""
+
+    candidates = [
+        read_secret("GEMINI_VISUAL_MODEL", "").strip(),
+        read_secret("GEMINI_VIDEO_MODEL", VIDEO_MODEL_DEFAULT).strip(),
+        configured_model,
+        VIDEO_MODEL_DEFAULT,
+        "gemini-flash-latest",
+    ]
+    blocked = {
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+    }
+    result: list[str] = []
+    for candidate in candidates:
+        normalized = _normalize_model_name(candidate)
+        if normalized and normalized not in blocked and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _visual_alignment_prompt(
+    actions: list[VideoAction],
+    start_seconds: float,
+    end_seconds: float,
+    second_pass: bool = False,
+) -> str:
+    """Prompt estricto para ubicar el fotograma correcto de cada acción."""
+
+    inventory = []
+    for action in actions:
+        inventory.append(
+            {
+                "action_id": action.action_id,
+                "timestamp_aproximado": action.timestamp_start,
+                "sistema_esperado": action.system,
+                "ruta_esperada": action.location_path,
+                "accion": action.action,
+                "elemento_esperado": action.interface_element,
+                "dato_esperado": action.data_handled,
+                "validacion_esperada": action.validation,
+                "resultado_esperado": action.result,
+            }
+        )
+
+    pass_note = (
+        "Esta es una segunda búsqueda ampliada. Recorre de nuevo todo el intervalo "
+        "y no reutilices una respuesta anterior sin comprobarla visualmente."
+        if second_pass
+        else "Realiza una búsqueda visual completa dentro del intervalo."
+    )
+
+    return f"""
+Actúa como auditor audiovisual de interfaces y alineador de evidencias para un
+instructivo técnico.
+
+INTERVALO DEL VIDEO ORIGINAL
+{_video_clock(start_seconds)} a {_video_clock(end_seconds)}
+
+ACCIONES QUE DEBES LOCALIZAR
+{json.dumps(inventory, ensure_ascii=False, indent=2)}
+
+TAREA
+Para cada action_id, encuentra el instante exacto en el que la pantalla demuestra
+esa acción, el elemento utilizado o el resultado inmediatamente posterior.
+{pass_note}
+
+REGLAS DE ACEPTACIÓN
+1. Evalúa la imagen visible, no solo lo que se escucha.
+2. application_match solo puede ser true cuando la aplicación o sistema esperado
+   está claramente visible. Una hoja de Excel no demuestra una acción de
+   MetaAdmin, KAWAK, el Explorador o el correo.
+3. element_match solo puede ser true cuando se observa el botón, campo, pestaña,
+   archivo, celda, filtro, dato, selección o resultado específico de la acción.
+4. Devuelve timestamp_seconds como tiempo ABSOLUTO desde el inicio del video,
+   con la mayor precisión posible. Elige un instante estable, posterior al clic o
+   cambio, donde la evidencia pueda leerse.
+5. shared_screen_visible debe ser true cuando se observa la pantalla de trabajo
+   que contiene la aplicación. La barra externa de una reunión puede estar
+   presente, pero la aplicación compartida debe ser el contenido dominante.
+   Cuando sea true, devuelve shared_screen_left, shared_screen_top,
+   shared_screen_right y shared_screen_bottom como coordenadas normalizadas
+   entre 0 y 1 del rectángulo exacto de la pantalla compartida. Excluye mosaicos
+   de participantes, avatares, chat y controles de la reunión.
+6. Rechaza expresamente:
+   - Google Meet, Teams o Zoom mostrando solo participantes, avatares o controles;
+   - una reunión compartiéndose a sí misma o una imagen recursiva de la reunión;
+   - Alt+Tab, el selector de tareas o miniaturas de ventanas;
+   - pantallas negras, desenfoques, cargas, animaciones o transiciones;
+   - una aplicación diferente de la mencionada en la acción;
+   - un fotograma genérico que no demuestre el elemento o resultado.
+7. Para acciones distintas, selecciona instantes distintos cuando el estado
+   visible cambie. No asignes una misma captura a acciones no equivalentes.
+8. Si la evidencia no aparece de forma verificable en este intervalo, matched
+   debe ser false. No inventes una coincidencia para completar la cobertura.
+9. confidence representa la certeza visual, no la certeza del audio.
+10. observed_system, observed_element y evidence_summary deben describir
+    brevemente lo que realmente se ve.
+11. meeting_only_or_recursive debe ser true cuando la reunión sea el contenido
+    principal o se observe el efecto de pantalla recursiva.
+12. Devuelve exactamente un elemento por cada action_id solicitado.
+
+Devuelve únicamente el objeto estructurado solicitado.
+""".strip()
+
+
+def _call_visual_alignment_batch(
+    client,
+    model: str,
+    uploaded_file,
+    actions: list[VideoAction],
+    start_seconds: float,
+    end_seconds: float,
+    second_pass: bool = False,
+) -> VisualAlignmentBatch:
+    """Pide a Gemini una comprobación visual directa sobre un tramo del video."""
+
+    file_part = _build_video_file_part(
+        uploaded_file=uploaded_file,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+    prompt = _visual_alignment_prompt(
+        actions=actions,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        second_pass=second_pass,
+    )
+    schema = _inline_and_clean_json_schema(VisualAlignmentBatch)
+    medium_resolution = getattr(
+        types.MediaResolution,
+        "MEDIA_RESOLUTION_MEDIUM",
+        types.MediaResolution.MEDIA_RESOLUTION_LOW,
+    )
+
+    try:
+        response = _generate_with_retries(
+            client=client,
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[file_part, types.Part.from_text(text=prompt)],
+                )
+            ],
+            config=types.GenerateContentConfig(
+                media_resolution=medium_resolution,
+                response_mime_type="application/json",
+                response_json_schema=schema,
+                temperature=0.0,
+                max_output_tokens=VIDEO_VISUAL_ALIGNMENT_MAX_OUTPUT_TOKENS,
+            ),
+            max_attempts=3,
+        )
+        parsed = _validate_structured_output(VisualAlignmentBatch, response)
+        assert isinstance(parsed, VisualAlignmentBatch)
+        return parsed
+    except Exception as first_error:
+        fallback_prompt = (
+            prompt
+            + "\n\nFORMATO JSON OBLIGATORIO\n"
+            + "Devuelve únicamente un objeto JSON válido que cumpla este esquema: "
+            + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        )
+        try:
+            response = _generate_with_retries(
+                client=client,
+                model=model,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            file_part,
+                            types.Part.from_text(text=fallback_prompt),
+                        ],
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    media_resolution=medium_resolution,
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                    max_output_tokens=VIDEO_VISUAL_ALIGNMENT_MAX_OUTPUT_TOKENS,
+                ),
+                max_attempts=2,
+            )
+            parsed = _validate_structured_output(VisualAlignmentBatch, response)
+            assert isinstance(parsed, VisualAlignmentBatch)
+            return parsed
+        except Exception as fallback_error:
+            raise AppError(
+                "Gemini no pudo alinear visualmente el tramo "
+                f"{_video_clock(start_seconds)}–{_video_clock(end_seconds)}. "
+                f"Detalle: {str(fallback_error or first_error)[:500]}"
+            ) from fallback_error
+
+
+def _visual_alignment_batches(
+    actions: list[VideoAction],
+    duration_seconds: float,
+    pending_ids: set[str],
+    context_seconds: float,
+) -> list[tuple[float, float, list[VideoAction]]]:
+    """Agrupa acciones por tramo para revisar varias con una sola llamada."""
+
+    grouped: dict[int, list[VideoAction]] = {}
+    for index, action in enumerate(actions):
+        action_id = _clean_action_value(action.action_id)
+        if action_id not in pending_ids:
+            continue
+        second = _capture_second_for_action_index(actions, index)
+        if second is None:
+            second = duration_seconds * (index + 1) / (len(actions) + 1)
+        chunk_index = max(0, int(second // VIDEO_CHUNK_SECONDS))
+        grouped.setdefault(chunk_index, []).append(action)
+
+    batches: list[tuple[float, float, list[VideoAction]]] = []
+    batch_size = max(
+        1,
+        _read_int_setting(
+            "VIDEO_VISUAL_ALIGNMENT_BATCH_ACTIONS",
+            VIDEO_VISUAL_ALIGNMENT_BATCH_ACTIONS,
+            1,
+            30,
+        ),
+    )
+    for chunk_index in sorted(grouped):
+        chunk_actions = grouped[chunk_index]
+        start = max(0.0, chunk_index * VIDEO_CHUNK_SECONDS - context_seconds)
+        end = min(
+            duration_seconds,
+            (chunk_index + 1) * VIDEO_CHUNK_SECONDS + context_seconds,
+        )
+        if end <= start:
+            continue
+        for offset in range(0, len(chunk_actions), batch_size):
+            batches.append((start, end, chunk_actions[offset: offset + batch_size]))
+    return batches
+
+
+def _merge_visual_alignment_result(
+    stored: dict[str, dict],
+    requested_actions: list[VideoAction],
+    result: VisualAlignmentBatch,
+    search_start: float,
+    search_end: float,
+    attempt: int,
+) -> None:
+    """Conserva la mejor respuesta y rechaza tiempos fuera del intervalo."""
+
+    requested = {
+        _clean_action_value(action.action_id): action
+        for action in requested_actions
+    }
+    returned: dict[str, VisualAlignmentItem] = {}
+    for item in result.items:
+        action_id = _clean_action_value(item.action_id)
+        if action_id in requested and action_id not in returned:
+            returned[action_id] = item
+
+    for action_id, action in requested.items():
+        item = returned.get(action_id)
+        if item is None:
+            item = VisualAlignmentItem(
+                action_id=action_id,
+                matched=False,
+                reject_reason="Gemini no devolvió una evaluación para esta acción.",
+            )
+
+        if item.matched and not (
+            search_start - 1.0
+            <= float(item.timestamp_seconds)
+            <= search_end + 1.0
+        ):
+            item = item.model_copy(
+                update={
+                    "matched": False,
+                    "application_match": False,
+                    "element_match": False,
+                    "reject_reason": (
+                        "El tiempo devuelto quedó fuera del intervalo auditado."
+                    ),
+                }
+            )
+
+        candidate = item.model_dump()
+        candidate.update(
+            {
+                "attempt": attempt,
+                "search_start": search_start,
+                "search_end": search_end,
+                "expected_system": action.system,
+                "expected_element": action.interface_element,
+                "expected_action": action.action,
+            }
+        )
+        candidate["trusted"] = _visual_alignment_item_is_trusted(candidate)
+
+        previous = stored.get(action_id)
+        if not isinstance(previous, dict):
+            stored[action_id] = candidate
+            continue
+
+        previous_trusted = _visual_alignment_item_is_trusted(previous)
+        candidate_trusted = _visual_alignment_item_is_trusted(candidate)
+        previous_confidence = float(previous.get("confidence") or 0.0)
+        candidate_confidence = float(candidate.get("confidence") or 0.0)
+
+        if (
+            candidate_trusted and not previous_trusted
+            or candidate_trusted == previous_trusted
+            and candidate_confidence > previous_confidence
+        ):
+            stored[action_id] = candidate
+
+
+def _upload_video_for_visual_alignment(client, local_path: Path, progress_callback=None):
+    """Sube una sola vez el video durante la fase de alineación semántica."""
+
+    if progress_callback is not None:
+        progress_callback(
+            "Subiendo temporalmente el video para comprobar cada paso contra la pantalla."
+        )
+    uploaded_file = client.files.upload(file=str(local_path))
+    if not getattr(uploaded_file, "name", None):
+        raise AppError(
+            "Gemini no devolvió un identificador para la auditoría visual."
+        )
+
+    deadline = time.monotonic() + VIDEO_PROCESSING_TIMEOUT_SECONDS
+    while True:
+        file_info = client.files.get(name=uploaded_file.name)
+        state_name = _file_state_name(file_info)
+        if "ACTIVE" in state_name:
+            return file_info
+        if "FAILED" in state_name:
+            raise AppError(
+                "Gemini no pudo preparar el video para la auditoría visual."
+            )
+        if time.monotonic() >= deadline:
+            raise AppError(
+                "La preparación del video para la auditoría visual superó el tiempo máximo."
+            )
+        time.sleep(VIDEO_POLL_INTERVAL_SECONDS)
+
+
+def _prepare_semantic_visual_alignment(
+    local_path: Path,
+    actions: list[VideoAction],
+    checkpoint_id: str,
+    duration_seconds: float,
+    progress_callback=None,
+) -> dict[str, dict]:
+    """Ubica semánticamente cada acción antes de extraer una captura.
+
+    Esta fase corrige el problema central de la versión anterior: ya no se elige
+    una imagen solo por cercanía temporal y nitidez. Gemini revisa el video,
+    comprueba aplicación, elemento y resultado, y rechaza reunión, Alt+Tab y
+    transiciones. El progreso se guarda por lotes.
+    """
+
+    if not VIDEO_VISUAL_ALIGNMENT_ENABLED:
+        return {
+            action.action_id: {
+                "action_id": action.action_id,
+                "matched": True,
+                "timestamp_seconds": (
+                    _capture_second_for_action_index(actions, index) or 0.0
+                ),
+                "confidence": 1.0,
+                "application_match": True,
+                "element_match": True,
+                "shared_screen_visible": True,
+                "meeting_only_or_recursive": False,
+                "task_switcher_visible": False,
+                "transition_frame": False,
+                "trusted": True,
+                "evidence_summary": "Alineación semántica desactivada por configuración.",
+            }
+            for index, action in enumerate(actions)
+        }
+
+    stored = _load_visual_alignment(checkpoint_id, actions)
+    pending_ids = {
+        action.action_id
+        for action in actions
+        if not _visual_alignment_item_is_trusted(stored.get(action.action_id))
+    }
+    if not pending_ids:
+        if progress_callback is not None:
+            progress_callback(
+                f"Alineación semántica recuperada: {len(actions)} de {len(actions)} pasos."
+            )
+        return stored
+
+    api_key = read_secret("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise AppError(
+            "La selección precisa de imágenes requiere GEMINI_API_KEY. "
+            "La clave ya usada para transcribir también sirve para esta fase."
+        )
+
+    client = genai.Client(api_key=api_key)
+    uploaded_file = None
+    model_candidates = _visual_alignment_model_candidates(
+        str(st.session_state.get("active_gemini_model") or "")
+    )
+    if not model_candidates:
+        client.close()
+        raise AppError(
+            "No se encontró un modelo multimodal para comprobar las capturas."
+        )
+
+    def run_batch(
+        batch_actions: list[VideoAction],
+        start: float,
+        end: float,
+        second_pass: bool,
+    ) -> VisualAlignmentBatch:
+        errors: list[str] = []
+        for candidate_model in model_candidates:
+            try:
+                result = _call_visual_alignment_batch(
+                    client=client,
+                    model=candidate_model,
+                    uploaded_file=uploaded_file,
+                    actions=batch_actions,
+                    start_seconds=start,
+                    end_seconds=end,
+                    second_pass=second_pass,
+                )
+                try:
+                    st.session_state["active_gemini_model"] = candidate_model
+                except Exception:
+                    pass
+                return result
+            except Exception as error:
+                errors.append(f"{candidate_model}: {str(error)[:220]}")
+                continue
+        raise AppError(
+            "No fue posible comprobar visualmente un lote de acciones. "
+            + " | ".join(errors[-3:])
+        )
+
+    try:
+        uploaded_file = _upload_video_for_visual_alignment(
+            client,
+            local_path,
+            progress_callback=progress_callback,
+        )
+
+        primary_batches = _visual_alignment_batches(
+            actions=actions,
+            duration_seconds=duration_seconds,
+            pending_ids=pending_ids,
+            context_seconds=VIDEO_VISUAL_ALIGNMENT_CONTEXT_SECONDS,
+        )
+        total_batches = len(primary_batches)
+        for batch_number, (start, end, batch_actions) in enumerate(
+            primary_batches,
+            start=1,
+        ):
+            if progress_callback is not None:
+                progress_callback(
+                    "Alineación semántica "
+                    f"{batch_number}/{total_batches}: "
+                    f"{batch_actions[0].action_id}–{batch_actions[-1].action_id}."
+                )
+            result = run_batch(
+                batch_actions=batch_actions,
+                start=start,
+                end=end,
+                second_pass=False,
+            )
+            _merge_visual_alignment_result(
+                stored=stored,
+                requested_actions=batch_actions,
+                result=result,
+                search_start=start,
+                search_end=end,
+                attempt=1,
+            )
+            _write_visual_alignment(
+                checkpoint_id,
+                actions,
+                stored,
+                status="partial",
+            )
+            if (
+                _drive_checkpoint_folder_id()
+                and batch_number % VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY == 0
+            ):
+                _write_visual_bundle_to_drive(
+                    checkpoint_id,
+                    _video_visual_dir(checkpoint_id),
+                )
+
+        remaining = {
+            action.action_id
+            for action in actions
+            if not _visual_alignment_item_is_trusted(stored.get(action.action_id))
+        }
+
+        if remaining:
+            second_batches = _visual_alignment_batches(
+                actions=actions,
+                duration_seconds=duration_seconds,
+                pending_ids=remaining,
+                context_seconds=VIDEO_VISUAL_ALIGNMENT_SECOND_PASS_CONTEXT_SECONDS,
+            )
+            for batch_number, (start, end, batch_actions) in enumerate(
+                second_batches,
+                start=1,
+            ):
+                if progress_callback is not None:
+                    progress_callback(
+                        "Segunda búsqueda visual "
+                        f"{batch_number}/{len(second_batches)}: "
+                        f"{batch_actions[0].action_id}–{batch_actions[-1].action_id}."
+                    )
+                result = run_batch(
+                    batch_actions=batch_actions,
+                    start=start,
+                    end=end,
+                    second_pass=True,
+                )
+                _merge_visual_alignment_result(
+                    stored=stored,
+                    requested_actions=batch_actions,
+                    result=result,
+                    search_start=start,
+                    search_end=end,
+                    attempt=2,
+                )
+                _write_visual_alignment(
+                    checkpoint_id,
+                    actions,
+                    stored,
+                    status="partial",
+                )
+                if _drive_checkpoint_folder_id():
+                    _write_visual_bundle_to_drive(
+                        checkpoint_id,
+                        _video_visual_dir(checkpoint_id),
+                    )
+
+        trusted_count = sum(
+            1
+            for action in actions
+            if _visual_alignment_item_is_trusted(stored.get(action.action_id))
+        )
+        status = "complete" if trusted_count == len(actions) else "partial"
+        _write_visual_alignment(
+            checkpoint_id,
+            actions,
+            stored,
+            status=status,
+        )
+        _write_visual_bundle_to_drive(
+            checkpoint_id,
+            _video_visual_dir(checkpoint_id),
+        )
+
+        if progress_callback is not None:
+            progress_callback(
+                "Alineación semántica guardada: "
+                f"{trusted_count} de {len(actions)} pasos comprobados."
+            )
+        return stored
+
+    finally:
+        if uploaded_file is not None and getattr(uploaded_file, "name", None):
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _semantic_alignment_failure_detail(
+    actions: list[VideoAction],
+    alignments: dict[str, dict],
+    limit: int = 12,
+) -> str:
+    failures: list[str] = []
+    for action in actions:
+        item = alignments.get(action.action_id)
+        if _visual_alignment_item_is_trusted(item):
+            continue
+        reason = ""
+        if isinstance(item, dict):
+            reason = _clean_action_value(
+                item.get("reject_reason")
+                or item.get("evidence_summary")
+            )
+        failures.append(
+            f"{action.action_id} ({reason or 'sin coincidencia visual verificable'})"
+        )
+        if len(failures) >= limit:
+            break
+    return ", ".join(failures)
+
+
 def _extract_video_frame_jpeg(
     local_path: Path,
     capture_second: float,
@@ -4469,12 +5247,19 @@ def _detect_shared_screen_bbox(image) -> tuple[int, int, int, int]:
 def _smart_crop_shared_screen_png(
     input_path: Path,
     output_path: Path,
+    semantic_bbox: tuple[float, float, float, float] | None = None,
 ) -> dict:
-    """Recorta la interfaz de reunión y conserva la pantalla compartida."""
+    """Recorta la interfaz de reunión y conserva solo la pantalla compartida.
+
+    Cuando Gemini identifica el rectángulo exacto de la pantalla compartida, esa
+    caja semántica tiene prioridad. Si la caja no es válida, se utiliza el
+    detector local basado en densidad de contenido.
+    """
 
     metadata = {
         "crop_applied": False,
         "crop_box": None,
+        "crop_source": "none",
         "original_size": None,
         "final_size": None,
     }
@@ -4484,17 +5269,54 @@ def _smart_crop_shared_screen_png(
         with Image.open(input_path) as opened:
             image = ImageOps.exif_transpose(opened).convert("RGB")
             metadata["original_size"] = [image.width, image.height]
-            bbox = (
-                _detect_shared_screen_bbox(image)
-                if VIDEO_VISUAL_SMART_CROP_ENABLED
-                else (0, 0, image.width, image.height)
-            )
+            full_bbox = (0, 0, image.width, image.height)
+            bbox = full_bbox
+
+            if semantic_bbox is not None:
+                try:
+                    left, top, right, bottom = [float(value) for value in semantic_bbox]
+                    valid = (
+                        0.0 <= left < right <= 1.0
+                        and 0.0 <= top < bottom <= 1.0
+                        and (right - left) >= 0.28
+                        and (bottom - top) >= 0.24
+                    )
+                    if valid:
+                        # Un margen mínimo conserva el borde de la ventana sin
+                        # volver a incluir los mosaicos o controles de la reunión.
+                        margin_x = 0.003
+                        margin_y = 0.004
+                        left = max(0.0, left - margin_x)
+                        top = max(0.0, top - margin_y)
+                        right = min(1.0, right + margin_x)
+                        bottom = min(1.0, bottom + margin_y)
+                        bbox = (
+                            int(round(left * image.width)),
+                            int(round(top * image.height)),
+                            int(round(right * image.width)),
+                            int(round(bottom * image.height)),
+                        )
+                        metadata["crop_source"] = "gemini_shared_screen_bbox"
+                except Exception:
+                    bbox = full_bbox
+
+            if bbox == full_bbox and VIDEO_VISUAL_SMART_CROP_ENABLED:
+                bbox = _detect_shared_screen_bbox(image)
+                metadata["crop_source"] = (
+                    "local_shared_screen_detector"
+                    if bbox != full_bbox
+                    else "full_frame"
+                )
+
             cropped = image.crop(bbox)
-            metadata["crop_applied"] = bbox != (0, 0, image.width, image.height)
+            metadata["crop_applied"] = bbox != full_bbox
             metadata["crop_box"] = list(bbox)
 
             if cropped.width > VIDEO_VISUAL_WIDTH_PX:
-                new_height = max(1, round(cropped.height * VIDEO_VISUAL_WIDTH_PX / cropped.width))
+                new_height = max(
+                    1,
+                    round(cropped.height * VIDEO_VISUAL_WIDTH_PX / cropped.width),
+                )
                 cropped = cropped.resize(
                     (VIDEO_VISUAL_WIDTH_PX, new_height),
                     resample=Image.Resampling.LANCZOS,
@@ -4560,8 +5382,16 @@ def _action_candidate_seconds(
     actions: list[VideoAction],
     action_index: int,
     duration_seconds: float | None,
+    preferred_override: float | None = None,
+    semantic_strict: bool = False,
 ) -> list[float]:
-    preferred = _capture_second_for_action_index(actions, action_index)
+    """Genera candidatos alrededor del tiempo comprobado semánticamente."""
+
+    preferred = (
+        float(preferred_override)
+        if preferred_override is not None
+        else _capture_second_for_action_index(actions, action_index)
+    )
     if preferred is None:
         return []
 
@@ -4571,24 +5401,42 @@ def _action_candidate_seconds(
     end = _parse_video_timestamp_seconds(action.timestamp_end)
     anchor = preferred
 
-    if category in {"click", "select", "open", "search", "register"}:
+    if semantic_strict:
+        # La auditoría de video ya ubicó la acción. Solo se explora una vecindad
+        # corta para evitar que la optimización de nitidez salte a otra pantalla.
+        candidates = [
+            anchor,
+            anchor + 0.30,
+            anchor - 0.30,
+            anchor + 0.65,
+            anchor - 0.65,
+            anchor + 1.05,
+            anchor - 1.05,
+        ]
+    elif category in {"click", "select", "open", "search", "register"}:
         candidates = [anchor, anchor + 0.8, anchor - 0.6, anchor + 1.7]
     elif category in {"save", "download", "attach", "validate"}:
-        candidates = [end + 0.35 if end is not None else anchor, anchor, anchor + 1.2, anchor - 0.7]
+        candidates = [
+            end + 0.35 if end is not None else anchor,
+            anchor,
+            anchor + 1.2,
+            anchor - 0.7,
+        ]
     else:
         candidates = [anchor, anchor + 0.7, anchor - 0.7, anchor + 1.5]
 
-    if start is not None:
-        candidates.append(start + 0.35)
-    if end is not None and end > (start or -1):
-        candidates.append((start + end) / 2 if start is not None else end)
+    if not semantic_strict:
+        if start is not None:
+            candidates.append(start + 0.35)
+        if end is not None and end > (start or -1):
+            candidates.append((start + end) / 2 if start is not None else end)
 
     result: list[float] = []
     seen: set[int] = set()
     for value in candidates:
         maximum = max(0.0, (duration_seconds or value + 1.0) - 0.08)
         value = max(0.0, min(float(value), maximum))
-        key = int(round(value * 10))
+        key = int(round(value * 100))
         if key in seen:
             continue
         seen.add(key)
@@ -4630,8 +5478,16 @@ def _actions_are_visually_equivalent(action_a: VideoAction, action_b: VideoActio
     )
 
 
-def _expand_candidate_seconds(base: list[float], duration_seconds: float | None) -> list[float]:
-    extras = [0.0, 0.9, -0.9, 1.8, -1.8, 3.0, -3.0, 5.0, -5.0]
+def _expand_candidate_seconds(
+    base: list[float],
+    duration_seconds: float | None,
+    semantic_strict: bool = False,
+) -> list[float]:
+    extras = (
+        [0.0, 0.22, -0.22, 0.48, -0.48]
+        if semantic_strict
+        else [0.0, 0.9, -0.9, 1.8, -1.8, 3.0, -3.0, 5.0, -5.0]
+    )
     result: list[float] = []
     seen: set[int] = set()
     for base_value in base:
@@ -4639,12 +5495,17 @@ def _expand_candidate_seconds(base: list[float], duration_seconds: float | None)
             value = base_value + extra
             maximum = max(0.0, (duration_seconds or value + 1.0) - 0.08)
             value = max(0.0, min(float(value), maximum))
-            key = int(round(value * 10))
+            key = int(round(value * 100))
             if key in seen:
                 continue
             seen.add(key)
             result.append(value)
-    return result[: max(VIDEO_VISUAL_CANDIDATE_RETRIES + 4, 10)]
+    maximum_candidates = (
+        max(VIDEO_VISUAL_CANDIDATE_RETRIES + 2, 9)
+        if semantic_strict
+        else max(VIDEO_VISUAL_CANDIDATE_RETRIES + 4, 10)
+    )
+    return result[:maximum_candidates]
 
 def _extract_best_action_visual(
     local_path: Path,
@@ -4654,16 +5515,33 @@ def _extract_best_action_visual(
     duration_seconds: float | None,
     blocked_hashes: list[str] | None = None,
     blocked_seconds: list[float] | None = None,
+    preferred_second: float | None = None,
+    semantic_strict: bool = False,
+    semantic_bbox: tuple[float, float, float, float] | None = None,
 ) -> dict | None:
-    """Extrae el mejor fotograma cercano y evita repeticiones evidentes."""
+    """Extrae el mejor fotograma sin abandonar el instante validado por Gemini."""
 
     action = actions[action_index]
-    base_candidates = _action_candidate_seconds(actions, action_index, duration_seconds)
+    base_candidates = _action_candidate_seconds(
+        actions,
+        action_index,
+        duration_seconds,
+        preferred_override=preferred_second,
+        semantic_strict=semantic_strict,
+    )
     if not base_candidates:
         return None
 
-    candidates = _expand_candidate_seconds(base_candidates, duration_seconds)
-    preferred = _capture_second_for_action_index(actions, action_index) or candidates[0]
+    candidates = _expand_candidate_seconds(
+        base_candidates,
+        duration_seconds,
+        semantic_strict=semantic_strict,
+    )
+    preferred = (
+        float(preferred_second)
+        if preferred_second is not None
+        else (_capture_second_for_action_index(actions, action_index) or candidates[0])
+    )
     blocked_hashes = [value for value in (blocked_hashes or []) if value]
     blocked_seconds = [float(value) for value in (blocked_seconds or [])]
     best: dict | None = None
@@ -4677,11 +5555,19 @@ def _extract_best_action_visual(
             cropped_path = temp_root / f"crop_{candidate_number}.png"
             if not _extract_video_frame_jpeg(local_path, candidate_second, raw_path):
                 continue
-            crop_metadata = _smart_crop_shared_screen_png(raw_path, cropped_path)
+            crop_metadata = _smart_crop_shared_screen_png(
+                raw_path,
+                cropped_path,
+                semantic_bbox=semantic_bbox,
+            )
             if not cropped_path.exists() or cropped_path.stat().st_size <= 1000:
                 continue
             image_hash = _visual_hash_from_path(cropped_path)
-            hash_distance = min((_hash_distance(image_hash, value) for value in blocked_hashes), default=9999)
+            content_hash = hashlib.sha256(cropped_path.read_bytes()).hexdigest()
+            hash_distance = min(
+                (_hash_distance(image_hash, value) for value in blocked_hashes),
+                default=9999,
+            )
             quality = _visual_frame_quality(
                 cropped_path,
                 candidate_second,
@@ -4693,6 +5579,7 @@ def _extract_best_action_visual(
                 "timestamp_seconds": candidate_second,
                 "quality_score": quality,
                 "image_hash": image_hash,
+                "content_hash": content_hash,
                 "duplicate_distance": hash_distance,
                 **crop_metadata,
             }
@@ -4723,7 +5610,15 @@ def _prepare_video_visual_evidence(
     checkpoint_id: str,
     progress_callback=None,
 ) -> list[dict]:
-    """Genera capturas reanudables sin guardar cientos de PNG en session_state."""
+    """Genera una captura comprobada para cada acción y guarda el avance.
+
+    Flujo:
+    1. Gemini revisa directamente el video y ubica el instante exacto.
+    2. Se rechazan reunión, pantalla recursiva, Alt+Tab, transiciones y sistemas
+       que no coincidan con el paso.
+    3. FFmpeg extrae únicamente alrededor del instante validado.
+    4. Se recorta la interfaz de reunión y se bloquean imágenes repetidas.
+    """
 
     if not VIDEO_VISUAL_EVIDENCE_ENABLED:
         if progress_callback is not None:
@@ -4744,6 +5639,7 @@ def _prepare_video_visual_evidence(
             )
         return []
 
+    actions = _deduplicate_video_actions(list(actions))
     candidates = _select_visual_actions(actions)
     if len(candidates) != len(actions):
         missing = len(actions) - len(candidates)
@@ -4755,67 +5651,169 @@ def _prepare_video_visual_evidence(
     visual_dir = _video_visual_dir(checkpoint_id)
     visual_dir.mkdir(parents=True, exist_ok=True)
     duration_seconds = _probe_local_video_duration_seconds(local_path)
+    if duration_seconds is None:
+        known_times = [
+            value
+            for action in actions
+            for value in (
+                _parse_video_timestamp_seconds(action.timestamp_start),
+                _parse_video_timestamp_seconds(action.timestamp_end),
+            )
+            if value is not None
+        ]
+        duration_seconds = max(known_times, default=0.0) + 10.0
+    if duration_seconds <= 0:
+        raise AppError(
+            "No fue posible determinar la duración del video para alinear las capturas."
+        )
+
+    alignments = _prepare_semantic_visual_alignment(
+        local_path=local_path,
+        actions=actions,
+        checkpoint_id=checkpoint_id,
+        duration_seconds=duration_seconds,
+        progress_callback=progress_callback,
+    )
 
     recovered = _load_local_video_visuals(checkpoint_id, actions)
     extracted_by_index: dict[int, dict] = {
         int(item["action_index"]): item
         for item in recovered
         if isinstance(item.get("action_index"), int)
+        and bool(item.get("semantic_valid"))
     }
     if progress_callback is not None and extracted_by_index:
         progress_callback(
-            "Reanudando capturas: "
+            "Reanudando capturas comprobadas: "
             f"{len(extracted_by_index)} de {len(actions)} ya estaban guardadas."
         )
 
-    recent_hashes: list[str] = []
-    recent_seconds: list[float] = []
-    for index in sorted(extracted_by_index)[-3:]:
+    all_hashes: list[str] = []
+    all_seconds: list[float] = []
+    for index in sorted(extracted_by_index):
         item = extracted_by_index[index]
-        recent_hashes.append(str(item.get("image_hash") or ""))
-        recent_seconds.append(float(item.get("timestamp_seconds") or 0.0))
+        all_hashes.append(str(item.get("image_hash") or ""))
+        all_seconds.append(float(item.get("timestamp_seconds") or 0.0))
 
-    processed_since_sync = 0
-    for visual_index, (action_index, action) in enumerate(candidates, start=1):
-        if action_index in extracted_by_index:
-            continue
+    def build_visual_item(
+        action_index: int,
+        action: VideoAction,
+        path: Path,
+        metadata: dict,
+        alignment: dict,
+        strategy: str,
+    ) -> dict:
+        second = float(metadata.get("timestamp_seconds") or 0.0)
+        return {
+            "visual_id": f"VIS-{action_index + 1:04d}",
+            "action_id": action.action_id or f"ACC-{action_index + 1:04d}",
+            "action_index": action_index,
+            "timestamp": _video_clock(second),
+            "timestamp_seconds": second,
+            "title": _build_step_title(action),
+            "filename": path.name,
+            "mime_type": "image/png",
+            "content_path": str(path),
+            "match_strategy": strategy,
+            "semantic_valid": True,
+            "semantic_alignment_version": VIDEO_VISUAL_ALIGNMENT_VERSION,
+            "semantic_confidence": float(alignment.get("confidence") or 0.0),
+            "semantic_observed_system": alignment.get("observed_system") or "",
+            "semantic_observed_element": alignment.get("observed_element") or "",
+            "semantic_evidence": alignment.get("evidence_summary") or "",
+            "semantic_meeting_chrome_visible": bool(
+                alignment.get("meeting_chrome_visible")
+            ),
+            **metadata,
+        }
 
-        visual_id = f"VIS-{visual_index:04d}"
+    def extract_for_action(
+        action_index: int,
+        blocked_items: list[dict],
+        strategy: str,
+    ) -> dict | None:
+        action = actions[action_index]
+        alignment = alignments.get(action.action_id)
+        if not _visual_alignment_item_is_trusted(alignment):
+            return None
+
+        visual_id = f"VIS-{action_index + 1:04d}"
         action_id = action.action_id or f"ACC-{action_index + 1:04d}"
         filename = f"{visual_id}_{safe_filename(action_id)}.png"
         path = visual_dir / filename
+        blocked_hashes = [
+            str(item.get("image_hash") or "")
+            for item in blocked_items
+            if isinstance(item, dict)
+        ]
+        blocked_seconds = [
+            float(item.get("timestamp_seconds") or 0.0)
+            for item in blocked_items
+            if isinstance(item, dict)
+        ]
+        preferred_second = float(alignment.get("timestamp_seconds") or 0.0)
+        semantic_bbox = (
+            float(alignment.get("shared_screen_left") or 0.0),
+            float(alignment.get("shared_screen_top") or 0.0),
+            float(alignment.get("shared_screen_right") or 1.0),
+            float(alignment.get("shared_screen_bottom") or 1.0),
+        )
         metadata = _extract_best_action_visual(
             local_path,
             actions,
             action_index,
             path,
             duration_seconds,
-            blocked_hashes=recent_hashes[-2:],
-            blocked_seconds=recent_seconds[-2:],
+            blocked_hashes=blocked_hashes,
+            blocked_seconds=blocked_seconds,
+            preferred_second=preferred_second,
+            semantic_strict=True,
+            semantic_bbox=semantic_bbox,
         )
-        if metadata and path.exists():
-            second = float(metadata.get("timestamp_seconds") or 0.0)
-            item = {
-                "visual_id": visual_id,
-                "action_id": action_id,
-                "action_index": action_index,
-                "timestamp": _video_clock(second),
-                "timestamp_seconds": second,
-                "title": _build_step_title(action),
-                "filename": path.name,
-                "mime_type": "image/png",
-                "content_path": str(path),
-                "match_strategy": "timestamp_window_visual_quality_unique",
-                **metadata,
-            }
+        if not metadata or not path.exists():
+            return None
+        return build_visual_item(
+            action_index=action_index,
+            action=action,
+            path=path,
+            metadata=metadata,
+            alignment=alignment,
+            strategy=strategy,
+        )
+
+    processed_since_sync = 0
+    for _, (action_index, action) in enumerate(candidates, start=1):
+        if action_index in extracted_by_index:
+            continue
+        if not _visual_alignment_item_is_trusted(alignments.get(action.action_id)):
+            continue
+
+        blocked_items = [
+            extracted_by_index[index]
+            for index in sorted(extracted_by_index)[-10:]
+        ]
+        item = extract_for_action(
+            action_index,
+            blocked_items=blocked_items,
+            strategy="semantic_video_alignment_exact_frame",
+        )
+        if item:
             extracted_by_index[action_index] = item
-            recent_hashes.append(str(metadata.get("image_hash") or ""))
-            recent_seconds.append(second)
+            all_hashes.append(str(item.get("image_hash") or ""))
+            all_seconds.append(float(item.get("timestamp_seconds") or 0.0))
             processed_since_sync += 1
 
         if processed_since_sync >= VIDEO_VISUAL_MANIFEST_SYNC_EVERY:
-            current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
-            _write_visual_manifest(checkpoint_id, actions, current, status="partial")
+            current = [
+                extracted_by_index[index]
+                for index in sorted(extracted_by_index)
+            ]
+            _write_visual_manifest(
+                checkpoint_id,
+                actions,
+                current,
+                status="partial",
+            )
             processed_since_sync = 0
 
         if (
@@ -4830,61 +5828,18 @@ def _prepare_video_visual_evidence(
             or len(extracted_by_index) % 6 == 0
         ):
             progress_callback(
-                "Extracción reanudable: "
+                "Extracción precisa y reanudable: "
                 f"{len(extracted_by_index)} de {len(actions)} pasos guardados."
             )
 
-    current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+    current = [
+        extracted_by_index[index]
+        for index in sorted(extracted_by_index)
+    ]
     _write_visual_manifest(checkpoint_id, actions, current, status="partial")
 
-    def repair_action(index_to_repair: int, blocked_items: list[dict]) -> dict | None:
-        action = actions[index_to_repair]
-        visual_id = f"VIS-{index_to_repair + 1:04d}"
-        action_id = action.action_id or f"ACC-{index_to_repair + 1:04d}"
-        filename = f"{visual_id}_{safe_filename(action_id)}.png"
-        path = visual_dir / filename
-        blocked_hashes = [str(item.get("image_hash") or "") for item in blocked_items if item]
-        blocked_seconds = [float(item.get("timestamp_seconds") or 0.0) for item in blocked_items if item]
-        metadata = _extract_best_action_visual(
-            local_path,
-            actions,
-            index_to_repair,
-            path,
-            duration_seconds,
-            blocked_hashes=blocked_hashes,
-            blocked_seconds=blocked_seconds,
-        )
-        if not metadata or not path.exists():
-            return None
-        second = float(metadata.get("timestamp_seconds") or 0.0)
-        return {
-            "visual_id": visual_id,
-            "action_id": action_id,
-            "action_index": index_to_repair,
-            "timestamp": _video_clock(second),
-            "timestamp_seconds": second,
-            "title": _build_step_title(action),
-            "filename": path.name,
-            "mime_type": "image/png",
-            "content_path": str(path),
-            "match_strategy": "repair_unique_visual_match",
-            **metadata,
-        }
-
-    missing_indices = [index for index in range(len(actions)) if index not in extracted_by_index]
-    for missing_index in missing_indices:
-        neighbors = [
-            extracted_by_index.get(missing_index - 2),
-            extracted_by_index.get(missing_index - 1),
-            extracted_by_index.get(missing_index + 1),
-            extracted_by_index.get(missing_index + 2),
-        ]
-        repaired = repair_action(missing_index, [item for item in neighbors if isinstance(item, dict)])
-        if repaired:
-            extracted_by_index[missing_index] = repaired
-            current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
-            _write_visual_manifest(checkpoint_id, actions, current, status="partial")
-
+    # Repara duplicados adyacentes y duplicados físicos globales. No se acepta la
+    # misma captura para dos acciones distintas aunque estén separadas en el Word.
     if VIDEO_VISUAL_REPAIR_DUPLICATES:
         signatures: dict[int, str] = {}
         for idx in sorted(extracted_by_index):
@@ -4896,54 +5851,151 @@ def _prepare_video_visual_evidence(
             )
             item["image_hash"] = signatures[idx]
 
-        ordered_indices = sorted(extracted_by_index)
         duplicate_indices: list[int] = []
+        ordered_indices = sorted(extracted_by_index)
         for position, idx in enumerate(ordered_indices):
-            if position == 0:
+            current_hash = signatures.get(idx, "")
+            current_content_hash = str(
+                extracted_by_index[idx].get("content_hash") or ""
+            )
+            if not current_hash and not current_content_hash:
                 continue
-            previous_idx = ordered_indices[position - 1]
-            distance = _hash_distance(signatures.get(idx, ""), signatures.get(previous_idx, ""))
-            if (
-                distance <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE
-                and not _actions_are_visually_equivalent(actions[idx], actions[previous_idx])
-            ):
-                duplicate_indices.append(idx)
-
-        for duplicate_index in duplicate_indices:
-            blocked = [
-                extracted_by_index[neighbor]
-                for neighbor in (
-                    duplicate_index - 2,
-                    duplicate_index - 1,
-                    duplicate_index + 1,
-                    duplicate_index + 2,
+            for previous_idx in ordered_indices[:position]:
+                if _actions_are_visually_equivalent(
+                    actions[idx],
+                    actions[previous_idx],
+                ):
+                    continue
+                previous_content_hash = str(
+                    extracted_by_index[previous_idx].get("content_hash") or ""
                 )
-                if neighbor in extracted_by_index
-            ]
-            repaired = repair_action(duplicate_index, blocked)
-            if repaired:
-                extracted_by_index[duplicate_index] = repaired
-                current = [extracted_by_index[index] for index in sorted(extracted_by_index)]
-                _write_visual_manifest(checkpoint_id, actions, current, status="partial")
+                exact_physical_duplicate = bool(
+                    current_content_hash
+                    and previous_content_hash
+                    and current_content_hash == previous_content_hash
+                )
+                adjacent = previous_idx == ordered_indices[position - 1]
+                near_adjacent_duplicate = bool(
+                    adjacent
+                    and _hash_distance(
+                        current_hash,
+                        signatures.get(previous_idx, ""),
+                    )
+                    <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE
+                )
+                if exact_physical_duplicate or near_adjacent_duplicate:
+                    duplicate_indices.append(idx)
+                    break
 
-    extracted = [extracted_by_index[index] for index in sorted(extracted_by_index)]
+        for duplicate_index in dict.fromkeys(duplicate_indices):
+            blocked = [
+                item
+                for index, item in extracted_by_index.items()
+                if index != duplicate_index
+            ]
+            repaired = extract_for_action(
+                duplicate_index,
+                blocked_items=blocked[-40:],
+                strategy="semantic_duplicate_repair",
+            )
+            if repaired:
+                repaired_hash = str(repaired.get("image_hash") or "")
+                repaired_content_hash = str(repaired.get("content_hash") or "")
+                still_duplicate = False
+                ordered_before = sorted(extracted_by_index)
+                for previous_index, previous_item in extracted_by_index.items():
+                    if previous_index == duplicate_index:
+                        continue
+                    if _actions_are_visually_equivalent(
+                        actions[duplicate_index],
+                        actions[previous_index],
+                    ):
+                        continue
+                    exact_physical_duplicate = bool(
+                        repaired_content_hash
+                        and repaired_content_hash
+                        == str(previous_item.get("content_hash") or "")
+                    )
+                    adjacent = abs(previous_index - duplicate_index) == 1
+                    near_adjacent_duplicate = bool(
+                        adjacent
+                        and _hash_distance(
+                            repaired_hash,
+                            str(previous_item.get("image_hash") or ""),
+                        )
+                        <= VIDEO_VISUAL_DUPLICATE_HASH_DISTANCE
+                    )
+                    if exact_physical_duplicate or near_adjacent_duplicate:
+                        still_duplicate = True
+                        break
+                if not still_duplicate:
+                    extracted_by_index[duplicate_index] = repaired
+                    continue
+
+            rejected = extracted_by_index.pop(duplicate_index, None)
+            if isinstance(rejected, dict):
+                rejected_path = _visual_content_path(checkpoint_id, rejected)
+                try:
+                    if rejected_path is not None:
+                        rejected_path.unlink()
+                except Exception:
+                    pass
+
+            current = [
+                extracted_by_index[index]
+                for index in sorted(extracted_by_index)
+            ]
+            _write_visual_manifest(
+                checkpoint_id,
+                actions,
+                current,
+                status="partial",
+            )
+
+    extracted = [
+        extracted_by_index[index]
+        for index in sorted(extracted_by_index)
+    ]
     status = "complete" if len(extracted) == len(actions) else "partial"
     _write_visual_manifest(checkpoint_id, actions, extracted, status=status)
     _write_visual_bundle_to_drive(checkpoint_id, visual_dir)
 
-    if VIDEO_VISUAL_REQUIRE_EVERY_STEP and len(extracted) != len(actions):
+    semantic_pending = [
+        action
+        for action in actions
+        if not _visual_alignment_item_is_trusted(alignments.get(action.action_id))
+    ]
+    if semantic_pending:
+        detail = _semantic_alignment_failure_detail(actions, alignments)
         raise AppError(
-            "Cobertura visual incompleta: se detectaron "
-            f"{len(actions)} acciones y se guardaron {len(extracted)} capturas. "
-            "Vuelve a ejecutar la extracción: continuará solo con los pasos pendientes."
+            "La auditoría visual no encontró una imagen comprobable para "
+            f"{len(semantic_pending)} de {len(actions)} pasos. "
+            "No se insertaron imágenes de reunión, Alt+Tab, transiciones ni "
+            "aplicaciones incorrectas. Pasos pendientes: "
+            f"{detail}. El avance válido quedó guardado."
+        )
+
+    if VIDEO_VISUAL_REQUIRE_EVERY_STEP and len(extracted) != len(actions):
+        missing_ids = [
+            actions[index].action_id
+            for index in range(len(actions))
+            if index not in extracted_by_index
+        ]
+        raise AppError(
+            "Cobertura visual precisa incompleta: se detectaron "
+            f"{len(actions)} acciones y se guardaron {len(extracted)} capturas "
+            "semánticamente válidas. Pendientes: "
+            + ", ".join(missing_ids[:12])
+            + ". Vuelve a ejecutar la extracción; continuará solo con esos pasos."
         )
 
     if progress_callback is not None:
         progress_callback(
-            "Evidencia visual completa y guardada: "
+            "Evidencia visual comprobada y guardada: "
             f"{len(extracted)} de {len(actions)} pasos."
         )
     return _load_local_video_visuals(checkpoint_id, actions)
+
 
 def _interval_is_covered(
     start_seconds: float,
@@ -5209,28 +6261,14 @@ def _merge_video_transcript_chunks(
             if value:
                 uncertainties.append(f"[{interval}] {value}")
 
-    normalized_actions: list[VideoAction] = []
-    seen: set[str] = set()
+    prepared_actions: list[VideoAction] = []
     for action in all_actions:
         action_text = _clean_action_value(action.action)
         if len(action_text) < MIN_ACTION_TEXT_CHARS:
             continue
-        key = re.sub(
-            r"[^a-záéíóúñ0-9]+",
-            " ",
-            f"{action.timestamp_start} {action_text} {action.interface_element}".lower(),
-        ).strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        normalized_actions.append(
-            action.model_copy(
-                update={
-                    "action_id": f"ACC-{len(normalized_actions)+1:04d}",
-                    "action": action_text,
-                }
-            )
-        )
+        prepared_actions.append(action.model_copy(update={"action": action_text}))
+
+    normalized_actions = _deduplicate_video_actions(prepared_actions)
 
     return VideoTranscript(
         detected_language=languages[0] if languages else "",
@@ -5559,7 +6597,7 @@ def _merge_action_candidates(
             continue
         seen.add(key)
         result.append(action.model_copy(update={"action": value}))
-    return result
+    return _deduplicate_video_actions(result)
 
 
 def _video_action_audit_prompt(start_seconds: float, end_seconds: float) -> str:
@@ -6088,6 +7126,9 @@ def transcribe_video_with_gemini(
             progress_callback=progress_callback,
             checkpoint_key=str(video_record.get("fingerprint") or video_record["name"]),
         )
+        transcript = transcript.model_copy(
+            update={"actions": _deduplicate_video_actions(list(transcript.actions))}
+        )
         checkpoint_id = str(
             st.session_state.get("video_checkpoint_id")
             or hashlib.sha256(
@@ -6159,6 +7200,9 @@ def transcribe_drive_video_with_gemini(
             mime_type=metadata["mime_type"],
             progress_callback=progress_callback,
             checkpoint_key=drive_checkpoint_key,
+        )
+        transcript = transcript.model_copy(
+            update={"actions": _deduplicate_video_actions(list(transcript.actions))}
         )
         checkpoint_id = str(
             st.session_state.get("video_checkpoint_id")
@@ -7423,6 +8467,8 @@ def _visuals_by_action_id(source_record: dict | None) -> dict[str, object]:
     ordered: list[dict] = []
     for item in _recover_source_record_visuals(source_record):
         action_id = _clean_action_value(item.get("action_id"))
+        if VIDEO_VISUAL_ALIGNMENT_ENABLED and not bool(item.get("semantic_valid")):
+            continue
         if not _visual_bytes(item):
             continue
         ordered.append(item)
@@ -8659,14 +9705,15 @@ def show_video_transcript_review(source_record: dict) -> str | None:
             )
 
     transcript = st.session_state.get("video_transcript")
+    review_actions = _source_video_actions(source_record) if transcript else []
     if transcript:
         metric_columns = st.columns(4)
-        metric_columns[0].metric("Acciones operativas", len(transcript.actions))
-        metric_columns[1].metric("Capturas", int(source_record.get("video_visual_count") or 0))
+        metric_columns[0].metric("Acciones operativas", len(review_actions))
+        metric_columns[1].metric("Capturas precisas", int(source_record.get("video_visual_count") or 0))
         metric_columns[2].metric("Hablantes", len(transcript.speakers))
         metric_columns[3].metric("Alertas", len(transcript.uncertainties))
 
-        if transcript.actions:
+        if review_actions:
             with st.expander("Inventario de acciones detectadas", expanded=True):
                 st.caption(
                     "Cada registro debe convertirse en un paso o fila independiente "
@@ -8685,7 +9732,7 @@ def show_video_transcript_review(source_record: dict) -> str | None:
                             "Acción": action.action,
                             "Validación/Resultado": action.validation or action.result,
                         }
-                        for action in transcript.actions
+                        for action in review_actions
                     ],
                     width="stretch",
                     hide_index=True,
@@ -8700,8 +9747,9 @@ def show_video_transcript_review(source_record: dict) -> str | None:
         if visuals:
             with st.expander("Evidencia visual extraída del video", expanded=False):
                 st.caption(
-                    "Estas capturas se insertarán automáticamente debajo del paso "
-                    "que corresponda en el Word y el PDF."
+                    "Cada captura fue comparada con la aplicación, el elemento y "
+                    "el resultado del paso. Se rechazan reunión, Alt+Tab, "
+                    "transiciones y pantallas que no correspondan."
                 )
                 for visual in visuals[:VIDEO_VISUAL_PREVIEW_LIMIT]:
                     st.image(
@@ -8709,7 +9757,8 @@ def show_video_transcript_review(source_record: dict) -> str | None:
                         caption=(
                             f"{visual.get('action_id', '')} · "
                             f"{visual.get('timestamp', '')} · "
-                            f"{visual.get('title', '')}"
+                            f"{visual.get('title', '')} · "
+                            f"confianza {float(visual.get('semantic_confidence') or 0):.0%}"
                         ),
                         width=720,
                     )
@@ -8724,7 +9773,7 @@ def show_video_transcript_review(source_record: dict) -> str | None:
             for uncertainty in transcript.uncertainties:
                 st.warning(uncertainty)
 
-    action_total = len(transcript.actions) if transcript else 0
+    action_total = len(review_actions) if transcript else 0
     visual_total = int(source_record.get("video_visual_count") or 0)
     if transcript and action_total and visual_total < action_total:
         st.info(
@@ -8732,14 +9781,17 @@ def show_video_transcript_review(source_record: dict) -> str | None:
             "en una fase separada para evitar que un reinicio borre el avance."
         )
         extract_visuals_clicked = st.button(
-            f"Completar capturas pendientes ({visual_total}/{action_total})",
+            f"Alinear y completar capturas precisas ({visual_total}/{action_total})",
             type="secondary",
             width="stretch",
             key=f"resume_visuals_{st.session_state.upload_key}",
         )
         if extract_visuals_clicked:
             try:
-                with st.status("Extrayendo evidencia visual...", expanded=True) as visual_status:
+                with st.status(
+                    "Alineando acciones con la pantalla y extrayendo evidencia...",
+                    expanded=True,
+                ) as visual_status:
                     progress_slot = st.empty()
 
                     def visual_progress(message: str) -> None:
@@ -9905,7 +10957,7 @@ def main() -> None:
                 drive_reference and drive_service_account_email()
             ) if source_from_drive else True
             transcribe_clicked = st.button(
-                "Transcribir o reanudar video y extraer evidencia visual",
+                "Transcribir o reanudar video",
                 type="primary",
                 width="stretch",
                 disabled=not api_key or not drive_ready,
@@ -10040,8 +11092,10 @@ def main() -> None:
                     source_record["role"] = (
                         "transcripción revisada del video de origen"
                     )
-                    edited_actions = _parse_action_inventory_from_source_text(
-                        approved_source_text
+                    edited_actions = _deduplicate_video_actions(
+                        _parse_action_inventory_from_source_text(
+                            approved_source_text
+                        )
                     )
                     if edited_actions:
                         source_record["video_actions"] = [
@@ -10399,7 +11453,10 @@ def main() -> None:
                         with st.expander("Ver detalle de la revalidación"):
                             st.code(str(audit_error)[:1600], language=None)
 
-                    st.write("4/5 · Organizando macroactividades e insertando evidencia visual")
+                    st.write(
+                        "4/5 · Alineando cada paso con la pantalla, recortando la "
+                        "reunión e insertando evidencia visual comprobada"
+                    )
 
                     def visual_progress(message: str) -> None:
                         st.write(f"4/5 · {message}")
